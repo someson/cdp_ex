@@ -73,6 +73,10 @@ defmodule CDPEx.Chrome do
   # Chrome gets fd 3 closed. If the exec itself fails, the shell exits 126 (not
   # executable) or 127 (not found) before Chrome runs; see exit_reason/1.
   @watchdog ~S|exec 3<&0; (read -r _ <&3; kill -9 $$) >/dev/null 2>&1 & exec "$0" "$@" 3<&-|
+
+  # Fresh names to try when a temp profile dir already exists (see create_temp_profile_dir/2).
+  @temp_dir_attempts 10
+
   # How often to poll the DevToolsActivePort file while waiting for readiness, so
   # a fast-ready Chrome returns promptly and @launch_timeout acts as a ceiling.
   @devtools_poll_interval 150
@@ -163,8 +167,7 @@ defmodule CDPEx.Chrome do
   def default_launch_timeout, do: @launch_timeout
 
   defp do_launch(binary, opts) do
-    with {:ok, user_data_dir, owns?} <- resolve_user_data_dir(opts),
-         :ok <- make_profile_dir(user_data_dir),
+    with {:ok, user_data_dir, owns?} <- prepare_user_data_dir(opts),
          {:ok, port} <- open_port(binary, build_args(user_data_dir, opts), user_data_dir, owns?) do
       await_launch(port, user_data_dir, owns?, Keyword.get(opts, :launch_timeout, @launch_timeout))
     end
@@ -373,13 +376,48 @@ defmodule CDPEx.Chrome do
     end
   end
 
-  defp resolve_user_data_dir(opts) do
+  defp prepare_user_data_dir(opts) do
     case {Keyword.get(opts, :user_data_dir), System.tmp_dir()} do
-      {nil, nil} -> {:error, {:launch_failed, {:user_data_dir, :no_tmp_dir}}}
-      {nil, tmp} -> {:ok, Path.join(tmp, "cdp_ex-#{System.unique_integer([:positive])}"), true}
-      {dir, _tmp} -> {:ok, dir, false}
+      {nil, nil} ->
+        {:error, {:launch_failed, {:user_data_dir, :no_tmp_dir}}}
+
+      {nil, tmp} ->
+        create_temp_profile_dir(tmp)
+
+      {dir, _tmp} ->
+        with :ok <- make_profile_dir(dir), do: {:ok, dir, false}
     end
   end
+
+  @doc false
+  # Creates a fresh profile dir under `tmp` and returns `{:ok, dir, true}`.
+  #
+  # `System.unique_integer/1` is unique only within one VM, and every VM starts
+  # from the same small numbers, so the OS pid goes into the name too: two VMs on
+  # one host, or a VM restarted after a crash, must not share a profile. The dir
+  # is created with `File.mkdir/1`, not `mkdir_p`, so an existing dir (left by a
+  # crashed VM whose OS pid was recycled) is never reused: Chrome would refuse
+  # it with a `SingletonLock` error while its old owner still runs, and our
+  # `stop/1` would delete a dir that isn't ours. `next_name` is injectable for tests.
+  @spec create_temp_profile_dir(String.t(), (-> String.t())) ::
+          {:ok, String.t(), true} | {:error, {:launch_failed, {:user_data_dir, term()}}}
+  def create_temp_profile_dir(tmp, next_name \\ &temp_profile_name/0),
+    do: create_temp_profile_dir(tmp, next_name, @temp_dir_attempts)
+
+  defp create_temp_profile_dir(_tmp, _next_name, 0),
+    do: {:error, {:launch_failed, {:user_data_dir, :eexist}}}
+
+  defp create_temp_profile_dir(tmp, next_name, attempts) do
+    dir = Path.join(tmp, next_name.())
+
+    case File.mkdir(dir) do
+      :ok -> {:ok, dir, true}
+      {:error, :eexist} -> create_temp_profile_dir(tmp, next_name, attempts - 1)
+      {:error, posix} -> {:error, {:launch_failed, {:user_data_dir, posix}}}
+    end
+  end
+
+  defp temp_profile_name, do: "cdp_ex-#{System.pid()}-#{System.unique_integer([:positive])}"
 
   # ── DevTools URL discovery ──────────────────────────────────────────────────
 

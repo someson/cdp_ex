@@ -106,6 +106,49 @@ defmodule CDPEx.ChromeTest do
     end
   end
 
+  describe "create_temp_profile_dir/2" do
+    @describetag :tmp_dir
+
+    test "names the dir after this OS process and creates it", %{tmp_dir: tmp} do
+      assert {:ok, dir, true} = Chrome.create_temp_profile_dir(tmp)
+      assert Path.basename(dir) =~ ~r/^cdp_ex-#{System.pid()}-\d+$/
+      assert File.dir?(dir)
+    end
+
+    test "returns a different dir on each call", %{tmp_dir: tmp} do
+      assert {:ok, a, true} = Chrome.create_temp_profile_dir(tmp)
+      assert {:ok, b, true} = Chrome.create_temp_profile_dir(tmp)
+      refute a == b
+    end
+
+    test "never reuses a dir that already exists", %{tmp_dir: tmp} do
+      taken = Path.join(tmp, "taken")
+      File.mkdir!(taken)
+      File.write!(Path.join(taken, "SingletonLock"), "")
+
+      {:ok, names} = Agent.start_link(fn -> ["taken", "free"] end)
+      next = fn -> Agent.get_and_update(names, fn [n | rest] -> {n, rest} end) end
+
+      assert Chrome.create_temp_profile_dir(tmp, next) == {:ok, Path.join(tmp, "free"), true}
+      assert File.exists?(Path.join(taken, "SingletonLock"))
+    end
+
+    test "gives up with :eexist when every name is taken", %{tmp_dir: tmp} do
+      File.mkdir!(Path.join(tmp, "taken"))
+
+      assert Chrome.create_temp_profile_dir(tmp, fn -> "taken" end) ==
+               {:error, {:launch_failed, {:user_data_dir, :eexist}}}
+    end
+
+    test "reports other mkdir failures as {:user_data_dir, posix}", %{tmp_dir: tmp} do
+      file = Path.join(tmp, "a_file")
+      File.write!(file, "")
+
+      assert Chrome.create_temp_profile_dir(file, fn -> "p" end) ==
+               {:error, {:launch_failed, {:user_data_dir, :enotdir}}}
+    end
+  end
+
   describe "launch/1" do
     test "returns chrome_not_found for a missing binary" do
       assert {:error, {:chrome_not_found, "/no/such/chrome"}} =
