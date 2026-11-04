@@ -44,19 +44,7 @@ apart, then gives up quietly.
 for the whole Chrome process group to exit before removing the dir, or retry
 removal for longer.
 
-## 3. Sweep stale temp profile dirs after a VM crash
-
-**Problem.** When the VM dies without running `terminate/2` (`kill -9`, the OOM
-killer), the watchdog kills Chrome but nothing removes its temp profile dir.
-These accumulate in the temp dir across crashes.
-
-**Direction.** Profile dirs are named `cdp_ex-<os_pid>-<n>`, so on launch (or
-once at application start) remove `cdp_ex-<pid>-*` dirs whose `<pid>` is not a
-running process. Caveat: if the OS has reused that pid for another process,
-the stale dir is kept, which is safe but incomplete. Never remove a dir whose
-pid is alive.
-
-## 4. Cold start: pipe transport
+## 3. Cold start: pipe transport
 
 **Problem.** A cold launch → page → navigate → stop cycle is still slower than
 Playwright: 532 ms vs 458 ms at p50. Playwright talks to Chrome over
@@ -74,7 +62,7 @@ when the pipe closes.
 session handling and tests. Worth it only if cold start matters; a warm
 `CDPEx.Pool` hides it.
 
-## 5. Default flags: what hasn't been measured
+## 4. Default flags: what hasn't been measured
 
 - `--disable-field-trial-config` (on by default since #1) was measured on
   Chromium only. Branded Google Chrome stable doesn't apply the field-trial
@@ -84,7 +72,7 @@ session handling and tests. Worth it only if cold start matters; a warm
   13.9 jobs/s, 27 vs 29 Chrome processes). Weak evidence; re-measure on top
   of `--disable-field-trial-config` before adding it.
 
-## 6. Keep the benchmark reproducible
+## 5. Keep the benchmark reproducible
 
 The numbers in `CHANGELOG.md` and the PR descriptions came from a harness that
 isn't in this repository: a Node fixture server, matching CDPEx and Playwright
@@ -92,10 +80,10 @@ scenario scripts, and a runner that samples PSS and CPU from `/proc`. Add it
 under `bench/` (outside the Hex package) with a short README, so a change can
 be checked against the same scenarios.
 
-## 7. Upstream
+## 6. Upstream
 
 Changes in this fork that `patrols/cdp_ex` doesn't have yet: the
 `--disable-field-trial-config` default (#1), reaping Chrome when the VM exits
-(#2), unique temp profile dirs (#3), in-page waits (#4), and the README fixes
-(#5). Upstream requires signed commits, so they need re-signing before being
+(#2), unique temp profile dirs (#3), in-page waits (#4), the README fixes
+(#5), and sweeping stale temp profile dirs (#8). Upstream requires signed commits, so they need re-signing before being
 offered there, and the PR numbers in `CHANGELOG.md` will differ.

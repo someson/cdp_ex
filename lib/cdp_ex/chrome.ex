@@ -382,6 +382,7 @@ defmodule CDPEx.Chrome do
         {:error, {:launch_failed, {:user_data_dir, :no_tmp_dir}}}
 
       {nil, tmp} ->
+        :ok = sweep_stale_profile_dirs(tmp)
         create_temp_profile_dir(tmp)
 
       {dir, _tmp} ->
@@ -418,6 +419,58 @@ defmodule CDPEx.Chrome do
   end
 
   defp temp_profile_name, do: "cdp_ex-#{System.pid()}-#{System.unique_integer([:positive])}"
+
+  @doc false
+  # Removes the temp profile dirs under `tmp` left by VMs that died without running
+  # `terminate/2` (`kill -9`, the OOM killer): the watchdog kills their Chrome, but
+  # nothing removes the dir. A dir is removed only if its name is exactly
+  # `cdp_ex-<os_pid>-<n>` (see temp_profile_name/0), it is a real dir (not a
+  # symlink), and `kill -0` says no process `<os_pid>` exists. A live pid, this
+  # VM's own, or any doubt (`kill` missing, `EPERM`, Windows) keeps the dir. If the
+  # OS has reused a dead VM's pid, its dir is kept too: safe, but incomplete.
+  #
+  # Best-effort: always returns `:ok`, so a dir that can't be listed or removed
+  # never fails the launch.
+  @spec sweep_stale_profile_dirs(String.t()) :: :ok
+  def sweep_stale_profile_dirs(tmp) do
+    _ =
+      with false <- match?({:win32, _}, :os.type()),
+           {:ok, names} <- File.ls(tmp) do
+        own = System.pid()
+
+        names
+        |> Enum.flat_map(&stale_candidate(&1, own))
+        |> Enum.group_by(fn {pid, _name} -> pid end, fn {_pid, name} -> name end)
+        |> Enum.each(fn {pid, pid_names} -> remove_if_gone(tmp, pid, pid_names) end)
+      end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp stale_candidate(name, own) do
+    case Regex.run(~r/\Acdp_ex-([1-9][0-9]*)-[1-9][0-9]*\z/, name) do
+      [_, ^own] -> []
+      [_, pid] -> [{pid, name}]
+      nil -> []
+    end
+  end
+
+  defp remove_if_gone(tmp, pid, names) do
+    if os_pid_gone?(pid), do: Enum.each(names, &remove_stale_dir(tmp, &1)), else: :ok
+  end
+
+  defp remove_stale_dir(tmp, name) do
+    dir = Path.join(tmp, name)
+
+    case File.lstat(dir) do
+      {:ok, %File.Stat{type: :directory}} -> _ = File.rm_rf(dir)
+      _ -> :ok
+    end
+
+    :ok
+  end
 
   # ── DevTools URL discovery ──────────────────────────────────────────────────
 
@@ -537,6 +590,19 @@ defmodule CDPEx.Chrome do
           {_, 0} -> true
           _ -> false
         end
+    end
+  rescue
+    _ -> false
+  end
+
+  # True only when `kill -0` fails with "No such process" (ESRCH). Unlike
+  # os_alive?/1, any other outcome counts as alive: EPERM means the process exists
+  # under another user, and a missing `kill` proves nothing. The locale is pinned
+  # so the message can be matched.
+  defp os_pid_gone?(os_pid) do
+    case System.cmd("kill", ["-0", os_pid], stderr_to_stdout: true, env: [{"LC_ALL", "C"}]) do
+      {_, 0} -> false
+      {output, _} -> output =~ "No such process"
     end
   rescue
     _ -> false
