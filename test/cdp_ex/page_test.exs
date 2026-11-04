@@ -327,6 +327,68 @@ defmodule CDPEx.PageTest do
     end
   end
 
+  describe "wait_for_function/3 in-page wait" do
+    test "sends one awaited promise that checks on mutations and on the interval", %{
+      page: page,
+      fake: fake
+    } do
+      task =
+        Task.async(fn ->
+          Page.wait_for_function(page, "window.ready", timeout: 1_234, interval: 25)
+        end)
+
+      assert_receive {:fake_cdp_recv, ^fake,
+                      %{
+                        "id" => id,
+                        "method" => "Runtime.evaluate",
+                        "params" => %{"expression" => js, "awaitPromise" => true}
+                      }},
+                     2_000
+
+      assert js =~ "!!(window.ready)"
+      assert js =~ "new MutationObserver(check)"
+      assert js =~ "setInterval(check, 25)"
+      # The page gets the whole remaining budget, give or take the time to get here.
+      assert [_, ms] = Regex.run(~r/settle\(resolve, false\), (\d+)\)/, js)
+      assert String.to_integer(ms) in 1_100..1_234
+
+      FakeCDP.send_text(fake, ~s({"id":#{id},"result":{"result":{"type":"boolean","value":true}}}))
+      assert :ok = Task.await(task, 2_000)
+    end
+
+    test "a wait the page settles false is a timeout, with no second evaluate", %{
+      page: page,
+      fake: fake
+    } do
+      task = Task.async(fn -> Page.wait_for_function(page, "false", timeout: 2_000) end)
+
+      assert_receive {:fake_cdp_recv, ^fake, %{"id" => id, "method" => "Runtime.evaluate"}}, 2_000
+      FakeCDP.send_text(fake, ~s({"id":#{id},"result":{"result":{"type":"boolean","value":false}}}))
+
+      assert {:error, :timeout} = Task.await(task, 2_000)
+      refute_receive {:fake_cdp_recv, ^fake, %{"method" => "Runtime.evaluate"}}, 100
+    end
+
+    test "a page that never settles the wait still times out", %{page: page, fake: fake} do
+      # The CDP call gets the wait's timeout plus a grace period; past that the
+      # wait is a plain :timeout, not a {:timeout, "Runtime.evaluate"} call error.
+      task = Task.async(fn -> Page.wait_for_function(page, "false", timeout: 0) end)
+
+      assert_receive {:fake_cdp_recv, ^fake, %{"method" => "Runtime.evaluate"}}, 2_000
+      assert {:error, :timeout} = Task.await(task, 3_000)
+    end
+
+    test "refuses a :timeout or :interval the in-page script can't take", %{page: page} do
+      assert_raise ArgumentError, ~r/invalid :interval 0/, fn ->
+        Page.wait_for_function(page, "true", interval: 0)
+      end
+
+      assert_raise ArgumentError, ~r/invalid :timeout "5000"/, fn ->
+        Page.wait_for_selector(page, "#x", timeout: "5000")
+      end
+    end
+  end
+
   describe "click/3 :wait" do
     test "retries while the selector is missing, then clicks", %{page: page, fake: fake} do
       task = Task.async(fn -> Page.click(page, "#late", wait: 2_000, trusted: false) end)
@@ -2760,11 +2822,13 @@ defmodule CDPEx.PageTest do
                     %{
                       "id" => id,
                       "method" => "Runtime.evaluate",
-                      "params" => %{"expression" => expression}
+                      "params" => %{"expression" => expression, "awaitPromise" => true}
                     }},
                    2_000
 
-    assert expression == expected_js
+    # The selector expression sits inside the in-page wait script; pin its
+    # quoting, and that the wait is one awaited promise rather than a poll.
+    assert String.contains?(expression, expected_js)
 
     # Resolve the wait so the task exits cleanly rather than racing teardown.
     FakeCDP.send_text(

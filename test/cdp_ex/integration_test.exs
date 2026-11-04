@@ -870,6 +870,57 @@ defmodule CDPEx.IntegrationTest do
       assert get_in(details, ["exception", "description"]) =~ "not a valid selector"
     end
 
+    test "wait_for_selector sees an element as soon as it is inserted, not at the next poll", %{
+      page: page,
+      fixture: fixture
+    } do
+      {:ok, _} = Page.navigate(page, fixture)
+
+      {:ok, _} =
+        Page.evaluate(page, """
+        setTimeout(() => {
+          const el = document.createElement("div");
+          el.id = "inserted-late";
+          document.body.appendChild(el);
+        }, 300)
+        """)
+
+      # The interval timer would first fire after 10s; only the MutationObserver can
+      # resolve this within the assertion's window.
+      {elapsed_us, result} =
+        :timer.tc(fn ->
+          Page.wait_for_selector(page, "#inserted-late", timeout: 5_000, interval: 10_000)
+        end)
+
+      assert result == :ok
+      assert elapsed_us < 1_500_000
+    end
+
+    test "wait_for_function catches state the DOM doesn't show, on the interval", %{
+      page: page,
+      fixture: fixture
+    } do
+      {:ok, _} = Page.navigate(page, fixture)
+      {:ok, _} = Page.evaluate(page, "setTimeout(() => { window.__flag = true }, 200)")
+
+      assert :ok =
+               Page.wait_for_function(page, "window.__flag === true", timeout: 3_000, interval: 50)
+    end
+
+    test "a wait in flight survives a navigation to a page that has the element", %{
+      page: page,
+      fixture: fixture
+    } do
+      {:ok, _} = Page.navigate(page, fixture <> "missing")
+      task = Task.async(fn -> Page.wait_for_selector(page, "#greeting", timeout: 8_000) end)
+
+      # Let the wait arm in the first document before replacing it.
+      Process.sleep(300)
+      {:ok, _} = Page.navigate(page, fixture)
+
+      assert Task.await(task, 10_000) == :ok
+    end
+
     test "wait_for_function resolves when truthy and times out otherwise", %{
       page: page,
       fixture: fixture
