@@ -149,6 +149,76 @@ defmodule CDPEx.ChromeTest do
     end
   end
 
+  describe "sweep_stale_profile_dirs/1" do
+    @describetag :tmp_dir
+
+    test "removes the profile dirs of a dead OS pid", %{tmp_dir: tmp} do
+      dead = dead_os_pid()
+      dirs = for n <- [1, 42], do: mkdir!(tmp, "cdp_ex-#{dead}-#{n}")
+      File.write!(Path.join(hd(dirs), "SingletonLock"), "")
+
+      assert Chrome.sweep_stale_profile_dirs(tmp) == :ok
+      refute Enum.any?(dirs, &File.exists?/1)
+    end
+
+    test "keeps the profile dirs of this VM", %{tmp_dir: tmp} do
+      dir = mkdir!(tmp, "cdp_ex-#{System.pid()}-1")
+
+      assert Chrome.sweep_stale_profile_dirs(tmp) == :ok
+      assert File.dir?(dir)
+    end
+
+    test "keeps the profile dirs of another live OS process", %{tmp_dir: tmp} do
+      port = Port.open({:spawn_executable, "/bin/sleep"}, [:exit_status, args: ["30"]])
+      {:os_pid, live} = Port.info(port, :os_pid)
+      on_exit(fn -> System.cmd("kill", ["-9", to_string(live)]) end)
+      dir = mkdir!(tmp, "cdp_ex-#{live}-1")
+
+      assert Chrome.sweep_stale_profile_dirs(tmp) == :ok
+      assert File.dir?(dir)
+    end
+
+    test "keeps anything not named exactly cdp_ex-<pid>-<n>", %{tmp_dir: tmp} do
+      dead = dead_os_pid()
+
+      names = [
+        "cdp_ex-#{dead}",
+        "cdp_ex-#{dead}-",
+        "cdp_ex-#{dead}-1-x",
+        "cdp_ex-#{dead}-01",
+        "cdp_ex-0#{dead}-1",
+        "cdp_ex-abc-1",
+        "xcdp_ex-#{dead}-1",
+        "cdp_ex-#{dead}-1.bak",
+        "other"
+      ]
+
+      dirs = Enum.map(names, &mkdir!(tmp, &1))
+
+      assert Chrome.sweep_stale_profile_dirs(tmp) == :ok
+      assert Enum.all?(dirs, &File.dir?/1)
+    end
+
+    test "keeps a regular file or a symlink with a matching name", %{tmp_dir: tmp} do
+      dead = dead_os_pid()
+      file = Path.join(tmp, "cdp_ex-#{dead}-1")
+      File.write!(file, "")
+      target = mkdir!(tmp, "target")
+      File.write!(Path.join(target, "keep"), "")
+      link = Path.join(tmp, "cdp_ex-#{dead}-2")
+      File.ln_s!(target, link)
+
+      assert Chrome.sweep_stale_profile_dirs(tmp) == :ok
+      assert File.regular?(file)
+      assert {:ok, %File.Stat{type: :symlink}} = File.lstat(link)
+      assert File.exists?(Path.join(target, "keep"))
+    end
+
+    test "returns :ok when the temp dir can't be listed", %{tmp_dir: tmp} do
+      assert Chrome.sweep_stale_profile_dirs(Path.join(tmp, "missing")) == :ok
+    end
+  end
+
   describe "launch/1" do
     test "returns chrome_not_found for a missing binary" do
       assert {:error, {:chrome_not_found, "/no/such/chrome"}} =
@@ -278,5 +348,21 @@ defmodule CDPEx.ChromeTest do
     File.write!(path, body)
     File.chmod!(path, 0o755)
     path
+  end
+
+  defp mkdir!(tmp, name) do
+    dir = Path.join(tmp, name)
+    File.mkdir!(dir)
+    dir
+  end
+
+  # The OS pid of a process that has run and exited (and been reaped), so `kill -0`
+  # reports it gone until the OS reuses the pid.
+  defp dead_os_pid do
+    port = Port.open({:spawn_executable, "/bin/true"}, [:exit_status])
+    {:os_pid, os_pid} = Port.info(port, :os_pid)
+    assert_receive {^port, {:exit_status, 0}}, 5_000
+    refute match?({_, 0}, System.cmd("kill", ["-0", to_string(os_pid)], stderr_to_stdout: true))
+    os_pid
   end
 end
