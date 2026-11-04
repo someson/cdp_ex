@@ -70,6 +70,10 @@ defmodule CDPEx.ChromeTest do
       assert List.last(Chrome.default_args("/tmp/p")) == "about:blank"
     end
 
+    test "disables the field-trial testing config" do
+      assert "--disable-field-trial-config" in Chrome.default_args("/tmp/p")
+    end
+
     test "ships no anti-bot defaults" do
       args = Chrome.default_args("/tmp/p")
       refute Enum.any?(args, &String.contains?(&1, "AutomationControlled"))
