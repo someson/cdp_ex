@@ -29,12 +29,14 @@ Chromes).
 It's production-tested: it runs as the sole browser engine for a JavaScript-heavy
 scraper, where it replaced a Wallaby/ChromeDriver setup.
 
-| | CDPEx | chrome_remote_interface | ChromicPDF | Wallaby |
+| | CDPEx | playwright_ex | ChromicPDF | Wallaby |
 |---|---|---|---|---|
-| Transport | CDP (WebSocket) | CDP (WebSocket) | CDP (WebSocket) | WebDriver / ChromeDriver |
-| Runtime deps | `mint_web_socket`, `jason`, `telemetry` | `hackney` + others | a few | ChromeDriver process |
-| Supervised lifecycle | ✅ | — | ✅ (PDF pool) | partial |
-| Scope | general automation | low-level client | PDF / screenshots | testing |
+| Talks to Chrome over | CDP (WebSocket) | the Playwright Node.js driver | CDP (pipes) | WebDriver |
+| Extra process to run | — | Node.js | — | ChromeDriver |
+| Scope | general automation | general automation, testing | PDF / screenshots | feature tests |
+
+`chrome_remote_interface`, the older low-level CDP client, hasn't had a release
+since 2019.
 
 If you want a small, dependency-light CDP client with proper OTP supervision, and
 you'd rather not run a ChromeDriver process (like Wallaby) or a Node sidecar (like
@@ -78,10 +80,14 @@ For reproducible setups, point it at a
 
 ## Running in containers
 
-CDPEx is validated on macOS, but its defaults already target Linux containers:
+CDPEx is validated on macOS, and CI runs its integration suite against Chrome
+stable on Linux (Ubuntu 24.04). The defaults target Linux containers:
 `--no-sandbox`, `--disable-dev-shm-usage`, and `--disable-setuid-sandbox` are on
 by default, so headless Chrome starts out of the box on a constrained host (e.g.
-2 vCPU / 2 GB). A few things smooth the path further:
+2 vCPU / 2 GB). `--disable-field-trial-config` is on by default too: it keeps
+Chromium and Chrome for Testing builds from switching on experimental features,
+which cut Chrome's memory by about 30% with 8 concurrent pages. A few things
+smooth the path further:
 
 - **Tune `:launch_timeout` for cold starts.** Chrome's first launch in a fresh
   container is slower than on a warm dev machine. `:launch_timeout` is a *ceiling*,
@@ -96,7 +102,9 @@ by default, so headless Chrome starts out of the box on a constrained host (e.g.
   stop), so there's no warm disk cache between launches and the *first* navigation
   pays a cold-start cost. For throughput, prefer one long-lived browser (`launch/1`
   + reuse) over a throwaway `with_page([...])` per request, or pass a persistent
-  `:user_data_dir`.
+  `:user_data_dir`. If the VM itself dies (`kill -9`, the OOM killer), Chrome is
+  still killed, but its temp profile (`cdp_ex-<os_pid>-<n>` under the temp dir)
+  stays behind; clear stale ones on boot if that matters on your host.
 
 - **`/dev/shm` sizing.** Docker defaults `/dev/shm` to 64 MB, which Chrome can
   exhaust (crashing tabs). CDPEx ships `--disable-dev-shm-usage` by default (Chrome
@@ -223,15 +231,28 @@ stays responsive during a cold start and warms multiple browsers concurrently
 under load. A caller that crashes returns its browser automatically, and a
 crashed browser is relaunched on demand.
 
+> #### Borrowers share browser state {: .warning}
+>
+> A pooled browser is reused as is: the next borrower sees the cookies,
+> `localStorage` and cache the previous one left, including a logged-in
+> session. `CDPEx.Page.clear_cookies/2` clears the browser's cookies; storage has
+> no built-in reset, so clear it with `CDPEx.Page.evaluate/3` on the origins you
+> use, or give jobs that must not share state their own browser.
+
 ## Page operations
 
 | Function | Description |
 |---|---|
 | `navigate/3` | Go to a URL, waiting for `networkAlmostIdle` (configurable) |
-| `wait_for_selector/3` | Poll until a CSS selector matches |
+| `wait_for_navigation/2` | Wait for a navigation an action triggered (`load`, `networkAlmostIdle`) |
+| `wait_for_selector/3` | Wait until a CSS selector matches, checked in the page on every DOM change |
+| `wait_for_function/3` | Wait until a JS expression is truthy, checked on DOM changes and on an interval |
 | `wait_for_response/3` | Block until a network response URL matches (fn / `Regex` / substring) |
 | `wait_for_network_idle/2` | Block until the network settles (Puppeteer "networkidle") |
 | `evaluate/3` | Run JS and return the value (`returnByValue`) |
+| `call_function/4` | Call a JS function with JSON-encoded args |
+| `text/3` / `attribute/4` | `textContent` / an attribute of the first match, or `nil` |
+| `visible?/3` | Whether the first match is rendered and visible |
 | `click/3` | Real trusted click on the first match (synthetic via `trusted: false`); `wait:` retries until it exists and has a box |
 | `click_text/3` | Click an element by its text content (whitespace-normalized, innermost match) |
 | `type/4` | Focus an element and enter text (`Input.insertText`) |
@@ -241,9 +262,12 @@ crashed browser is relaunched on demand.
 | `screenshot/2` | PNG bytes, or write to `:path` |
 | `pdf/2` | Render the page to PDF bytes, or write to `:path` |
 | `set_user_agent/3` | Override the UA string, with optional Client-Hints metadata + `Accept-Language` |
-| `observe_network/2` | Stream `Network` request/response events to the caller |
+| `set_extra_headers/3` | Extra HTTP headers on every later request from the page |
+| `set_viewport/4` | Override the viewport size (and device scale factor) |
+| `cookies/2` / `set_cookies/3` / `clear_cookies/2` | Read, set, or clear the browser's cookies (browser-wide, not per page) |
+| `observe_network/2` / `stop_observing_network/2` | Stream `Network` request/response events to the caller, or stop |
 | `response_body/3` | Fetch a response body by requestId (`Network.getResponseBody`) |
-| `enable_request_interception/2` | Pause matching requests for the caller to resolve |
+| `enable_request_interception/2` / `disable_request_interception/2` | Pause matching requests for the caller to resolve, or stop |
 | `continue_request/3` / `fulfill_request/3` / `fail_request/3` | Resolve a paused request (proceed / synthetic response / fail) |
 | `authenticate/4` | Answer a proxy / HTTP Basic auth challenge (call before `navigate/3`) |
 
@@ -259,7 +283,8 @@ documented in full on [hexdocs](https://hexdocs.pm/cdp_ex/CDPEx.Page.html).
 Interception is event-driven: the process that enables it receives one
 `Fetch.requestPaused` event per request and must resolve every one — with
 `continue_request/3`, `fulfill_request/3`, or `fail_request/3`. Drive it from a single
-long-lived process (an unresolved request stalls the page).
+long-lived process: an unresolved request stalls the page, so disable interception
+before that process stops resolving, or the page's next request hangs.
 
 ```elixir
 defmodule ImageBlocker do
@@ -280,7 +305,21 @@ defmodule ImageBlocker do
 
         loop(page)
     after
-      1_000 -> :ok
+      # Idle for a second: stop intercepting, then let through any request that
+      # paused just before the disable.
+      1_000 ->
+        :ok = CDPEx.Page.disable_request_interception(page)
+        drain(page)
+    end
+  end
+
+  defp drain(page) do
+    receive do
+      {:cdp_event, _conn, "Fetch.requestPaused", %{"requestId" => id}, _sid} ->
+        _ = CDPEx.Page.continue_request(page, id)
+        drain(page)
+    after
+      0 -> :ok
     end
   end
 end

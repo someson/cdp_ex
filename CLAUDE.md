@@ -1,7 +1,7 @@
 # CDPEx
 
 OTP-native Chrome DevTools Protocol client, published on Hex as `cdp_ex`. Runtime
-deps are `mint_web_socket` and `jason` only; adding a dependency is a public-API
+deps are `mint_web_socket`, `jason` and `telemetry` only; adding a dependency is a public-API
 decision, not a convenience. Its main consumer is Pulse (livein.city), which uses
 it for all browser scraping. Design notes live in `docs/design/`.
 
