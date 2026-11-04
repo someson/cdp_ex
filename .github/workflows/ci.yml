@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Run on demand from the Actions tab (e.g. to re-check main).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -20,6 +22,9 @@ jobs:
   check:
     name: check (Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }})
     runs-on: ubuntu-24.04
+    # A cold Dialyzer PLT build is the slow part; a stuck run shouldn't hold a
+    # runner for GitHub's 6-hour default.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -66,6 +71,8 @@ jobs:
   integration:
     name: integration (real Chrome)
     runs-on: ubuntu-24.04
+    # The suite takes a few minutes; a hung Chrome must not hold the runner.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -98,12 +105,28 @@ jobs:
           CDP_EX_CHROME_BINARY: ${{ steps.setup-chrome.outputs.chrome-path }}
         run: mix test --only integration
 
+      # Every launched Chrome must be reaped, whatever the tests did; a test can
+      # pass while leaving an OS process behind. Give a Chrome that is still
+      # shutting down a few seconds, then fail on anything left with a cdp_ex
+      # profile. Runs after a failed suite too, since that is when leaks happen.
+      - name: No Chrome left behind
+        if: ${{ always() }}
+        run: |
+          for _ in 1 2 3 4 5; do
+            pgrep -f -- '--user-data-dir=[^ ]*cdp_ex-' > /dev/null || exit 0
+            sleep 2
+          done
+          echo "::error::Chrome processes outlived the integration suite"
+          pgrep -af -- '--user-data-dir=[^ ]*cdp_ex-'
+          exit 1
+
   # Static security audit of these workflow files (script injection, token
   # permissions, dangerous triggers, action pinning). Fast; no Elixir/Chrome.
   # The action-pinning policy lives in .github/zizmor.yml.
   workflow-audit:
     name: workflow audit (zizmor)
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
