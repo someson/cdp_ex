@@ -7,6 +7,12 @@ defmodule CDPEx.Chrome do
   `DevToolsActivePort` file), and returns a handle. `stop/1` kills the process
   and removes the temp profile.
 
+  On Unix, Chrome runs under a small `/bin/sh` watchdog that kills it when the
+  Port's stdin closes, so Chrome doesn't outlive the VM even when the VM exits
+  without running `terminate/2` (`System.halt/1`, `kill -9`, the OOM killer).
+  Chrome still has the Port's OS pid. The temp profile dir stays behind in that
+  case, since nothing in the VM is left to remove it.
+
   The argument and discovery helpers (`build_args/2`, `default_args/2`,
   `resolve_binary/1`) are pure and unit-testable without launching anything.
 
@@ -49,6 +55,24 @@ defmodule CDPEx.Chrome do
   import Bitwise, only: [band: 2]
 
   @launch_timeout 15_000
+
+  # On Unix, Chrome is started through this /bin/sh script rather than directly, so
+  # it can't outlive the VM. `terminate/2` reaps Chrome on every exit path inside a
+  # running VM, but nothing runs when the VM itself goes away (`System.halt/1`, a
+  # crashing script, `kill -9`, the OOM killer), and Chrome ignores its stdin, so the
+  # Port closing doesn't stop it either. The script starts a background watchdog
+  # that blocks reading the Port's stdin, then execs Chrome in its own place, so
+  # Chrome keeps the Port's OS pid (`kill/1`, `await_exit/2` and the process label
+  # are unchanged). The OS closes that pipe when the VM exits, however it exits;
+  # the watchdog's read then returns and it kill -9s Chrome. On a normal stop it
+  # fires after `stop/1` already killed Chrome, which is harmless.
+  #
+  # fd 3 carries stdin into the watchdog because POSIX shells give a background
+  # job /dev/null as stdin. The watchdog drops stdout/stderr so it doesn't hold the
+  # Port open after Chrome exits (the exit status only arrives once they close), and
+  # Chrome gets fd 3 closed. If the exec itself fails, the shell exits 126 (not
+  # executable) or 127 (not found) before Chrome runs; see exit_reason/1.
+  @watchdog ~S|exec 3<&0; (read -r _ <&3; kill -9 $$) >/dev/null 2>&1 & exec "$0" "$@" 3<&-|
   # How often to poll the DevToolsActivePort file while waiting for readiness, so
   # a fast-ready Chrome returns promptly and @launch_timeout acts as a ceiling.
   @devtools_poll_interval 150
@@ -159,8 +183,15 @@ defmodule CDPEx.Chrome do
   # `:original`. badarg is a caller bug that validate_opts!/1 normally stops first, so it
   # keeps raising as a safety net; a full port table is a runtime failure like a refused spawn.
   defp open_port(binary, args, user_data_dir, owns?) do
+    {executable, argv} = spawn_command(binary, args)
+
     {:ok,
-     Port.open({:spawn_executable, binary}, [:binary, :stderr_to_stdout, :exit_status, args: args])}
+     Port.open({:spawn_executable, executable}, [
+       :binary,
+       :stderr_to_stdout,
+       :exit_status,
+       args: argv
+     ])}
   rescue
     error ->
       if owns?, do: remove_dir(user_data_dir)
@@ -170,6 +201,17 @@ defmodule CDPEx.Chrome do
         %ErlangError{original: reason} -> {:error, {:launch_failed, {:spawn, reason}}}
         _ -> reraise error, __STACKTRACE__
       end
+  end
+
+  @doc false
+  # The executable and argv the Port spawns for `binary` + `args`: Chrome under the
+  # @watchdog script on Unix, Chrome itself on Windows (no /bin/sh there).
+  @spec spawn_command(String.t(), [String.t()]) :: {String.t(), [String.t()]}
+  def spawn_command(binary, args) do
+    case :os.type() do
+      {:win32, _} -> {binary, args}
+      _ -> {"/bin/sh", ["-c", @watchdog, binary | args]}
+    end
   end
 
   defp await_launch(port, user_data_dir, owns?, timeout) do
@@ -363,7 +405,7 @@ defmodule CDPEx.Chrome do
           end
 
         {^port, {:exit_status, status}} ->
-          {:error, {:chrome_exited, status, String.slice(buffer, 0, 500)}}
+          {:error, exit_reason(status, buffer)}
       after
         # A bounded tick (never past the deadline): try the file, else keep
         # waiting and accumulating stderr. Only the `remaining <= 0` branch above
@@ -374,6 +416,17 @@ defmodule CDPEx.Chrome do
             {:error, _} -> await_debug_url(port, dir, buffer, deadline)
           end
       end
+    end
+  end
+
+  # Under the @watchdog script a binary the OS refuses to exec makes /bin/sh exit 126
+  # (not executable) or 127 (not found) before Chrome runs. Report that as the spawn
+  # failure it is, the same shape Port.open's exception gives a direct spawn.
+  defp exit_reason(status, buffer) do
+    case {:os.type(), status} do
+      {{:unix, _}, 126} -> {:launch_failed, {:spawn, :eacces}}
+      {{:unix, _}, 127} -> {:launch_failed, {:spawn, :enoent}}
+      _ -> {:chrome_exited, status, String.slice(buffer, 0, 500)}
     end
   end
 

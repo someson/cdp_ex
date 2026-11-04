@@ -82,6 +82,26 @@ defmodule CDPEx.IntegrationTest do
       assert_receive {:DOWN, ^ref, :process, ^browser, _}, 5_000
     end
 
+    test "Chrome dies with the VM that launched it, even when terminate/2 never runs" do
+      # A separate VM launches Chrome and halts at once: no terminate/2, no stop/1.
+      script = """
+      {:ok, _} = Application.ensure_all_started(:cdp_ex)
+      {:ok, browser} = CDPEx.launch()
+      %{os_pid: os_pid, user_data_dir: dir} = :sys.get_state(browser).chrome
+      IO.puts("chrome=\#{os_pid} dir=\#{dir}")
+      System.halt(1)
+      """
+
+      code_path = Enum.flat_map(:code.get_path(), &["-pa", to_string(&1)])
+      elixir = System.find_executable("elixir")
+      {out, 1} = System.cmd(elixir, code_path ++ ["-e", script], stderr_to_stdout: true)
+      [_, os_pid, dir] = Regex.run(~r/chrome=(\d+) dir=(\S+)/, out)
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      assert eventually(fn -> not os_alive?(os_pid) end, 250),
+             "Chrome (os pid #{os_pid}) outlived the VM that launched it"
+    end
+
     test "launch/1 returns well under the timeout ceiling (readiness is polled)" do
       {elapsed_us, {:ok, browser}} = :timer.tc(fn -> CDPEx.launch() end)
       on_exit(fn -> stop_quietly(browser) end)

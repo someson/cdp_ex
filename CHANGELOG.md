@@ -9,6 +9,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - Chrome now launches with `--disable-field-trial-config`, as Puppeteer and Playwright do. Chromium and Chrome for Testing builds otherwise apply their bundled field-trial testing config, which turns on experimental features; with 8 concurrent pages this cut Chrome's peak memory by ~30% (660 → 462 MB PSS) and raised throughput by ~20%. Pass `:args` to restore the old flag list (#TBD).
 
+### Fixed
+- Chrome no longer outlives the VM that launched it. `terminate/2` reaps Chrome on every exit path inside a running VM, but when the VM itself exited without running it (`System.halt/1`, an uncaught error in an `elixir` script, `kill -9`, the OOM killer), Chrome and its child processes kept running with ppid 1. On Unix, Chrome now starts under a small `/bin/sh` watchdog that kills it once the Port's stdin closes, which the OS does however the VM exits. Chrome keeps the Port's OS pid, and a binary the OS refuses to exec still returns `{:error, {:launch_failed, {:spawn, posix}}}`. The temp profile dir of such a VM is still left behind.
+
 ## [0.14.0] - 2026-10-22
 
 ### Changed

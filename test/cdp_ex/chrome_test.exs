@@ -82,6 +82,16 @@ defmodule CDPEx.ChromeTest do
     end
   end
 
+  describe "spawn_command/2" do
+    @tag skip: match?({:win32, _}, :os.type()) && "no /bin/sh watchdog on Windows"
+    test "runs Chrome under the /bin/sh watchdog, with its args passed through" do
+      assert {"/bin/sh", ["-c", script, "/opt/chrome", "--headless", "about:blank"]} =
+               Chrome.spawn_command("/opt/chrome", ["--headless", "about:blank"])
+
+      assert script =~ ~s(exec "$0" "$@")
+    end
+  end
+
   describe "build_args/2" do
     test "appends :extra_args to the defaults" do
       args = Chrome.build_args("/tmp/p", extra_args: ["--proxy-server=http://x:1"])
