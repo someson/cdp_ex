@@ -465,11 +465,13 @@ defmodule CDPEx.Chrome do
     dir = Path.join(tmp, name)
 
     case File.lstat(dir) do
-      {:ok, %File.Stat{type: :directory}} -> _ = File.rm_rf(dir)
-      _ -> :ok
-    end
+      {:ok, %File.Stat{type: :directory}} ->
+        _ = File.rm_rf(dir)
+        :ok
 
-    :ok
+      _ ->
+        :ok
+    end
   end
 
   # ── DevTools URL discovery ──────────────────────────────────────────────────
