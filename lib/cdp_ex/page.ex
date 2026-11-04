@@ -39,6 +39,9 @@ defmodule CDPEx.Page do
   @navigate_timeout 30_000
   @evaluate_timeout 15_000
   @selector_timeout 5_000
+  # Extra time the CDP call for an in-page wait gets past the wait's own timeout,
+  # so the page's timer normally settles it; see await_truthy/4.
+  @wait_grace 500
   @screenshot_timeout 30_000
   @command_timeout 10_000
   @click_poll_interval 100
@@ -814,7 +817,10 @@ defmodule CDPEx.Page do
   end
 
   @doc """
-  Polls until `css` matches an element, or `timeout` elapses.
+  Waits until `css` matches an element, or `timeout` elapses.
+
+  The check runs inside the page on every DOM mutation, so a matching element is
+  seen as soon as it is inserted (see `wait_for_function/3`).
 
   The selector is `Jason.encode!`-ed into the injected `document.querySelector(...)`
   call, so quote characters in attribute selectors (`[id^='ticket-card-']`,
@@ -835,7 +841,17 @@ defmodule CDPEx.Page do
   end
 
   @doc """
-  Polls a JavaScript expression until it is truthy, or `timeout` elapses.
+  Waits until a JavaScript expression is truthy, or `timeout` elapses.
+
+  The wait runs inside the page as one `Runtime.evaluate` that awaits a promise:
+  the expression is checked at once, then again on every DOM mutation (a
+  `MutationObserver` on the whole document) and every `:interval` ms, so a DOM
+  change is seen as soon as it happens rather than at the next poll, with no CDP
+  round trip per check. The `:interval` timer covers state the DOM doesn't
+  reflect (a JS variable, a timer). A navigation that replaces the document
+  rejects the in-flight wait with a CDP error, and the wait is re-armed in the
+  new document for the time left. Keep the expression cheap: on a page that
+  mutates constantly it runs once per batch of mutations.
 
   The expression is coerced with `!!(...)`, so JS truthiness applies. Returns
   `:ok`, `{:error, :timeout}`, or `{:error, reason}` if a non-transient evaluate
@@ -845,51 +861,99 @@ defmodule CDPEx.Page do
   dropped connection, and a closed page (`:noproc`, or `{:session_closed, _}` on a
   `:session` page, whose detach Chrome reports as "session not found"). This is
   the shared error taxonomy behind `wait_for_selector/3`.
-  Options: `:timeout` (default 5_000), `:interval` (poll interval ms, default 100).
+  Options: `:timeout` (default 5_000), `:interval` (ms between timer-driven
+  checks, default 100).
   """
   @spec wait_for_function(t(), String.t(), keyword()) :: :ok | {:error, term()}
   def wait_for_function(%__MODULE__{} = page, js, opts \\ []) when is_binary(js) do
-    timeout = Keyword.get(opts, :timeout, @selector_timeout)
-    interval = Keyword.get(opts, :interval, 100)
+    timeout = wait_opt!(opts, :timeout, @selector_timeout, 0)
+    interval = wait_opt!(opts, :interval, 100, 1)
     deadline = System.monotonic_time(:millisecond) + timeout
-    poll_truthy(page, "!!(#{js})", interval, deadline)
+    await_truthy(page, js, interval, deadline)
   end
 
-  defp poll_truthy(page, js, interval, deadline) do
-    case probe_truthy(page, js) do
-      :truthy ->
+  # Both values are interpolated into the in-page script, so anything but an
+  # integer in range is refused here rather than surfacing as a JS error.
+  defp wait_opt!(opts, key, default, min) do
+    case Keyword.get(opts, key, default) do
+      value when is_integer(value) and value >= min ->
+        value
+
+      other ->
+        raise ArgumentError,
+              "invalid #{inspect(key)} #{inspect(other)} (expected an integer >= #{min})"
+    end
+  end
+
+  # One in-page wait per document: it settles true as soon as the expression is
+  # truthy, or false when the time left runs out. A CDP error means the document
+  # went away under it (the execution context was destroyed or isn't ready yet
+  # mid-navigation), so re-arm after `interval` for whatever time is left.
+  defp await_truthy(page, js, interval, deadline) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+    script = in_page_wait(js, interval, remaining)
+
+    case evaluate(page, script, await_promise: true, timeout: remaining + @wait_grace) do
+      {:ok, true} ->
         :ok
 
-      {:fatal, reason} ->
-        {:error, reason}
+      # The in-page timer ran out, or (throttled timers in a background page) our
+      # own guard did first.
+      {:ok, _not_true} ->
+        {:error, :timeout}
 
-      :falsy ->
-        if System.monotonic_time(:millisecond) >= deadline do
-          {:error, :timeout}
-        else
-          Process.sleep(interval)
-          poll_truthy(page, js, interval, deadline)
-        end
+      {:error, {:timeout, "Runtime.evaluate"}} ->
+        {:error, :timeout}
+
+      {:error, {:cdp_error, _method, _info}} ->
+        rearm_after_cdp_error(page, js, interval, deadline)
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
-  defp probe_truthy(page, js) do
-    case evaluate(page, js) do
-      {:ok, true} ->
-        :truthy
+  defp rearm_after_cdp_error(page, js, interval, deadline) do
+    case deadline - System.monotonic_time(:millisecond) do
+      left when left <= 0 ->
+        {:error, :timeout}
 
-      {:ok, _falsy} ->
-        :falsy
-
-      # A CDP error here is typically transient (e.g. the execution context is
-      # not ready mid-navigation). Keep polling until the deadline rather than
-      # failing hard — that's the point of a wait.
-      {:error, {:cdp_error, _method, _info}} ->
-        :falsy
-
-      {:error, reason} ->
-        {:fatal, reason}
+      left ->
+        Process.sleep(min(interval, left))
+        await_truthy(page, js, interval, deadline)
     end
+  end
+
+  # The promise the page awaits. It checks the expression now, on every DOM
+  # mutation and every `interval` ms, and settles once: true on a truthy check,
+  # false after `timeout` ms, or rejected with whatever the expression throws (so
+  # a bad selector is an `:evaluate_exception`, not a silent no-match). Every exit
+  # disconnects the observer and clears both timers, so nothing outlives the wait.
+  defp in_page_wait(js, interval, timeout) do
+    """
+    new Promise((resolve, reject) => {
+      let settled = false, observer = null, poll = null, timer = null;
+      const settle = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        if (observer) observer.disconnect();
+        clearInterval(poll);
+        clearTimeout(timer);
+        fn(value);
+      };
+      const check = () => {
+        let ok;
+        try { ok = !!(#{js}); } catch (e) { settle(reject, e); return; }
+        if (ok) settle(resolve, true);
+      };
+      check();
+      if (settled) return;
+      observer = new MutationObserver(check);
+      observer.observe(document, {childList: true, subtree: true, attributes: true, characterData: true});
+      poll = setInterval(check, #{interval});
+      timer = setTimeout(() => settle(resolve, false), #{timeout});
+    })
+    """
   end
 
   @doc """
