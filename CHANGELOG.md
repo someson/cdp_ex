@@ -11,6 +11,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 - Chrome no longer outlives the VM that launched it. `terminate/2` reaps Chrome on every exit path inside a running VM, but when the VM itself exited without running it (`System.halt/1`, an uncaught error in an `elixir` script, `kill -9`, the OOM killer), Chrome and its child processes kept running with ppid 1. On Unix, Chrome now starts under a small `/bin/sh` watchdog that kills it once the Port's stdin closes, which the OS does however the VM exits. Chrome keeps the Port's OS pid, and a binary the OS refuses to exec still returns `{:error, {:launch_failed, {:spawn, posix}}}`. The temp profile dir of such a VM is still left behind.
+- The temp profile dir is now named `cdp_ex-<os_pid>-<n>` and created exclusively, so it is unique across VMs. It used to be `cdp_ex-<n>` from `System.unique_integer/1`, which every VM numbers from the same start: two VMs on one host, or a VM restarted after a crash with its old Chrome still running, could pick the same dir, and the launch then failed with `{:chrome_exited, 21, _}` (`SingletonLock: File exists`). An existing dir is never reused; after 10 taken names `launch/1` returns `{:error, {:launch_failed, {:user_data_dir, :eexist}}}`.
 
 ## [0.14.0] - 2026-10-22
 
