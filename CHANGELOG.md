@@ -6,6 +6,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- Chrome now launches with `--disable-field-trial-config`, as Puppeteer and Playwright do. Chromium and Chrome for Testing builds otherwise apply their bundled field-trial testing config, which turns on experimental features; with 8 concurrent pages this cut Chrome's peak memory by ~30% (660 → 462 MB PSS) and raised throughput by ~20%. Pass `:args` to restore the old flag list (#TBD).
+
 ## [0.14.0] - 2026-10-22
 
 ### Changed
