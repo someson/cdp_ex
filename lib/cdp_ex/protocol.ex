@@ -230,6 +230,45 @@ defmodule CDPEx.Protocol do
   defp request_target(path, query), do: "#{path || "/"}?#{query}"
 
   @doc """
+  Splits pipe-transport input into complete messages.
+
+  Over `--remote-debugging-pipe` Chrome writes each CDP message as JSON followed by
+  a NUL byte, and a Port delivers the stream in arbitrary chunks. `buffer` is the
+  unterminated tail left by the previous chunk; the result is the complete messages
+  in order and the new tail. Only `data` is scanned, so a message that spans many
+  chunks costs linear time. Empty messages are dropped.
+
+  ## Examples
+
+      iex> CDPEx.Protocol.split_pipe_messages("", ~s({"id":1}\\0{"id":2}\\0{"me))
+      {[~s({"id":1}), ~s({"id":2})], ~s({"me)}
+
+      iex> CDPEx.Protocol.split_pipe_messages(~s({"me), ~s(thod":"X"}\\0))
+      {[~s({"method":"X"})], ""}
+
+      iex> CDPEx.Protocol.split_pipe_messages(~s({"id), ~s(":1))
+      {[], ~s({"id":1)}
+  """
+  @spec split_pipe_messages(binary(), binary()) :: {[binary()], binary()}
+  def split_pipe_messages(buffer, data) do
+    case :binary.split(data, <<0>>, [:global]) do
+      [partial] ->
+        {[], buffer <> partial}
+
+      [first | rest] ->
+        {complete, [tail]} = Enum.split(rest, -1)
+        messages = Enum.reject([buffer <> first | complete], &(&1 == ""))
+        {messages, tail}
+    end
+  end
+
+  @doc """
+  Encodes one CDP message for the pipe transport: the JSON followed by a NUL byte.
+  """
+  @spec pipe_frame(iodata()) :: [iodata() | 0, ...]
+  def pipe_frame(json), do: [json, 0]
+
+  @doc """
   Brackets an IPv6 host literal so it can be interpolated into a URL
   (`::1` -> `[::1]`); other hosts pass through unchanged.
   """

@@ -7,6 +7,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `pipe: true` launches Chrome with `--remote-debugging-pipe`: CDP runs over the Port's stdin and stdout, and Chrome opens no DevTools TCP port that other local processes could connect to. Pages on such a browser are `:session` pages (`:dedicated` returns `{:error, {:unsupported_transport, :dedicated}}`), a `:proxy` with credentials fails the launch with `{:error, {:invalid_proxy, :pipe}}`, and Chrome's stderr is discarded. Chrome exits by itself when the pipe closes, which reaps it when the VM dies. Unix only. Startup is about 15 ms faster on Linux and unchanged on macOS (#13).
 - `isolated: true` on `new_page/2` and `with_page/3` opens the page in its own browser context (cookies, `localStorage`, cache), disposed when the page closes: on `close_page/2`, a raise in `fun`, a `:deadline`, a tab closed from outside, a caller killed mid-`with_page/3`, and a connected browser's `stop/1`. Cookie functions on such a page act on its context only. The `[:cdp_ex, :page, :start | :stop]` metadata gains `:isolated` (#12).
 
 ### Changed

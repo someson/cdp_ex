@@ -43,6 +43,45 @@ defmodule CDPEx.BrowserTest do
     end
   end
 
+  describe "a pipe browser" do
+    test "defaults new pages to :session and rejects :dedicated, before any I/O" do
+      state = %Browser{pipe: true, proxy_auth: %{username: "u", password: "p"}}
+
+      assert {:reply, {:error, {:unsupported_transport, :dedicated}}, ^state} =
+               Browser.handle_call(
+                 {:new_page, [transport: :dedicated]},
+                 {self(), make_ref()},
+                 state
+               )
+
+      # The default resolves to :session, which a credentialed proxy then rejects: proof
+      # the default reached the :session path without touching a connection.
+      assert {:reply, {:error, {:unsupported_transport, :session}}, ^state} =
+               Browser.handle_call({:new_page, []}, {self(), make_ref()}, state)
+    end
+
+    test "a proxy with credentials fails the launch with {:invalid_proxy, :pipe}" do
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {:invalid_proxy, :pipe}} =
+               Browser.start_link(pipe: true, proxy: "http://u:p@host:8080")
+    end
+
+    test "Chrome's exit, reported by the pipe connection, stops the browser with its status" do
+      conn = self()
+      state = %Browser{browser_conn: conn, pipe: true}
+      reason = {:shutdown, {:ws_closed, {:chrome_exited, 137}}}
+
+      log =
+        capture_log(fn ->
+          assert {:stop, {:chrome_exited, 137}, ^state} =
+                   Browser.handle_info({:EXIT, conn, reason}, state)
+        end)
+
+      assert log =~ "Chrome exited with status 137"
+    end
+  end
+
   describe "launch/1 :proxy validation" do
     test "a malformed :proxy fails the launch with {:invalid_proxy, _} (no Chrome launched)" do
       # apply_proxy runs before Chrome.launch in init/1, so a bad proxy stops init early.

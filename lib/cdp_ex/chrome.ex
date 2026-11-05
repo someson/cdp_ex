@@ -7,7 +7,15 @@ defmodule CDPEx.Chrome do
   `DevToolsActivePort` file), and returns a handle. `stop/1` kills the process
   and removes the temp profile.
 
-  On Unix, Chrome runs under a small `/bin/sh` watchdog that kills it when the
+  With `pipe: true` Chrome gets `--remote-debugging-pipe` instead: it reads CDP on
+  fd 3 and writes it on fd 4, which a `/bin/sh` wrapper maps onto the Port's stdin
+  and stdout. No TCP port is opened, and `launch/1` returns as soon as Chrome
+  answers a first command on the pipe. Chrome's own stdout and stderr go to
+  `/dev/null`, so a failed launch carries no stderr excerpt. Chrome exits by itself
+  when the pipe closes, which is what reaps it when the VM exits without running
+  `terminate/2`; the stdin watchdog below can't run, since stdin carries CDP.
+
+  Without `:pipe`, on Unix, Chrome runs under a small `/bin/sh` watchdog that kills it when the
   Port's stdin closes, so Chrome doesn't outlive the VM even when the VM exits
   without running `terminate/2` (`System.halt/1`, `kill -9`, the OOM killer).
   Chrome still has the Port's OS pid. The temp profile dir stays behind in that
@@ -25,6 +33,10 @@ defmodule CDPEx.Chrome do
       stop) when omitted. A caller-supplied dir is left in place.
     * `:extra_args` — extra flags appended to the defaults
     * `:args` — full flag list that **replaces** the defaults entirely
+    * `:pipe` — `true` talks CDP over `--remote-debugging-pipe` instead of a
+      WebSocket (default `false`). Pages on such a browser are `:session` pages only.
+      Unix only: `true` raises `ArgumentError` on Windows. With a full `:args` list,
+      include `--remote-debugging-pipe` yourself.
     * `:launch_timeout` — ms to wait for the DevTools endpoint (default
       `15_000`). A *ceiling*, not a fixed wait: readiness is polled and returns
       as soon as Chrome is reachable, so a generous value is free. Raise it for
@@ -54,6 +66,8 @@ defmodule CDPEx.Chrome do
 
   import Bitwise, only: [band: 2]
 
+  alias CDPEx.Protocol
+
   @launch_timeout 15_000
 
   # On Unix, Chrome is started through this /bin/sh script rather than directly, so
@@ -74,6 +88,18 @@ defmodule CDPEx.Chrome do
   # executable) or 127 (not found) before Chrome runs; see exit_reason/1.
   @watchdog ~S|exec 3<&0; (read -r _ <&3; kill -9 $$) >/dev/null 2>&1 & exec "$0" "$@" 3<&-|
 
+  # The `pipe: true` wrapper: Chrome's --remote-debugging-pipe reads fd 3 and writes
+  # fd 4, so the Port's stdin and stdout move there, and Chrome's own stdout and
+  # stderr go to /dev/null (anything else written to the Port's stdout would corrupt
+  # the CDP stream). exec keeps the Port's OS pid, as with @watchdog. No watchdog: it
+  # would have to read stdin, which now carries CDP. Chrome instead exits when fd 3
+  # reaches EOF, which the OS delivers when the VM exits, however it exits.
+  @pipe_wrapper ~S|exec "$0" "$@" 3<&0 4>&1 0</dev/null 1>/dev/null 2>/dev/null|
+
+  # The readiness probe sent on the pipe. Its id is 0 so it can't collide with the
+  # ids CDPEx.Connection numbers from 1.
+  @pipe_probe ~S|{"id":0,"method":"Browser.getVersion","params":{}}|
+
   # Fresh names to try when a temp profile dir already exists (see create_temp_profile_dir/2).
   @temp_dir_attempts 10
 
@@ -86,7 +112,8 @@ defmodule CDPEx.Chrome do
   @type handle :: %{
           port: port(),
           os_pid: non_neg_integer() | nil,
-          debug_url: String.t(),
+          debug_url: String.t() | nil,
+          pipe: boolean(),
           user_data_dir: String.t(),
           owns_data_dir: boolean()
         }
@@ -96,7 +123,11 @@ defmodule CDPEx.Chrome do
   endpoint is reachable, or `{:error, reason}`.
 
   The `Port` is owned by the calling process, which therefore receives the
-  `{port, {:exit_status, _}}` message if Chrome dies.
+  `{port, {:exit_status, _}}` message if Chrome dies. With `pipe: true` the
+  handle's `debug_url` is `nil` and the Port carries CDP: hand it to
+  `CDPEx.Connection` with `Port.connect/2` before sending anything else on it.
+  A pipe launch that gets no answer within `:launch_timeout` returns
+  `{:error, {:debug_url_not_found, ""}}`.
   """
   @typedoc """
   Error reasons from `launch/1`. Precisely specced (not `term()`) so Dialyzer flags
@@ -122,8 +153,9 @@ defmodule CDPEx.Chrome do
   end
 
   @doc false
-  @spec validate_opts!(keyword()) :: :ok
-  def validate_opts!(opts) do
+  # `os_type` is `:os.type()`; a test passes another to check the Windows rules on Unix.
+  @spec validate_opts!(keyword(), {atom(), atom()}) :: :ok
+  def validate_opts!(opts, os_type \\ :os.type()) do
     # A full :args override means build_args/2 never reads these, so they launched fine.
     ignored =
       if is_list(Keyword.get(opts, :args)), do: [:headless, :window_size, :extra_args], else: []
@@ -132,13 +164,18 @@ defmodule CDPEx.Chrome do
     opts
     |> Enum.uniq_by(&elem(&1, 0))
     |> Enum.each(fn {key, value} ->
-      if key not in ignored and !valid_opt?(key, value) do
+      if key not in ignored and !valid_opt?(key, value, os_type) do
         raise ArgumentError, "invalid #{inspect(key)} #{inspect(value)} (expected #{expected(key)})"
       end
     end)
   end
 
+  # Remapping fds 3 and 4 for the pipe needs /bin/sh, which Windows lacks.
+  defp valid_opt?(:pipe, true, os_type), do: not match?({:win32, _}, os_type)
+  defp valid_opt?(key, value, _os_type), do: valid_opt?(key, value)
+
   defp valid_opt?(:headless, value), do: is_boolean(value)
+  defp valid_opt?(:pipe, value), do: value == false
   defp valid_opt?(:chrome_binary, value), do: value in [nil, false] or string?(value)
   defp valid_opt?(:user_data_dir, value), do: is_nil(value) or string?(value)
   defp valid_opt?(:launch_timeout, value), do: is_integer(value) and value >= 0
@@ -157,6 +194,7 @@ defmodule CDPEx.Chrome do
   defp string?(value), do: is_binary(value) or (is_list(value) and :io_lib.char_list(value))
 
   defp expected(:headless), do: "a boolean"
+  defp expected(:pipe), do: "a boolean; true needs /bin/sh, so not on Windows"
   defp expected(key) when key in [:chrome_binary, :user_data_dir], do: "a string"
   defp expected(:launch_timeout), do: "a non-negative integer"
   defp expected(key) when key in [:extra_args, :args], do: "a list of strings"
@@ -167,9 +205,13 @@ defmodule CDPEx.Chrome do
   def default_launch_timeout, do: @launch_timeout
 
   defp do_launch(binary, opts) do
+    pipe? = Keyword.get(opts, :pipe, false)
+    timeout = Keyword.get(opts, :launch_timeout, @launch_timeout)
+
     with {:ok, user_data_dir, owns?} <- prepare_user_data_dir(opts),
-         {:ok, port} <- open_port(binary, build_args(user_data_dir, opts), user_data_dir, owns?) do
-      await_launch(port, user_data_dir, owns?, Keyword.get(opts, :launch_timeout, @launch_timeout))
+         {:ok, port} <-
+           open_port(binary, build_args(user_data_dir, opts), user_data_dir, owns?, pipe?) do
+      await_launch(port, user_data_dir, owns?, pipe?, timeout)
     end
   end
 
@@ -185,16 +227,16 @@ defmodule CDPEx.Chrome do
   # badarg and system_limit arrive as ArgumentError and SystemLimitError, which have no
   # `:original`. badarg is a caller bug that validate_opts!/1 normally stops first, so it
   # keeps raising as a safety net; a full port table is a runtime failure like a refused spawn.
-  defp open_port(binary, args, user_data_dir, owns?) do
-    {executable, argv} = spawn_command(binary, args)
+  defp open_port(binary, args, user_data_dir, owns?, pipe?) do
+    {executable, argv} = spawn_command(binary, args, pipe?)
+    # In pipe mode the Port's stdout is the CDP stream, so stderr must stay out of it.
+    output = if pipe?, do: [], else: [:stderr_to_stdout]
 
     {:ok,
-     Port.open({:spawn_executable, executable}, [
-       :binary,
-       :stderr_to_stdout,
-       :exit_status,
-       args: argv
-     ])}
+     Port.open(
+       {:spawn_executable, executable},
+       [:binary, :exit_status, args: argv] ++ output
+     )}
   rescue
     error ->
       if owns?, do: remove_dir(user_data_dir)
@@ -208,29 +250,40 @@ defmodule CDPEx.Chrome do
 
   @doc false
   # The executable and argv the Port spawns for `binary` + `args`: Chrome under the
-  # @watchdog script on Unix, Chrome itself on Windows (no /bin/sh there).
-  @spec spawn_command(String.t(), [String.t()]) :: {String.t(), [String.t()]}
-  def spawn_command(binary, args) do
+  # @watchdog script on Unix, Chrome itself on Windows (no /bin/sh there), or Chrome
+  # under @pipe_wrapper for `pipe: true` (Unix only, see validate_opts!/1).
+  @spec spawn_command(String.t(), [String.t()], boolean()) :: {String.t(), [String.t()]}
+  def spawn_command(binary, args, pipe? \\ false)
+
+  def spawn_command(binary, args, true), do: {"/bin/sh", ["-c", @pipe_wrapper, binary | args]}
+
+  def spawn_command(binary, args, false) do
     case :os.type() do
       {:win32, _} -> {binary, args}
       _ -> {"/bin/sh", ["-c", @watchdog, binary | args]}
     end
   end
 
-  defp await_launch(port, user_data_dir, owns?, timeout) do
+  defp await_launch(port, user_data_dir, owns?, pipe?, timeout) do
     os_pid =
       case Port.info(port, :os_pid) do
         {:os_pid, pid} -> pid
         _ -> nil
       end
 
-    case await_debug_url(port, user_data_dir, "", deadline(timeout)) do
+    ready =
+      if pipe?,
+        do: await_pipe(port, deadline(timeout)),
+        else: await_debug_url(port, user_data_dir, "", deadline(timeout))
+
+    case ready do
       {:ok, debug_url} ->
         {:ok,
          %{
            port: port,
            os_pid: os_pid,
            debug_url: debug_url,
+           pipe: pipe?,
            user_data_dir: user_data_dir,
            owns_data_dir: owns?
          }}
@@ -320,7 +373,7 @@ defmodule CDPEx.Chrome do
       "--disable-field-trial-config",
       "--window-size=#{width},#{height}",
       "--user-data-dir=#{user_data_dir}",
-      "--remote-debugging-port=0"
+      debugging_flag(Keyword.get(opts, :pipe, false))
     ]
 
     headless_flag(headless?) ++ base ++ ["about:blank"]
@@ -328,6 +381,9 @@ defmodule CDPEx.Chrome do
 
   defp headless_flag(true), do: ["--headless"]
   defp headless_flag(false), do: []
+
+  defp debugging_flag(true), do: "--remote-debugging-pipe"
+  defp debugging_flag(false), do: "--remote-debugging-port=0"
 
   # ── Chrome discovery ────────────────────────────────────────────────────────
 
@@ -509,6 +565,43 @@ defmodule CDPEx.Chrome do
             {:error, _} -> await_debug_url(port, dir, buffer, deadline)
           end
       end
+    end
+  end
+
+  # Pipe readiness: Chrome reads the pipe only once DevTools is up, so the probe can be
+  # written at once and its reply means Chrome is ready. Nothing else arrives before
+  # it: Chrome sends events only for domains or targets a client has enabled, and no
+  # client has yet. A Port.command on a port that already closed raises; the
+  # exit_status it delivered first is still in the mailbox and is read below.
+  defp await_pipe(port, deadline) do
+    try do
+      Port.command(port, Protocol.pipe_frame(@pipe_probe))
+    rescue
+      ArgumentError -> :ok
+    end
+
+    await_pipe_reply(port, "", deadline)
+  end
+
+  defp await_pipe_reply(port, buffer, deadline) do
+    receive do
+      {^port, {:data, data}} ->
+        case Protocol.split_pipe_messages(buffer, data) do
+          {[], buffer} -> await_pipe_reply(port, buffer, deadline)
+          {[reply | _], _rest} -> pipe_probe_result(reply)
+        end
+
+      {^port, {:exit_status, status}} ->
+        {:error, exit_reason(status, "")}
+    after
+      max(remaining_ms(deadline), 0) -> {:error, {:debug_url_not_found, ""}}
+    end
+  end
+
+  defp pipe_probe_result(reply) do
+    case Jason.decode(reply) do
+      {:ok, %{"id" => 0, "result" => _}} -> {:ok, nil}
+      _ -> {:error, {:debug_url_not_found, String.slice(reply, 0, 500)}}
     end
   end
 

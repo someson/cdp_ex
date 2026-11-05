@@ -31,7 +31,7 @@ scraper, where it replaced a Wallaby/ChromeDriver setup.
 
 | | CDPEx | playwright_ex | ChromicPDF | Wallaby |
 |---|---|---|---|---|
-| Talks to Chrome over | CDP (WebSocket) | the Playwright Node.js driver | CDP (pipes) | WebDriver |
+| Talks to Chrome over | CDP (WebSocket, or a pipe) | the Playwright Node.js driver | CDP (pipes) | WebDriver |
 | Extra process to run | — | Node.js | — | ChromeDriver |
 | Scope | general automation | general automation, testing | PDF / screenshots | feature tests |
 
@@ -48,6 +48,9 @@ Playwright or Puppeteer), that's the gap CDPEx fills.
 > Opt into `sessionId` multiplexing (many pages over the one browser socket)
 > with `new_page(browser, transport: :session)`; the trade-off is shared fate (a
 > dropped browser connection drops all of its session pages).
+>
+> **Pipe:** `launch(pipe: true)` talks CDP over Chrome's stdin/stdout instead of
+> a local TCP port (`:session` pages only). See below.
 >
 > **Connect to a running Chrome:** attach to a Chrome you didn't launch — local,
 > a sidecar, or a remote/cloud `wss://` endpoint — with `connect/2` (`:session`
@@ -195,6 +198,31 @@ one-shot form.
 > returns **403** for a non-IP/non-`localhost` `Host` (DNS-rebinding protection), so
 > for a **named** remote/sidecar/cloud Chrome pass the `ws(s)://` browser URL
 > directly rather than the `http(s)://` discovery form.
+
+### Over a pipe instead of a DevTools port
+
+By default Chrome listens on a local TCP port for DevTools, and any process on
+the host that finds the port can drive that browser. `pipe: true` launches Chrome
+with `--remote-debugging-pipe` instead: CDP goes over the Port's stdin and
+stdout, and no port is opened.
+
+```elixir
+{:ok, browser} = CDPEx.launch(pipe: true)
+{:ok, page} = CDPEx.new_page(browser)  # a :session page
+```
+
+It works with `with_page([pipe: true], fun)` and
+`Pool.start_link(launch_opts: [pipe: true])` too. The trade-offs:
+
+- Pages are `:session` pages only: `transport: :dedicated` returns
+  `{:error, {:unsupported_transport, :dedicated}}`, so `Page.authenticate/4` and
+  request interception aren't available, and a `:proxy` with credentials fails
+  the launch with `{:error, {:invalid_proxy, :pipe}}`. A proxy without
+  credentials works.
+- Chrome's stderr is discarded, so a failed launch carries no stderr excerpt.
+- Unix only.
+- Startup is about 15 ms faster on Linux (104 vs 120 ms to the first CDP reply,
+  Chromium in a 4-CPU container) and no faster on macOS.
 
 ### Under your supervision tree
 

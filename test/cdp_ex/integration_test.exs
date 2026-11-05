@@ -2157,6 +2157,98 @@ defmodule CDPEx.IntegrationTest do
     end
   end
 
+  describe "pipe transport" do
+    test "drives :session pages over the pipe, with no DevTools port", %{fixture: fixture} do
+      {:ok, browser} = CDPEx.launch(pipe: true)
+      on_exit(fn -> stop_quietly(browser) end)
+      %{chrome: chrome} = :sys.get_state(browser)
+
+      assert chrome.debug_url == nil
+      # Chrome writes DevToolsActivePort only when it listens on a TCP port.
+      refute File.exists?(Path.join(chrome.user_data_dir, "DevToolsActivePort"))
+
+      assert CDPEx.new_page(browser, transport: :dedicated) ==
+               {:error, {:unsupported_transport, :dedicated}}
+
+      {:ok, page} = CDPEx.new_page(browser)
+      assert is_binary(page.session_id)
+      {:ok, _} = Page.navigate(page, fixture)
+      assert {:ok, html} = Page.html(page)
+      assert html =~ "<html"
+      assert :ok = CDPEx.close_page(browser, page)
+    end
+
+    test "carries a message far larger than one Port chunk" do
+      {:ok, browser} = CDPEx.launch(pipe: true)
+      on_exit(fn -> stop_quietly(browser) end)
+      {:ok, page} = CDPEx.new_page(browser)
+
+      assert {:ok, value} = Page.evaluate(page, "'x'.repeat(8 * 1024 * 1024)")
+      assert byte_size(value) == 8 * 1024 * 1024
+    end
+
+    test "isolated pages get their own context, disposed on close", %{fixture: fixture} do
+      {:ok, browser} = CDPEx.launch(pipe: true)
+      on_exit(fn -> stop_quietly(browser) end)
+
+      {:ok, page} = CDPEx.new_page(browser, isolated: true)
+      {:ok, _} = Page.navigate(page, fixture)
+      assert [_] = contexts(browser)
+      :ok = CDPEx.close_page(browser, page)
+      assert eventually(fn -> contexts(browser) == [] end)
+    end
+
+    test "with_page/3 and a pool launch with pipe: true" do
+      assert {:ok, 2} = CDPEx.with_page([pipe: true], &Page.evaluate(&1, "1 + 1"))
+
+      {:ok, pool} = Pool.start_link(size: 1, launch_opts: [pipe: true])
+      on_exit(fn -> stop_pool_quietly(pool) end)
+      assert {:ok, 3} = Pool.with_page(pool, &Page.evaluate(&1, "1 + 2"))
+    end
+
+    test "stop/1 reaps Chrome and removes the profile dir" do
+      {:ok, browser} = CDPEx.launch(pipe: true)
+      %{chrome: %{os_pid: os_pid, user_data_dir: dir}} = :sys.get_state(browser)
+
+      :ok = CDPEx.stop(browser)
+      refute os_alive?(os_pid)
+      refute File.dir?(dir)
+    end
+
+    test "killing Chrome stops the browser with {:chrome_exited, status}" do
+      {:ok, browser} = CDPEx.launch(pipe: true)
+      {:ok, page} = CDPEx.new_page(browser)
+      ref = Process.monitor(browser)
+      %{chrome: %{os_pid: os_pid}} = :sys.get_state(browser)
+
+      capture_log(fn ->
+        {_, 0} = System.cmd("kill", ["-9", to_string(os_pid)])
+        assert_receive {:DOWN, ^ref, :process, ^browser, {:chrome_exited, _status}}, 10_000
+      end)
+
+      assert {:error, _} = Page.evaluate(page, "1 + 1")
+    end
+
+    test "Chrome exits with the VM that launched it, though no watchdog runs" do
+      script = """
+      {:ok, _} = Application.ensure_all_started(:cdp_ex)
+      {:ok, browser} = CDPEx.launch(pipe: true)
+      %{os_pid: os_pid, user_data_dir: dir} = :sys.get_state(browser).chrome
+      IO.puts("chrome=\#{os_pid} dir=\#{dir}")
+      System.halt(1)
+      """
+
+      code_path = Enum.flat_map(:code.get_path(), &["-pa", to_string(&1)])
+      elixir = System.find_executable("elixir")
+      {out, 1} = System.cmd(elixir, code_path ++ ["-e", script], stderr_to_stdout: true)
+      [_, os_pid, dir] = Regex.run(~r/chrome=(\d+) dir=(\S+)/, out)
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      assert eventually(fn -> not os_alive?(os_pid) end, 250),
+             "Chrome (os pid #{os_pid}) outlived the VM that launched it"
+    end
+  end
+
   # The browser contexts other than the default one, as Chrome reports them.
   defp contexts(browser) do
     %{browser_conn: conn} = :sys.get_state(browser)

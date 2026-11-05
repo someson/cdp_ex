@@ -132,6 +132,87 @@ defmodule CDPEx.ConnectionTest do
     assert_receive {:cdp_event, ^conn, "Page.lifecycleEvent", %{"name" => "load"}, nil}, 2_000
   end
 
+  describe "pipe transport" do
+    # A Port into a sink stands in for Chrome: what the connection writes is
+    # discarded, and the test plays Chrome's side by sending the connection the
+    # messages a Port delivers, {port, {:data, _}} and {port, {:exit_status, _}}.
+    setup do
+      port =
+        Port.open({:spawn_executable, "/bin/sh"}, [
+          :binary,
+          :exit_status,
+          args: ["-c", "cat >/dev/null"]
+        ])
+
+      {:ok, conn} = Connection.start_link({:pipe, port})
+      true = Port.connect(port, conn)
+      %{pipe: conn, port: port}
+    end
+
+    test "matches a reply split across chunks to its caller", %{pipe: conn, port: port} do
+      task = Task.async(fn -> Connection.call(conn, "Browser.getVersion", %{}) end)
+      eventually_pending(conn)
+
+      send(conn, {port, {:data, ~s({"id":1,"res)}})
+      send(conn, {port, {:data, ~s(ult":{"product":"x"}}) <> <<0>>}})
+
+      assert Task.await(task) == {:ok, %{"product" => "x"}}
+    end
+
+    test "delivers several events from one chunk, in order", %{pipe: conn, port: port} do
+      :ok = Connection.subscribe(conn, "Page.lifecycleEvent")
+
+      send(
+        conn,
+        {port,
+         {:data,
+          ~s({"method":"Page.lifecycleEvent","params":{"n":1}}) <>
+            <<0>> <> ~s({"method":"Page.lifecycleEvent","params":{"n":2}}) <> <<0>>}}
+      )
+
+      assert_receive {:cdp_event, ^conn, "Page.lifecycleEvent", %{"n" => 1}, nil}, 1_000
+      assert_receive {:cdp_event, ^conn, "Page.lifecycleEvent", %{"n" => 2}, nil}, 1_000
+    end
+
+    test "Chrome's exit fails in-flight callers with {:ws_closed, {:chrome_exited, status}}", %{
+      pipe: conn,
+      port: port
+    } do
+      ref = Process.monitor(conn)
+      task = Task.async(fn -> Connection.call(conn, "Browser.getVersion", %{}) end)
+      eventually_pending(conn)
+
+      send(conn, {port, {:exit_status, 137}})
+
+      assert Task.await(task) == {:error, {:ws_closed, {:chrome_exited, 137}}}
+
+      assert_receive {:DOWN, ^ref, :process, ^conn,
+                      {:shutdown, {:ws_closed, {:chrome_exited, 137}}}}
+    end
+
+    test "a Port closed by another process stops the connection with {:ws_closed, :closed}", %{
+      pipe: conn,
+      port: port
+    } do
+      ref = Process.monitor(conn)
+      Port.close(port)
+      assert_receive {:DOWN, ^ref, :process, ^conn, {:shutdown, {:ws_closed, :closed}}}
+    end
+
+    test "closing the connection closes the Port", %{pipe: conn, port: port} do
+      :ok = Connection.close(conn)
+      assert Port.info(port) == nil
+    end
+  end
+
+  defp eventually_pending(conn, retries \\ 50) do
+    cond do
+      map_size(:sys.get_state(conn).pending) > 0 -> :ok
+      retries == 0 -> flunk("the call never reached the connection")
+      true -> Process.sleep(10) && eventually_pending(conn, retries - 1)
+    end
+  end
+
   describe "tls_opts/1" do
     test "verifies the peer via the OS trust store by default" do
       opts = Connection.tls_opts([])
