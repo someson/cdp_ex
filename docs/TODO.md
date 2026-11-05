@@ -39,8 +39,21 @@ browser process was killed, briefly outlive it and recreate the profile dir
 after `remove_dir/1` has deleted it. `remove_dir/1` retries 5 times, 50 ms
 apart, then gives up quietly.
 
-**Next step.** Confirm by logging which process creates the dir (e.g.
-`inotifywait` on the temp dir during a loop of that test). If confirmed, wait
+**Not reproduced on current main** (2026-11-05, Apple Silicon host): 0 leftover
+dirs and 0 Chrome processes in every run below.
+
+| Setup | Runs |
+|-------|------|
+| macOS, Google Chrome stable | 20 |
+| Ubuntu 26.04 container, Chrome for Testing 156 arm64 (Playwright 1.64.1), `strace` | 20 |
+| Same, no `strace`, capped to 4 CPUs | 120 |
+| Ubuntu 26.04 container, Google Chrome 157 amd64 (emulated), `strace` | 20 |
+
+Under `strace`, the only `mkdir` of the profile dir came from the BEAM. The
+harness is `test/docker/` (`TRACE=1` names the process that creates a leftover
+dir). The container numbers still differ from the original setup (Chromium
+1243 on a native 4 vCPU Linux host). Parked: rerun `TRACE=1
+test/docker/run.sh` if a leftover dir shows up again. If one does leak, wait
 for the whole Chrome process group to exit before removing the dir, or retry
 removal for longer.
 
