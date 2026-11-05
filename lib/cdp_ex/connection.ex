@@ -57,6 +57,9 @@ defmodule CDPEx.Connection do
     all_subscribers: %{},
     monitors: %{},
     waiters: [],
+    # waiter `to` => monitor ref on the process that registered it, so a waiter
+    # whose caller dies goes at once rather than at its timeout (see the :DOWN clause).
+    waiter_monitors: %{},
     ws_send_error: nil
   ]
 
@@ -411,15 +414,12 @@ defmodule CDPEx.Connection do
     {:reply, :ok, demonitor_if_orphaned(state, pid)}
   end
 
-  def handle_call({:await_event, matcher, timeout, session_id}, from, state) do
-    timer = arm_timeout({:waiter_timeout, from}, timeout)
-    {:noreply, %{state | waiters: [{matcher, session_id, from, timer} | state.waiters]}}
+  def handle_call({:await_event, matcher, timeout, session_id}, {caller, _tag} = from, state) do
+    {:noreply, add_waiter(state, {matcher, session_id, from}, timeout, caller)}
   end
 
-  def handle_call({:await_event_async, matcher, timeout, session_id, ref}, _from, state) do
-    to = {:async, ref}
-    timer = arm_timeout({:waiter_timeout, to}, timeout)
-    {:reply, :ok, %{state | waiters: [{matcher, session_id, to, timer} | state.waiters]}}
+  def handle_call({:await_event_async, matcher, timeout, session_id, ref}, {caller, _}, state) do
+    {:reply, :ok, add_waiter(state, {matcher, session_id, {:async, ref}}, timeout, caller)}
   end
 
   @impl true
@@ -428,9 +428,9 @@ defmodule CDPEx.Connection do
       {nil, _waiters} ->
         {:noreply, state}
 
-      {{_matcher, _sid, _to, timer}, waiters} ->
+      {{_matcher, _sid, to, timer}, waiters} ->
         cancel_timer(timer)
-        {:noreply, %{state | waiters: waiters}}
+        {:noreply, forget_waiters(%{state | waiters: waiters}, [to])}
     end
   end
 
@@ -453,7 +453,7 @@ defmodule CDPEx.Connection do
 
       {_waiter, waiters} ->
         reply_waiter(from, {:error, {:timeout, :await_event}})
-        {:noreply, %{state | waiters: waiters}}
+        {:noreply, forget_waiters(%{state | waiters: waiters}, [from])}
     end
   end
 
@@ -476,8 +476,10 @@ defmodule CDPEx.Connection do
   # A subscriber process died without unsubscribing: drop it from every
   # subscription and forget its monitor, so dead pids can't accumulate. Must come
   # before the catch-all clause, which would otherwise feed it to WebSocket.stream.
-  def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
-    {:noreply, drop_subscriber(state, pid)}
+  # A dead waiter caller is dropped the same way: with nobody left to receive its
+  # outcome, it would otherwise run its matcher on every event until its timeout.
+  def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
+    {:noreply, state |> drop_dead_waiter(ref) |> drop_subscriber(pid)}
   end
 
   # A linked process — our owner (e.g. CDPEx.Browser) — went down. Stop too, so
@@ -634,7 +636,7 @@ defmodule CDPEx.Connection do
       reply_waiter(from, reason)
     end)
 
-    %{state | pending: pending, waiters: waiters}
+    forget_waiters(%{state | pending: pending, waiters: waiters}, Enum.map(dead, &elem(&1, 2)))
   end
 
   defp fail_detached_session(state, _method, _params), do: state
@@ -650,7 +652,37 @@ defmodule CDPEx.Connection do
       reply_waiter(from, {:ok, params})
     end)
 
-    %{state | waiters: kept}
+    forget_waiters(%{state | waiters: kept}, Enum.map(matched, &elem(&1, 2)))
+  end
+
+  defp add_waiter(state, {matcher, session_id, to}, timeout, caller) do
+    timer = arm_timeout({:waiter_timeout, to}, timeout)
+
+    %{
+      state
+      | waiters: [{matcher, session_id, to, timer} | state.waiters],
+        waiter_monitors: Map.put(state.waiter_monitors, to, Process.monitor(caller))
+    }
+  end
+
+  # Demonitors the callers of waiters that just ended, so a long-lived caller doesn't
+  # pile up monitors. [:flush] drops a :DOWN already in the mailbox.
+  defp forget_waiters(state, tos) do
+    {mons, waiter_monitors} = Map.split(state.waiter_monitors, tos)
+    Enum.each(mons, fn {_to, mon} -> Process.demonitor(mon, [:flush]) end)
+    %{state | waiter_monitors: waiter_monitors}
+  end
+
+  defp drop_dead_waiter(state, mon) do
+    case Enum.find(state.waiter_monitors, fn {_to, m} -> m == mon end) do
+      nil ->
+        state
+
+      {to, _mon} ->
+        {waiter, waiters} = pop_waiter(state.waiters, to)
+        if waiter, do: cancel_timer(elem(waiter, 3))
+        %{state | waiters: waiters, waiter_monitors: Map.delete(state.waiter_monitors, to)}
+    end
   end
 
   # A session-less waiter (`nil`) matches any event — preserving the default
