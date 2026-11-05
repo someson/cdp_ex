@@ -173,10 +173,16 @@ defmodule CDPEx.Connection do
   @doc """
   Removes a subscription created with `subscribe/4`. A connection that is gone has
   no subscriptions left, so that is `:ok` too.
+
+  Without options it removes all of the caller's subscriptions to `method`, whatever
+  their session filter. Pass `session_id: sid` (`nil` included) to remove only the one
+  made with that filter, so a process watching two sessions of one connection can
+  stop watching one of them.
   """
-  @spec unsubscribe(GenServer.server(), String.t() | :all) :: :ok
-  def unsubscribe(conn, method) do
-    GenServer.call(conn, {:unsubscribe, method, self()})
+  @spec unsubscribe(GenServer.server(), String.t() | :all, keyword()) :: :ok
+  def unsubscribe(conn, method, opts \\ []) do
+    scope = if Keyword.has_key?(opts, :session_id), do: {:only, opts[:session_id]}, else: :any
+    GenServer.call(conn, {:unsubscribe, method, scope, self()})
   catch
     :exit, {reason, {GenServer, :call, _}} when reason != :calling_self -> :ok
   end
@@ -403,13 +409,13 @@ defmodule CDPEx.Connection do
     {:reply, :ok, %{state | subscribers: subs}}
   end
 
-  def handle_call({:unsubscribe, :all, pid}, _from, state) do
-    state = %{state | all_subscribers: Map.delete(state.all_subscribers, pid)}
+  def handle_call({:unsubscribe, :all, scope, pid}, _from, state) do
+    state = %{state | all_subscribers: drop_filter(state.all_subscribers, pid, scope)}
     {:reply, :ok, demonitor_if_orphaned(state, pid)}
   end
 
-  def handle_call({:unsubscribe, method, pid}, _from, state) do
-    subs = Map.update(state.subscribers, method, %{}, &Map.delete(&1, pid))
+  def handle_call({:unsubscribe, method, scope, pid}, _from, state) do
+    subs = Map.update(state.subscribers, method, %{}, &drop_filter(&1, pid, scope))
     state = %{state | subscribers: subs}
     {:reply, :ok, demonitor_if_orphaned(state, pid)}
   end
@@ -743,6 +749,21 @@ defmodule CDPEx.Connection do
   # several sessions on the shared connection).
   defp add_filter(map, pid, session_id) do
     Map.update(map, pid, MapSet.new([session_id]), &MapSet.put(&1, session_id))
+  end
+
+  # `:any` drops all of `pid`'s filters; `{:only, sid}` drops that one, and the pid
+  # with it once none is left.
+  defp drop_filter(map, pid, :any), do: Map.delete(map, pid)
+
+  defp drop_filter(map, pid, {:only, session_id}) do
+    case Map.fetch(map, pid) do
+      {:ok, filters} ->
+        filters = MapSet.delete(filters, session_id)
+        if MapSet.size(filters) == 0, do: Map.delete(map, pid), else: Map.put(map, pid, filters)
+
+      :error ->
+        map
+    end
   end
 
   # Monitor a subscriber the first time it subscribes, so we learn if it dies.

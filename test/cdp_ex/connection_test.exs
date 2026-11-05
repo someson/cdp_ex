@@ -213,6 +213,36 @@ defmodule CDPEx.ConnectionTest do
     end
   end
 
+  describe "unsubscribe/3 with :session_id" do
+    test "removes only that session's subscription", %{conn: conn, fake: fake} do
+      :ok = Connection.subscribe(conn, "Fetch.requestPaused", 1_000, session_id: "A")
+      :ok = Connection.subscribe(conn, "Fetch.requestPaused", 1_000, session_id: "B")
+      :ok = Connection.unsubscribe(conn, "Fetch.requestPaused", session_id: "A")
+
+      for sid <- ["A", "B"] do
+        FakeCDP.send_text(
+          fake,
+          ~s({"method":"Fetch.requestPaused","sessionId":"#{sid}","params":{"s":"#{sid}"}})
+        )
+      end
+
+      assert_receive {:cdp_event, ^conn, "Fetch.requestPaused", %{"s" => "B"}, "B"}, 2_000
+      refute_received {:cdp_event, ^conn, "Fetch.requestPaused", %{"s" => "A"}, "A"}
+      # Still subscribed through B, so still monitored.
+      assert Map.has_key?(:sys.get_state(conn).monitors, self())
+
+      :ok = Connection.unsubscribe(conn, "Fetch.requestPaused", session_id: "B")
+      refute Map.has_key?(:sys.get_state(conn).monitors, self())
+    end
+
+    test "without options removes every filter, as before", %{conn: conn} do
+      :ok = Connection.subscribe(conn, "Fetch.requestPaused", 1_000, session_id: "A")
+      :ok = Connection.subscribe(conn, "Fetch.requestPaused", 1_000, session_id: "B")
+      :ok = Connection.unsubscribe(conn, "Fetch.requestPaused")
+      assert :sys.get_state(conn).subscribers["Fetch.requestPaused"] == %{}
+    end
+  end
+
   describe "tls_opts/1" do
     test "verifies the peer via the OS trust store by default" do
       opts = Connection.tls_opts([])

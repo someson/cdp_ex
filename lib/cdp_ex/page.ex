@@ -507,7 +507,7 @@ defmodule CDPEx.Page do
         after
           stop_watch(watch)
           Process.demonitor(ref, [:flush])
-          :ok = unsubscribe_each(page.conn, [@lifecycle_method])
+          :ok = unsubscribe_each(page.conn, [@lifecycle_method], page.session_id)
           drain_events(page.conn, @lifecycle_method)
         end
     end
@@ -1548,7 +1548,7 @@ defmodule CDPEx.Page do
         # method in `methods`; if the caller had independently subscribed to one of
         # them beforehand, that subscription goes too (an accepted edge case —
         # observe_network owns the lifecycle of the methods it is given).
-        unsubscribe_each(page.conn, methods)
+        unsubscribe_each(page.conn, methods, page.session_id)
         error
     end
   end
@@ -1564,7 +1564,7 @@ defmodule CDPEx.Page do
   """
   @spec stop_observing_network(t(), keyword()) :: :ok
   def stop_observing_network(%__MODULE__{} = page, opts \\ []) do
-    unsubscribe_each(page.conn, Keyword.get(opts, :events, @network_events))
+    unsubscribe_each(page.conn, Keyword.get(opts, :events, @network_events), page.session_id)
   end
 
   @doc """
@@ -1977,9 +1977,10 @@ defmodule CDPEx.Page do
   > forgetful caller can't leave it bricked (every request paused with no resolver).
   > While interception is enabled you must still resolve every pause.
 
-  Only `:dedicated` pages are supported; a `:session`-transport page is rejected with
-  `{:error, {:unsupported_transport, :session}}` — its subscription and owner-monitor
-  would outlive `close_page`, which never stops the shared browser connection.
+  Works on `:dedicated` and `:session` pages. On a `:session` page the subscription is
+  scoped to its session, so one process can intercept several pages of a browser and
+  tell their pauses apart by the event's session id; disabling one leaves the others.
+  When the page closes, the browser forgets its interception owner.
 
   Mutually exclusive with `authenticate/4` on the same page — both drive the `Fetch`
   domain. The conflict is **enforced**: enabling interception on an authenticated page
@@ -2002,12 +2003,12 @@ defmodule CDPEx.Page do
     # enable (on this process, mirroring observe_network/2); roll both back on failure.
     case Browser.reserve_interception(page.browser, page) do
       :ok ->
-        with :ok <- subscribe_each(page.conn, [@fetch_paused], timeout),
+        with :ok <- subscribe_each(page.conn, [@fetch_paused], timeout, page.session_id),
              {:ok, _} <- do_call(page, "Fetch.enable", %{"patterns" => patterns}, timeout) do
           :ok
         else
           {:error, _} = error ->
-            unsubscribe_each(page.conn, [@fetch_paused])
+            unsubscribe_each(page.conn, [@fetch_paused], page.session_id)
             # A client-side timeout can mean Chrome actually enabled Fetch; disable it
             # best-effort before releasing, so a timed-out enable can't leave the page
             # bricked (Fetch on, no resolver) with the reservation/monitor already gone.
@@ -2032,7 +2033,7 @@ defmodule CDPEx.Page do
   @spec disable_request_interception(t(), keyword()) :: :ok | {:error, term()}
   def disable_request_interception(%__MODULE__{} = page, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
-    unsubscribe_each(page.conn, [@fetch_paused])
+    unsubscribe_each(page.conn, [@fetch_paused], page.session_id)
     result = ok_call(page, "Fetch.disable", %{}, timeout)
     # Release the browser-side reservation (demonitors this process) regardless of the
     # disable result, so the eventual owner :DOWN can't re-issue a spurious disable.
@@ -2273,7 +2274,7 @@ defmodule CDPEx.Page do
   # fine — if one subscribe exhausts it the rest are skipped. A budget-exhausted call
   # surfaces as :timeout (the conn is alive, the deadline elapsed) vs :noproc for a
   # genuinely dead conn.
-  defp subscribe_each(conn, methods, timeout, session_id \\ nil) do
+  defp subscribe_each(conn, methods, timeout, session_id) do
     Enum.reduce_while(methods, :ok, fn method, :ok ->
       case Connection.subscribe(conn, method, timeout, session_id: session_id) do
         :ok -> {:cont, :ok}
@@ -2284,8 +2285,10 @@ defmodule CDPEx.Page do
     end)
   end
 
-  defp unsubscribe_each(conn, methods) do
-    Enum.each(methods, &Connection.unsubscribe(conn, &1))
+  # Only the subscriptions made for this page's session (nil on a :dedicated page), so a
+  # process watching several :session pages of one browser keeps the others.
+  defp unsubscribe_each(conn, methods, session_id) do
+    Enum.each(methods, &Connection.unsubscribe(conn, &1, session_id: session_id))
   end
 
   defp ok_call(page, method, params, timeout) do

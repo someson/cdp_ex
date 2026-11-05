@@ -158,12 +158,49 @@ defmodule CDPEx.BrowserTest do
   end
 
   describe "interception reservation (#30)" do
-    test "rejects a :session page (shared-connection ownership problem)" do
-      page = %Page{browser: self(), conn: self(), target_id: "T1", session_id: "S1"}
-      state = %Browser{}
+    test "reserves an owned :session page and rejects one it doesn't track" do
+      conn = self()
+      page = %Page{browser: self(), conn: conn, target_id: "T1", session_id: "S1"}
+      caller = spawn(fn -> Process.sleep(:infinity) end)
 
-      assert {:reply, {:error, {:unsupported_transport, :session}}, ^state} =
-               Browser.handle_call({:reserve_interception, page}, {self(), make_ref()}, state)
+      assert {:reply, :ok, reserved} =
+               Browser.handle_call(
+                 {:reserve_interception, page},
+                 {caller, make_ref()},
+                 %Browser{browser_conn: conn, sessions: %{"T1" => "S1"}}
+               )
+
+      assert {^caller, _ref} = reserved.intercepts["T1"]
+
+      other = %Browser{browser_conn: conn, sessions: %{"T1" => "OTHER"}}
+
+      assert {:reply, {:error, :unknown_page}, ^other} =
+               Browser.handle_call({:reserve_interception, page}, {caller, make_ref()}, other)
+
+      Process.exit(caller, :kill)
+    end
+
+    test "a :session page's detach drops its reservation and the owner monitor" do
+      conn = self()
+      caller = spawn(fn -> Process.sleep(:infinity) end)
+      ref = Process.monitor(caller)
+
+      state = %Browser{
+        browser_conn: conn,
+        sessions: %{"T1" => "S1"},
+        intercepts: %{"T1" => {caller, ref}}
+      }
+
+      event =
+        {:cdp_event, conn, "Target.detachedFromTarget", %{"sessionId" => "S1", "targetId" => "T1"},
+         nil}
+
+      assert {:noreply, %Browser{intercepts: %{}, sessions: %{}}} =
+               Browser.handle_info(event, state)
+
+      # The monitor is gone: the owner's death now sends nothing.
+      Process.exit(caller, :kill)
+      refute_receive {:DOWN, ^ref, :process, _, _}, 100
     end
 
     test "rejects a page this browser doesn't own" do

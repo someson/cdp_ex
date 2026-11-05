@@ -559,16 +559,13 @@ defmodule CDPEx.Browser do
     end
   end
 
-  def handle_call({:reserve_interception, %Page{session_id: sid}}, _from, state)
-      when not is_nil(sid) do
-    # Same shared-connection problem authenticate/4 rejects: an interception owner on a
-    # :session page would outlive close_page (which never stops the shared connection).
-    {:reply, {:error, {:unsupported_transport, :session}}, state}
-  end
-
-  def handle_call({:reserve_interception, %Page{conn: conn, target_id: tid}}, {caller, _tag}, state) do
+  def handle_call(
+        {:reserve_interception, %Page{conn: conn, target_id: tid, session_id: sid}},
+        {caller, _tag},
+        state
+      ) do
     cond do
-      Map.get(state.pages, tid) != conn ->
+      not own_page?(state, tid, conn, sid) ->
         {:reply, {:error, :unknown_page}, state}
 
       Map.has_key?(state.auths, tid) ->
@@ -648,7 +645,7 @@ defmodule CDPEx.Browser do
     # takes its isolated context with it.
     state =
       case Enum.find(state.pages, fn {_tid, conn} -> conn == pid end) do
-        {tid, _conn} -> drop_context(state, tid)
+        {tid, _conn} -> page_gone(state, tid)
         nil -> state
       end
 
@@ -664,7 +661,7 @@ defmodule CDPEx.Browser do
     # and a targetId we don't track is simply a no-op delete.
     # An isolated page's context goes with it.
     tid = params["targetId"]
-    state = drop_context(state, tid)
+    state = page_gone(state, tid)
     {:noreply, %{state | sessions: Map.delete(state.sessions, tid)}}
   end
 
@@ -713,10 +710,11 @@ defmodule CDPEx.Browser do
         cancel_orphaned_auth(state, ref)
 
       {tid, intercepts} ->
-        case Map.get(state.pages, tid) do
+        case {Map.get(state.pages, tid), Map.get(state.sessions, tid)} do
           # Page already closed: its Fetch domain went with it, nothing to disable.
-          nil -> :ok
-          conn -> disable_fetch_async(conn)
+          {nil, nil} -> :ok
+          {nil, sid} -> disable_fetch_async(state.browser_conn, sid)
+          {conn, _} -> disable_fetch_async(conn, nil)
         end
 
         {:noreply, %{state | intercepts: intercepts}}
@@ -759,12 +757,12 @@ defmodule CDPEx.Browser do
   # an unresponsive page connection can't block the Browser GenServer. Connection.call
   # tolerates a dead conn (returns {:error, _} rather than exiting); a genuine failure
   # on a live conn is logged since it can leave the page intercepted.
-  defp disable_fetch_async(conn) do
+  defp disable_fetch_async(conn, session_id) do
     _ =
       Task.start(fn ->
         ProcessLabel.set({:cdp_fetch_disable, conn})
 
-        case Connection.call(conn, "Fetch.disable", %{}, @create_timeout) do
+        case Connection.call(conn, "Fetch.disable", %{}, @create_timeout, session_id: session_id) do
           {:ok, _} ->
             :ok
 
@@ -772,6 +770,10 @@ defmodule CDPEx.Browser do
             :ok
 
           {:error, {:ws_closed, _}} ->
+            :ok
+
+          # The :session page closed meanwhile, taking its Fetch domain with it.
+          {:error, {:session_closed, _}} ->
             :ok
 
           {:error, reason} ->
@@ -1130,11 +1132,14 @@ defmodule CDPEx.Browser do
   # Ends one of our pages' targets (see discard_target/3) and forgets its context.
   defp end_target(state, tid) do
     discard_target(state.browser_conn, tid, Map.get(state.contexts, tid))
-    %{state | contexts: Map.delete(state.contexts, tid)}
+    drop_intercept(%{state | contexts: Map.delete(state.contexts, tid)}, tid)
   end
 
-  # The page's target is already gone: dispose its context, if it had one.
-  defp drop_context(state, tid) do
+  # The page's target is already gone: dispose its context, if it had one, and forget
+  # its interception owner.
+  defp page_gone(state, tid) do
+    state = drop_intercept(state, tid)
+
     case Map.pop(state.contexts, tid) do
       {nil, _} ->
         state
@@ -1142,6 +1147,19 @@ defmodule CDPEx.Browser do
       {context_id, contexts} ->
         dispose_context(state.browser_conn, context_id)
         %{state | contexts: contexts}
+    end
+  end
+
+  # The page ended, and its Fetch domain with it: forget its interception owner, so a
+  # long-lived owner that never disables doesn't keep an entry and a monitor per page.
+  defp drop_intercept(state, tid) do
+    case Map.pop(state.intercepts, tid) do
+      {nil, _} ->
+        state
+
+      {{_caller, ref}, intercepts} ->
+        Process.demonitor(ref, [:flush])
+        %{state | intercepts: intercepts}
     end
   end
 
