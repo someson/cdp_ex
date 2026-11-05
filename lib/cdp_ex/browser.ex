@@ -425,7 +425,7 @@ defmodule CDPEx.Browser do
         # The page rides the shared browser connection; detach the session and
         # close the tab, but NEVER close that connection (other sessions use it).
         detach_session(state.browser_conn, sid)
-        close_target(state.browser_conn, tid)
+        state = end_target(state, tid)
         Telemetry.page(:stop, %{target_id: tid, transport: :session})
         {:reply, :ok, %{state | sessions: Map.delete(state.sessions, tid)}}
 
@@ -440,7 +440,7 @@ defmodule CDPEx.Browser do
         # Close the target on the browser connection first (a page connection can't
         # cleanly close its own target), then stop the page connection — best-effort,
         # since either may already be gone.
-        close_target(state.browser_conn, tid)
+        state = end_target(state, tid)
         safe_close(conn)
         Telemetry.page(:stop, %{target_id: tid, transport: :dedicated})
         {:reply, :ok, %{state | pages: Map.delete(state.pages, tid)}}
@@ -596,6 +596,14 @@ defmodule CDPEx.Browser do
           %{state | pending_auth: pending_auth}
       end
 
+    # A page connection that went away on its own (tab crashed or closed from outside)
+    # takes its isolated context with it.
+    state =
+      case Enum.find(state.pages, fn {_tid, conn} -> conn == pid end) do
+        {tid, _conn} -> drop_context(state, tid)
+        nil -> state
+      end
+
     {:noreply, %{state | pages: drop_conn(state.pages, pid), auths: drop_value(state.auths, pid)}}
   end
 
@@ -606,7 +614,10 @@ defmodule CDPEx.Browser do
     # A flattened session ended. Drop its entry so it doesn't linger for the life
     # of the browser. Idempotent: our own close_page may have removed it already,
     # and a targetId we don't track is simply a no-op delete.
-    {:noreply, %{state | sessions: Map.delete(state.sessions, params["targetId"])}}
+    # An isolated page's context goes with it.
+    tid = params["targetId"]
+    state = drop_context(state, tid)
+    {:noreply, %{state | sessions: Map.delete(state.sessions, tid)}}
   end
 
   def handle_info({:armed, pid}, state) do
@@ -736,8 +747,9 @@ defmodule CDPEx.Browser do
         # Connect-mode: we don't own Chrome, so closing the socket wouldn't reap the
         # tabs we opened. Close just OUR targets (best-effort; close_target tolerates
         # a dead conn), leaving Chrome and any pre-existing tabs untouched.
-        Enum.each(state.sessions, fn {tid, _sid} -> close_target(state.browser_conn, tid) end)
-        Enum.each(state.pages, fn {tid, _conn} -> close_target(state.browser_conn, tid) end)
+        Enum.each(Map.keys(state.sessions) ++ Map.keys(state.pages), fn tid ->
+          discard_target(state.browser_conn, tid, Map.get(state.contexts, tid))
+        end)
       end
 
     Enum.each(state.pages, fn {_tid, conn} -> safe_close(conn) end)
@@ -816,7 +828,7 @@ defmodule CDPEx.Browser do
   # already be gone). Returns the updated state for the {:reply, …} tuple.
   defp close_failed_auth_page(state, tid, conn) do
     safe_close(conn)
-    close_target(state.browser_conn, tid)
+    state = end_target(state, tid)
     %{state | pages: Map.delete(state.pages, tid)}
   end
 
@@ -1045,6 +1057,24 @@ defmodule CDPEx.Browser do
       )
 
     :ok
+  end
+
+  # Ends one of our pages' targets (see discard_target/3) and forgets its context.
+  defp end_target(state, tid) do
+    discard_target(state.browser_conn, tid, Map.get(state.contexts, tid))
+    %{state | contexts: Map.delete(state.contexts, tid)}
+  end
+
+  # The page's target is already gone: dispose its context, if it had one.
+  defp drop_context(state, tid) do
+    case Map.pop(state.contexts, tid) do
+      {nil, _} ->
+        state
+
+      {context_id, contexts} ->
+        dispose_context(state.browser_conn, context_id)
+        %{state | contexts: contexts}
+    end
   end
 
   defp put_context(contexts, _tid, nil), do: contexts

@@ -479,6 +479,113 @@ defmodule CDPEx.BrowserTest do
     end
   end
 
+  describe "isolated pages: disposing" do
+    test "close_page on an isolated session page disposes its context instead of closeTarget" do
+      {state, conn} = fake_browser_state()
+      state = %{state | sessions: %{"T1" => "S1"}, contexts: %{"T1" => "C1"}}
+      page = %Page{browser: self(), conn: conn, target_id: "T1", session_id: "S1"}
+
+      assert {:reply, :ok, new_state} = call_in_task(state, {:close_page, page})
+
+      assert_receive {:sent, "Target.detachFromTarget", %{"sessionId" => "S1"}}
+      assert_receive {:sent, "Target.disposeBrowserContext", %{"browserContextId" => "C1"}}
+      refute_received {:sent, "Target.closeTarget", _}
+      assert new_state.contexts == %{}
+      assert new_state.sessions == %{}
+      Connection.close(conn)
+    end
+
+    test "close_page on an isolated dedicated page disposes its context" do
+      {state, conn} = fake_browser_state()
+      {:ok, page_conn} = Connection.start_link("ws://127.0.0.1:#{state.port}/devtools/page/T1")
+      state = %{state | pages: %{"T1" => page_conn}, contexts: %{"T1" => "C1"}}
+      page = %Page{browser: self(), conn: page_conn, target_id: "T1"}
+
+      assert {:reply, :ok, new_state} = call_in_task(state, {:close_page, page})
+
+      assert_receive {:sent, "Target.disposeBrowserContext", %{"browserContextId" => "C1"}}
+      refute_received {:sent, "Target.closeTarget", _}
+      assert new_state.contexts == %{}
+      assert new_state.pages == %{}
+      Connection.close(conn)
+    end
+
+    test "a second close of an isolated page is :unknown_page and sends nothing" do
+      {state, conn} = fake_browser_state()
+      state = %{state | sessions: %{"T1" => "S1"}, contexts: %{"T1" => "C1"}}
+      page = %Page{browser: self(), conn: conn, target_id: "T1", session_id: "S1"}
+
+      assert {:reply, :ok, closed} = call_in_task(state, {:close_page, page})
+      assert_receive {:sent, "Target.disposeBrowserContext", _}
+
+      assert {:reply, {:error, :unknown_page}, ^closed} = call_in_task(closed, {:close_page, page})
+      refute_receive {:sent, "Target.disposeBrowserContext", _}, 200
+      Connection.close(conn)
+    end
+
+    test "page-conn EXIT disposes the page's context" do
+      {state, conn} = fake_browser_state()
+      page_conn = spawn(fn -> :ok end)
+      state = %{state | pages: %{"T1" => page_conn}, contexts: %{"T1" => "C1"}}
+
+      assert {:noreply, new_state} = info_in_task(state, {:EXIT, page_conn, :boom})
+
+      assert_receive {:sent, "Target.disposeBrowserContext", %{"browserContextId" => "C1"}}
+      assert new_state.contexts == %{}
+      assert new_state.pages == %{}
+      Connection.close(conn)
+    end
+
+    test "Target.detachedFromTarget disposes the session page's context" do
+      {state, conn} = fake_browser_state()
+      state = %{state | sessions: %{"T1" => "S1"}, contexts: %{"T1" => "C1"}}
+
+      event =
+        {:cdp_event, conn, "Target.detachedFromTarget", %{"sessionId" => "S1", "targetId" => "T1"},
+         nil}
+
+      assert {:noreply, new_state} = info_in_task(state, event)
+
+      assert_receive {:sent, "Target.disposeBrowserContext", %{"browserContextId" => "C1"}}
+      assert new_state.contexts == %{}
+      Connection.close(conn)
+    end
+
+    test "a failed proxy-auth arm disposes the context" do
+      {state, conn} = fake_browser_state(%{"Fetch.enable" => :error})
+      state = %{state | proxy_auth: %{username: "u", password: "p"}}
+
+      capture_log(fn ->
+        assert {:reply, {:error, {:cdp_error, "Fetch.enable", _}}, new_state} =
+                 new_page_in_task(state, transport: :dedicated, isolated: true)
+
+        assert_receive {:sent, "Target.disposeBrowserContext", %{"browserContextId" => "C1"}}, 1_000
+        assert new_state.contexts == %{}
+        assert new_state.pages == %{}
+      end)
+
+      Connection.close(conn)
+    end
+
+    test "terminate/2 on a connected browser disposes its contexts" do
+      {state, _conn} = fake_browser_state()
+      state = %{state | connected: true, sessions: %{"T1" => "S1"}, contexts: %{"T1" => "C1"}}
+
+      assert :ok = Task.await(Task.async(fn -> Browser.terminate(:normal, state) end), 30_000)
+      assert_receive {:sent, "Target.disposeBrowserContext", %{"browserContextId" => "C1"}}
+    end
+  end
+
+  defp call_in_task(state, request) do
+    fn -> Browser.handle_call(request, {self(), make_ref()}, state) end
+    |> Task.async()
+    |> Task.await(30_000)
+  end
+
+  defp info_in_task(state, msg) do
+    fn -> Browser.handle_info(msg, state) end |> Task.async() |> Task.await(30_000)
+  end
+
   # A Browser state whose browser_conn talks to a fake Chrome (see fake_chrome/2).
   defp fake_browser_state(overrides \\ %{}) do
     test = self()
