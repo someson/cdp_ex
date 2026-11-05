@@ -129,7 +129,17 @@ defmodule CDPEx.MixProject do
       main: "readme",
       source_ref: "v#{@version}",
       source_url: @source_url,
-      extras: ["README.md", "CHANGELOG.md", "LICENSE"]
+      extras: [
+        "README.md",
+        "docs/guides/usage.md",
+        "docs/guides/page-operations.md",
+        "docs/guides/recipes.md",
+        "docs/guides/error-handling.md",
+        "docs/guides/telemetry.md",
+        "docs/guides/process-labels.md",
+        "CHANGELOG.md",
+        "LICENSE"
+      ]
     ]
   end
 end
