@@ -125,29 +125,13 @@ the setup out of the GenServer means reworking how pages, contexts, auth and
 interception are tracked, which today rely on calls being served one at a
 time. Measure how long the queue gets with 4 pages per browser first.
 
-## 9. Proxy login and request interception on one page
+## 9. Proxy login and request interception on one page — done
 
-**Problem.** A page can either answer the proxy's 407 (a credentialed
-`:proxy`, or `Page.authenticate/4`) or intercept requests
-(`enable_request_interception/2`), not both: the second returns
-`{:error, {:conflict, :authenticated}}` or `{:conflict, :intercepting}`. Both
-run on the `Fetch` domain. Puppeteer allows the combination.
-
-**Evidence.** ReqBot (a consumer that blocks images and fonts behind an
-authenticated proxy) works around it in its own interceptor process: after
-`enable_request_interception/2` it re-sends `Fetch.enable` with
-`handleAuthRequests: true` through `CDPEx.Connection` and answers
-`Fetch.authRequired` itself (credentials once per request, `CancelAuth` on a
-repeat, `Default` for a `Server` challenge). Any change to our `Fetch` internals
-can break it.
-
-**Plan.** One `Fetch.enable` per page carrying both the interception patterns
-and `handleAuthRequests: true`; the auth handler answers `Fetch.authRequired`
-and the interception owner keeps receiving `Fetch.requestPaused`. With
-credentials, every request is paused (the proxy challenge only arrives for
-paused requests), so requests outside the caller's patterns must be continued
-by the library, not the caller. Needs an integration test against a proxy that
-requires Basic auth. Estimate: half a day to a day.
+A page answers the proxy's (or a site's) login and intercepts requests at the
+same time, enabled in either order; one `CDPEx.Fetch` process per page owns
+the `Fetch` domain and forwards the caller only the pauses matching its
+patterns (#24). Design: `docs/design/2026-11-05-fetch-auth-and-interception.md`.
+ReqBot can drop the `Fetch.enable` workaround in its interceptor.
 
 ## 10. Block resources by type
 
@@ -157,7 +141,7 @@ network. A common scraping speed-up (less proxy traffic, faster loads). ReqBot
 builds it from request interception plus a dedicated process that owns the
 paused requests, because the caller is blocked in a navigation wait and cannot
 answer them. Should be a library-owned handler on the `Fetch` domain, so it
-lands after item 9. Estimate: about half a day on top of 9.
+builds on item 9. Estimate: about half a day.
 
 ## 11. Full document response from `navigate/3`
 

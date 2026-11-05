@@ -1,11 +1,14 @@
 defmodule CDPEx.FetchTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias CDPEx.Connection
   alias CDPEx.FakeCDP
   alias CDPEx.Fetch
 
   @creds [username: "u", password: "p"]
+  @auth %{username: "u", password: "p", source: :any}
 
   describe "auth_decision/5" do
     test "provides credentials for a matching challenge and records the attempt" do
@@ -55,26 +58,125 @@ defmodule CDPEx.FetchTest do
     end
   end
 
-  describe "start_link/1" do
-    test "arms asynchronously, then signals {:arm_failed, _, :noproc} on a dead connection" do
-      # The handler is linked. init/1 now returns fast and defers arming to
-      # handle_continue/2, so start_link succeeds; the dead-conn subscribe/enable then
-      # fails there and is reported to the browser (here, the test process) as
-      # {:arm_failed, pid, :noproc} before the handler stops quietly (:normal).
+  describe "enable_params/2" do
+    test "auth only pauses everything and handles auth" do
+      assert Fetch.enable_params(%{}, nil) == %{"handleAuthRequests" => true}
+    end
+
+    test "interception only sends the caller's patterns as they are" do
+      patterns = [%{"urlPattern" => "*.png", "requestStage" => "Response"}]
+      assert Fetch.enable_params(nil, patterns) == %{"patterns" => patterns}
+    end
+
+    test "both pause every request and keep the caller's Response-stage patterns" do
+      patterns = [
+        %{"resourceType" => "Image"},
+        %{"urlPattern" => "*/api/*", "requestStage" => "Response"}
+      ]
+
+      assert Fetch.enable_params(%{}, patterns) == %{
+               "patterns" => [
+                 %{"urlPattern" => "*"},
+                 %{"urlPattern" => "*/api/*", "requestStage" => "Response"}
+               ],
+               "handleAuthRequests" => true
+             }
+    end
+
+    test "neither means disabled" do
+      assert Fetch.enable_params(nil, nil) == nil
+    end
+  end
+
+  describe "compile_matchers/1 + matches?/2" do
+    defp paused(url, type \\ "Document"),
+      do: %{"requestId" => "R", "request" => %{"url" => url}, "resourceType" => type}
+
+    defp hits?(patterns, params), do: Fetch.matches?(Fetch.compile_matchers(patterns), params)
+
+    test "* matches any run of characters, including none and slashes" do
+      assert hits?([%{"urlPattern" => "*"}], paused("https://a.test/x"))
+      assert hits?([%{"urlPattern" => "https://a.test/*"}], paused("https://a.test/"))
+      assert hits?([%{"urlPattern" => "*.png"}], paused("https://a.test/i/x.png"))
+      refute hits?([%{"urlPattern" => "*.png"}], paused("https://a.test/x.png?v=1"))
+    end
+
+    test "? matches exactly one character" do
+      assert hits?([%{"urlPattern" => "https://a.test/?"}], paused("https://a.test/x"))
+      refute hits?([%{"urlPattern" => "https://a.test/?"}], paused("https://a.test/"))
+      refute hits?([%{"urlPattern" => "https://a.test/?"}], paused("https://a.test/xy"))
+    end
+
+    test "a backslash escapes a wildcard, and regex metacharacters are literal" do
+      assert hits?([%{"urlPattern" => "https://a.test/\\*"}], paused("https://a.test/*"))
+      refute hits?([%{"urlPattern" => "https://a.test/\\*"}], paused("https://a.test/x"))
+      assert hits?([%{"urlPattern" => "*?q=(1)"}], paused("https://a.test/?q=(1)"))
+      refute hits?([%{"urlPattern" => "https://a.test/x.png"}], paused("https://a.test/xApng"))
+    end
+
+    test "a missing urlPattern matches every URL" do
+      assert hits?([%{"resourceType" => "Image"}], paused("https://a.test/x", "Image"))
+    end
+
+    test "resourceType must match when given" do
+      assert hits?([%{"resourceType" => "Image"}], paused("https://a.test/x.png", "Image"))
+      refute hits?([%{"resourceType" => "Image"}], paused("https://a.test/x.png", "Font"))
+    end
+
+    test "any matching pattern is enough" do
+      patterns = [%{"resourceType" => "Image"}, %{"urlPattern" => "*.woff2"}]
+      assert hits?(patterns, paused("https://a.test/f.woff2", "Font"))
+      refute hits?(patterns, paused("https://a.test/", "Document"))
+    end
+
+    test "Response-stage patterns don't match Request-stage pauses" do
+      refute hits?([%{"urlPattern" => "*", "requestStage" => "Response"}], paused("https://a/"))
+    end
+  end
+
+  describe "forward?/2" do
+    defp with_modes(auth, patterns) do
+      intercept =
+        patterns && %{owner: self(), patterns: patterns, matchers: Fetch.compile_matchers(patterns)}
+
+      %Fetch{auth: auth, intercept: intercept}
+    end
+
+    test "nothing is forwarded without interception" do
+      refute Fetch.forward?(with_modes(%{}, nil), paused("https://a/"))
+    end
+
+    test "without auth every pause is the owner's (Chrome applied its patterns)" do
+      assert Fetch.forward?(with_modes(nil, [%{"resourceType" => "Image"}]), paused("https://a/"))
+    end
+
+    test "with auth only matching Request-stage pauses and every Response-stage pause go" do
+      state = with_modes(%{}, [%{"resourceType" => "Image"}])
+      assert Fetch.forward?(state, paused("https://a/x.png", "Image"))
+      refute Fetch.forward?(state, paused("https://a/", "Document"))
+
+      response = Map.put(paused("https://a/", "Document"), "responseStatusCode", 200)
+      assert Fetch.forward?(state, response)
+
+      failed = Map.put(paused("https://a/", "Document"), "responseErrorReason", "Failed")
+      assert Fetch.forward?(state, failed)
+    end
+  end
+
+  describe "a dead connection" do
+    test "stops the owner at once; the Browser fails any caller parked on it" do
       Process.flag(:trap_exit, true)
 
       conn = spawn(fn -> :ok end)
       ref = Process.monitor(conn)
       assert_receive {:DOWN, ^ref, :process, ^conn, _}, 1_000
 
-      assert {:ok, pid} =
-               Fetch.start_link(conn: conn, browser: self(), username: "u", password: "p")
-
-      assert_receive {:arm_failed, ^pid, :noproc}, 1_000
+      assert {:ok, pid} = Fetch.start_link(conn: conn, browser: self())
+      assert_receive {:EXIT, ^pid, :normal}, 1_000
     end
   end
 
-  describe "handle_continue(:arm) (FakeCDP)" do
+  describe "the owner on FakeCDP" do
     setup do
       {:ok, server} = FakeCDP.start()
       {:ok, conn} = Connection.start_link(server.url)
@@ -82,7 +184,6 @@ defmodule CDPEx.FetchTest do
 
       on_exit(fn ->
         try do
-          # Closing the conn makes the (conn-monitoring) Fetch handler self-stop.
           if Process.alive?(conn), do: Connection.close(conn)
         catch
           :exit, _ -> :ok
@@ -92,68 +193,206 @@ defmodule CDPEx.FetchTest do
       %{conn: conn, fake: fake}
     end
 
-    test "subscribes, enables Fetch with handleAuthRequests, then signals {:armed}", %{
+    test "auth enables Fetch with handleAuthRequests, replies :ok, rejects a second auth", %{
       conn: conn,
       fake: fake
     } do
-      {:ok, pid} = Fetch.start_link(conn: conn, browser: self(), username: "u", password: "p")
+      pid = start_owner(conn)
 
-      assert_receive {:fake_cdp_recv, ^fake,
-                      %{"id" => id, "method" => "Fetch.enable", "params" => params}},
-                     2_000
+      tag = make_ref()
+      Fetch.request(pid, tag, {:auth, @auth})
+      assert expect_call(fake, "Fetch.enable") == %{"handleAuthRequests" => true}
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
 
-      assert params["handleAuthRequests"] == true
-      FakeCDP.send_text(fake, ~s({"id":#{id},"result":{}}))
-
-      assert_receive {:armed, ^pid}, 2_000
+      tag2 = make_ref()
+      Fetch.request(pid, tag2, {:auth, @auth})
+      assert_receive {:fetch_reply, ^pid, ^tag2, {:error, :already_authenticated}}, 2_000
     end
 
-    test "cancel/1 disables Fetch then stops :normal (graceful orphan teardown, #40)", %{
+    test "a failed enable leaves the mode off, so a retry can arm it", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+
+      log =
+        capture_log(fn ->
+          tag = make_ref()
+          Fetch.request(pid, tag, {:auth, @auth})
+          expect_call(fake, "Fetch.enable", :error)
+
+          assert_receive {:fetch_reply, ^pid, ^tag, {:error, {:cdp_error, "Fetch.enable", _}}},
+                         2_000
+        end)
+
+      assert log =~ "arming failed"
+
+      tag = make_ref()
+      Fetch.request(pid, tag, {:auth, @auth})
+      expect_call(fake, "Fetch.enable")
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+    end
+
+    test "interception alone sends the caller's patterns and forwards every pause", %{
       conn: conn,
       fake: fake
     } do
-      # Trap exits so we can witness the handler's {:EXIT} (it is linked to this process,
-      # which stands in for the Browser).
+      pid = start_owner(conn)
+      patterns = [%{"resourceType" => "Image"}]
+
+      tag = make_ref()
+      Fetch.request(pid, tag, {:intercept, self(), patterns, 5_000})
+      assert expect_call(fake, "Fetch.enable") == %{"patterns" => patterns}
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+
+      pause(fake, "r1", "https://a.test/", "Document")
+      assert_receive {:cdp_event, ^conn, "Fetch.requestPaused", %{"requestId" => "r1"}, nil}, 2_000
+      refute_receive {:fake_cdp_recv, ^fake, %{"method" => "Fetch.continueRequest"}}, 100
+
+      tag = make_ref()
+      Fetch.request(pid, tag, {:intercept, self(), patterns, 5_000})
+      assert_receive {:fetch_reply, ^pid, ^tag, {:error, :already_intercepting}}, 2_000
+    end
+
+    test "with auth and interception, the owner gets only its pauses; the rest continue", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+      arm(pid, fake, {:auth, @auth})
+
+      tag = make_ref()
+      Fetch.request(pid, tag, {:intercept, self(), [%{"resourceType" => "Image"}], 5_000})
+
+      assert expect_call(fake, "Fetch.enable") == %{
+               "patterns" => [%{"urlPattern" => "*"}],
+               "handleAuthRequests" => true
+             }
+
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+
+      pause(fake, "img", "https://a.test/x.png", "Image")
+      assert_receive {:cdp_event, ^conn, "Fetch.requestPaused", %{"requestId" => "img"}, nil}, 2_000
+
+      pause(fake, "doc", "https://a.test/", "Document")
+      assert expect_call(fake, "Fetch.continueRequest") == %{"requestId" => "doc"}
+      refute_received {:cdp_event, _, "Fetch.requestPaused", %{"requestId" => "doc"}, _}
+
+      # The proxy challenge is still answered.
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Fetch.authRequired","params":{"requestId":"doc","authChallenge":{"source":"Proxy"}}})
+      )
+
+      assert %{"authChallengeResponse" => %{"response" => "ProvideCredentials"}} =
+               expect_call(fake, "Fetch.continueWithAuth")
+    end
+
+    test "interception can come first, then auth", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      arm(pid, fake, {:intercept, self(), [%{"urlPattern" => "*.png"}], 5_000})
+
+      tag = make_ref()
+      Fetch.request(pid, tag, {:auth, @auth})
+
+      assert %{"handleAuthRequests" => true, "patterns" => [%{"urlPattern" => "*"}]} =
+               expect_call(fake, "Fetch.enable")
+
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+    end
+
+    test "an owner that dies with auth on: its pauses are let through, auth re-armed alone", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+      arm(pid, fake, {:auth, @auth})
+      owner = relay_owner()
+      arm(pid, fake, {:intercept, owner, [%{"resourceType" => "Image"}], 5_000})
+
+      pause(fake, "img", "https://a.test/x.png", "Image")
+      assert_receive {:owner_got, {:cdp_event, _, "Fetch.requestPaused", _, _}}, 2_000
+
+      Process.exit(owner, :kill)
+
+      assert expect_call(fake, "Fetch.continueRequest") == %{"requestId" => "img"}
+      assert expect_call(fake, "Fetch.enable") == %{"handleAuthRequests" => true}
+
+      # Everything is continued by the owner again.
+      pause(fake, "img2", "https://a.test/y.png", "Image")
+      assert expect_call(fake, "Fetch.continueRequest") == %{"requestId" => "img2"}
+    end
+
+    test "an owner that dies without auth disables Fetch", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      owner = relay_owner()
+      arm(pid, fake, {:intercept, owner, [%{"urlPattern" => "*"}], 5_000})
+
+      Process.exit(owner, :kill)
+      expect_call(fake, "Fetch.disable")
+      assert Process.alive?(pid)
+    end
+
+    test "release keeps auth working and replies the CDP result", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      arm(pid, fake, {:auth, @auth})
+      arm(pid, fake, {:intercept, self(), [%{"resourceType" => "Image"}], 5_000})
+
+      tag = make_ref()
+      Fetch.request(pid, tag, {:release_intercept, 5_000})
+      assert expect_call(fake, "Fetch.enable") == %{"handleAuthRequests" => true}
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+
+      # Released twice is fine.
+      tag = make_ref()
+      Fetch.request(pid, tag, {:release_intercept, 5_000})
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+    end
+
+    test "Fetch.authRequired is left alone while auth is off", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      arm(pid, fake, {:intercept, self(), [%{"urlPattern" => "*"}], 5_000})
+
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Fetch.authRequired","params":{"requestId":"r","authChallenge":{"source":"Proxy"}}})
+      )
+
+      refute_receive {:fake_cdp_recv, ^fake, %{"method" => "Fetch.continueWithAuth"}}, 200
+      assert Process.alive?(pid)
+    end
+
+    test "drop_auth drops only the auth it names", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      tag = make_ref()
+      Fetch.request(pid, tag, {:auth, @auth})
+      expect_call(fake, "Fetch.enable")
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+
+      Fetch.request(pid, make_ref(), {:drop_auth, make_ref()})
+      refute_receive {:fake_cdp_recv, ^fake, %{"method" => "Fetch.disable"}}, 200
+
+      Fetch.request(pid, make_ref(), {:drop_auth, tag})
+      expect_call(fake, "Fetch.disable")
+    end
+
+    test "stop/1 ends the owner without touching the page's Fetch domain", %{
+      conn: conn,
+      fake: fake
+    } do
       Process.flag(:trap_exit, true)
+      pid = start_owner(conn)
+      arm(pid, fake, {:auth, @auth})
 
-      {:ok, pid} = Fetch.start_link(conn: conn, browser: self(), username: "u", password: "p")
-
-      assert_receive {:fake_cdp_recv, ^fake, %{"id" => id, "method" => "Fetch.enable"}}, 2_000
-      FakeCDP.send_text(fake, ~s({"id":#{id},"result":{}}))
-      assert_receive {:armed, ^pid}, 2_000
-
-      # The authenticate/4 caller departed; the Browser cancels the orphaned handler. It
-      # must disable Fetch (terminate/2 — releasing any paused request) and stop :normal,
-      # so the Browser's {:EXIT} clears its auths entry.
-      :ok = Fetch.cancel(pid)
-
-      assert_receive {:fake_cdp_recv, ^fake, %{"id" => did, "method" => "Fetch.disable"}}, 2_000
-      FakeCDP.send_text(fake, ~s({"id":#{did},"result":{}}))
-
+      :ok = Fetch.stop(pid)
       assert_receive {:EXIT, ^pid, :normal}, 2_000
+      refute_receive {:fake_cdp_recv, ^fake, %{"method" => "Fetch.disable"}}, 100
     end
 
-    test "a :session handler answers only its session and stops on its session's detach", %{
+    test "a :session owner answers only its session and stops on its session's detach", %{
       conn: conn,
       fake: fake
     } do
       Process.flag(:trap_exit, true)
-
-      {:ok, pid} =
-        Fetch.start_link(
-          conn: conn,
-          session_id: "S1",
-          browser: self(),
-          username: "u",
-          password: "p"
-        )
-
-      assert_receive {:fake_cdp_recv, ^fake,
-                      %{"id" => id, "method" => "Fetch.enable", "sessionId" => "S1"}},
-                     2_000
-
-      FakeCDP.send_text(fake, ~s({"id":#{id},"result":{}}))
-      assert_receive {:armed, ^pid}, 2_000
+      {:ok, pid} = Fetch.start_link(conn: conn, session_id: "S1", browser: self())
+      arm(pid, fake, {:auth, @auth})
 
       # Another session's pause isn't ours to continue.
       FakeCDP.send_text(
@@ -190,5 +429,52 @@ defmodule CDPEx.FetchTest do
       assert_receive {:EXIT, ^pid, :normal}, 2_000
       refute_received {:fake_cdp_recv, ^fake, %{"params" => %{"requestId" => "r2"}}}
     end
+  end
+
+  defp start_owner(conn) do
+    {:ok, pid} = Fetch.start_link(conn: conn, browser: self())
+    pid
+  end
+
+  # Send `request`, answer its Fetch.enable, and wait for the :ok reply.
+  defp arm(pid, fake, request) do
+    tag = make_ref()
+    Fetch.request(pid, tag, request)
+    expect_call(fake, "Fetch.enable")
+    assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+  end
+
+  # Wait for a CDP call to `method`, answer it (OK or an error), and return its params.
+  defp expect_call(fake, method, outcome \\ :ok) do
+    assert_receive {:fake_cdp_recv, ^fake, %{"id" => id, "method" => ^method} = frame}, 2_000
+
+    case outcome do
+      :ok -> FakeCDP.send_text(fake, ~s({"id":#{id},"result":{}}))
+      :error -> FakeCDP.send_text(fake, ~s({"id":#{id},"error":{"code":-32000,"message":"boom"}}))
+    end
+
+    frame["params"] || %{}
+  end
+
+  defp pause(fake, id, url, type) do
+    params = %{"requestId" => id, "request" => %{"url" => url}, "resourceType" => type}
+    FakeCDP.send_text(fake, Jason.encode!(%{"method" => "Fetch.requestPaused", "params" => params}))
+  end
+
+  # An interception owner the test can kill: relays what it gets to the test.
+  defp relay_owner do
+    test = self()
+
+    spawn(fn ->
+      relay = fn relay ->
+        receive do
+          msg ->
+            send(test, {:owner_got, msg})
+            relay.(relay)
+        end
+      end
+
+      relay.(relay)
+    end)
   end
 end

@@ -1254,7 +1254,7 @@ defmodule CDPEx.IntegrationTest do
       :ok = CDPEx.close_page(browser, page)
       assert_receive {:DOWN, ^ref, :process, ^handler, :normal}, 5_000
       assert Process.alive?(page.conn)
-      assert eventually(fn -> :sys.get_state(browser).auths == %{} end)
+      assert eventually(fn -> :sys.get_state(browser).fetchers == %{} end)
     end
 
     test "a :session page's handler stops when its tab is closed from outside" do
@@ -1269,7 +1269,7 @@ defmodule CDPEx.IntegrationTest do
 
       {:ok, _} = Connection.call(page.conn, "Target.closeTarget", %{"targetId" => page.target_id})
       assert_receive {:DOWN, ^ref, :process, ^handler, :normal}, 5_000
-      assert eventually(fn -> :sys.get_state(browser).auths == %{} end)
+      assert eventually(fn -> :sys.get_state(browser).fetchers == %{} end)
     end
 
     test "the Fetch handler self-stops when the page's connection goes down" do
@@ -1337,12 +1337,14 @@ defmodule CDPEx.IntegrationTest do
       assert {:error, :already_authenticated} = Page.authenticate(page, "user", "pass")
     end
 
-    test "an auto-armed page rejects request interception (Fetch mutual exclusion)" do
+    test "an auto-armed page also takes request interception" do
       {:ok, browser} = CDPEx.launch(proxy: @creds_proxy)
       on_exit(fn -> stop_quietly(browser) end)
 
       {:ok, page} = CDPEx.new_page(browser)
-      assert {:error, {:conflict, :authenticated}} = Page.enable_request_interception(page)
+      assert :ok = Page.enable_request_interception(page)
+      assert {:error, :already_intercepting} = Page.enable_request_interception(page)
+      assert :ok = Page.disable_request_interception(page)
     end
 
     test "launch(proxy: creds) auto-arms a :session page" do
@@ -1389,7 +1391,91 @@ defmodule CDPEx.IntegrationTest do
         :ok = CDPEx.close_page(browser, page)
       end
 
-      assert eventually(fn -> :sys.get_state(browser).auths == %{} end)
+      assert eventually(fn -> :sys.get_state(browser).fetchers == %{} end)
+    end
+
+    for launch_opts <- [[], [pipe: true]] do
+      test "proxy login + image interception on one page (#{inspect(launch_opts)})" do
+        {:ok, %{port: proxy_port}} =
+          ProxyAuthServer.start(username: "puser", password: "ppass", report: self())
+
+        {:ok, browser} =
+          CDPEx.launch(
+            [proxy: "http://puser:ppass@127.0.0.1:#{proxy_port}"] ++ unquote(launch_opts)
+          )
+
+        on_exit(fn -> stop_quietly(browser) end)
+        {:ok, page} = CDPEx.new_page(browser)
+        test = self()
+
+        owner =
+          spawn_link(fn ->
+            send(
+              test,
+              {:enabled,
+               Page.enable_request_interception(page, patterns: [%{"resourceType" => "Image"}])}
+            )
+
+            block_images(page, test)
+          end)
+
+        assert_receive {:enabled, :ok}, 5_000
+
+        assert {:ok, _} = Page.navigate(page, "http://proxied.test/with-image", wait_until: :load)
+        assert {:ok, "Proxied"} = Page.text(page, "#greeting")
+
+        # The owner saw the image, and only the image; it never reached the proxy.
+        assert_receive {:blocked, "http://proxied.test/pixel.png", "Image"}, 5_000
+        refute_received {:blocked, _, _}
+        assert_received {:proxy_served, "http://proxied.test/with-image"}
+        refute_received {:proxy_served, "http://proxied.test/pixel.png"}
+
+        # Releasing interception keeps the proxy login: the image now goes through.
+        send(owner, {:disable, test})
+        assert_receive {:disabled, :ok}, 5_000
+        assert {:ok, _} = Page.navigate(page, "http://proxied.test/with-image", wait_until: :load)
+
+        assert eventually(fn ->
+                 receive do
+                   {:proxy_served, "http://proxied.test/pixel.png"} -> true
+                 after
+                   0 -> false
+                 end
+               end)
+      end
+    end
+
+    test "the interception owner dies: the page still passes the proxy" do
+      {:ok, %{port: proxy_port}} =
+        ProxyAuthServer.start(username: "puser", password: "ppass", report: self())
+
+      {:ok, browser} = CDPEx.launch(proxy: "http://puser:ppass@127.0.0.1:#{proxy_port}")
+      on_exit(fn -> stop_quietly(browser) end)
+      {:ok, page} = CDPEx.new_page(browser)
+      test = self()
+
+      # An owner that takes the document's pause and dies holding it.
+      owner =
+        spawn(fn ->
+          send(test, {:enabled, Page.enable_request_interception(page)})
+
+          receive do
+            {:cdp_event, _, "Fetch.requestPaused", _, _} -> send(test, :holding)
+          end
+
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:enabled, :ok}, 5_000
+      nav = Task.async(fn -> Page.navigate(page, "http://proxied.test/", wait_until: :load) end)
+      assert_receive :holding, 5_000
+      Process.exit(owner, :kill)
+
+      # The held document is let through and login keeps working.
+      assert {:ok, _} = Task.await(nav, 15_000)
+      assert {:ok, "Proxied"} = Page.text(page, "#greeting")
+      assert {:ok, _} = Page.navigate(page, "http://proxied.test/again", wait_until: :load)
+      assert_received {:proxy_served, "http://proxied.test/"}
     end
 
     test "without credentials a proxy 407 blocks the navigation (the proxy enforces auth)" do
@@ -1515,20 +1601,21 @@ defmodule CDPEx.IntegrationTest do
              end)
     end
 
-    test "interception and authenticate are mutually exclusive per page" do
+    test "interception first, then authenticate: a Basic-gated page loads, pauses go to the owner",
+         %{fixture: fixture} do
       {:ok, browser} = CDPEx.launch()
       on_exit(fn -> stop_quietly(browser) end)
+      {:ok, page} = CDPEx.new_page(browser)
 
-      # Authenticate first → interception is refused.
-      {:ok, p1} = CDPEx.new_page(browser)
-      assert :ok = Page.authenticate(p1, "cdpex", "secret")
-      assert {:error, {:conflict, :authenticated}} = Page.enable_request_interception(p1)
+      # Intercept only a URL nobody loads, then add login: the
+      # Basic-gated document must load without ever reaching this process.
+      assert :ok =
+               Page.enable_request_interception(page, patterns: [%{"urlPattern" => "*/never.css"}])
 
-      # Intercept first → authenticate is refused (the reverse direction).
-      {:ok, p2} = CDPEx.new_page(browser)
-      assert :ok = Page.enable_request_interception(p2)
-      assert {:error, {:conflict, :intercepting}} = Page.authenticate(p2, "cdpex", "secret")
-      assert :ok = Page.disable_request_interception(p2)
+      assert :ok = Page.authenticate(page, "cdpex", "secret")
+      assert {:ok, _} = Page.navigate(page, fixture <> "basic-auth")
+      assert {:ok, "Hello"} = Page.text(page, "#greeting")
+      refute_received {:cdp_event, _, "Fetch.requestPaused", _, _}
     end
 
     for launch_opts <- [[], [pipe: true]] do
@@ -1607,19 +1694,23 @@ defmodule CDPEx.IntegrationTest do
              end)
     end
 
-    test "closing an intercepted :session page drops its reservation" do
+    test "closing an intercepted :session page stops its Fetch owner" do
       {:ok, browser} = CDPEx.launch()
       on_exit(fn -> stop_quietly(browser) end)
       {:ok, page} = CDPEx.new_page(browser, transport: :session)
 
       assert :ok = Page.enable_request_interception(page)
-      assert map_size(:sys.get_state(browser).intercepts) == 1
-      :ok = CDPEx.close_page(browser, page)
-      assert :sys.get_state(browser).intercepts == %{}
+      assert %{} = fetchers = :sys.get_state(browser).fetchers
+      assert [{_tid, owner}] = Map.to_list(fetchers)
+      ref = Process.monitor(owner)
 
-      # The owner never disabled; its subscription for the closed session goes anyway.
+      :ok = CDPEx.close_page(browser, page)
+      assert :sys.get_state(browser).fetchers == %{}
+      assert_receive {:DOWN, ^ref, :process, ^owner, :normal}, 5_000
+
+      # The owner never disabled; the Fetch owner's subscriptions go with it.
       assert eventually(fn ->
-               :sys.get_state(page.conn).subscribers["Fetch.requestPaused"][self()] == nil
+               :sys.get_state(page.conn).subscribers["Fetch.requestPaused"][owner] == nil
              end)
     end
   end
@@ -2122,6 +2213,20 @@ defmodule CDPEx.IntegrationTest do
 
   # The Fetch handlers currently alive (matched by their initial call), so a test
   # can isolate the one a given authenticate/4 started.
+  # An interception owner that fails every image it is handed (reporting it to `test`)
+  # and continues anything else, until told to disable.
+  defp block_images(page, test) do
+    receive do
+      {:cdp_event, _, "Fetch.requestPaused", %{"requestId" => id} = params, _sid} ->
+        send(test, {:blocked, params["request"]["url"], params["resourceType"]})
+        _ = Page.fail_request(page, id, reason: :blocked_by_client)
+        block_images(page, test)
+
+      {:disable, reply_to} ->
+        send(reply_to, {:disabled, Page.disable_request_interception(page)})
+    end
+  end
+
   defp fetch_handlers do
     for pid <- Process.list(),
         {:dictionary, dict} <- [Process.info(pid, :dictionary)],

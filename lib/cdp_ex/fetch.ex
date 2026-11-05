@@ -1,21 +1,28 @@
 defmodule CDPEx.Fetch do
   @moduledoc """
-  Per-page handler for the CDP `Fetch` domain, backing `CDPEx.Page.authenticate/4`.
+  Per-page owner of the CDP `Fetch` domain, backing `CDPEx.Page.authenticate/4`,
+  the credentialed `:proxy` launch option and `CDPEx.Page.enable_request_interception/2`.
 
-  When armed on a page it enables `Fetch` with `handleAuthRequests`, then:
+  It has two independent modes, so a page can answer a proxy's login and intercept
+  requests at the same time:
 
-    * auto-continues every paused request (`Fetch.requestPaused` →
-      `Fetch.continueRequest`) so navigation proceeds normally, and
-    * answers authentication challenges (`Fetch.authRequired` →
-      `Fetch.continueWithAuth`) with the configured credentials.
+    * **auth** — answers authentication challenges (`Fetch.authRequired` →
+      `Fetch.continueWithAuth`) with the configured credentials;
+    * **intercept** — forwards paused requests (`Fetch.requestPaused`) that match the
+      interception owner's patterns to that owner, as the original event tuple.
 
-  Because `Fetch.enable` pauses **every** request, each one round-trips through
-  this process — measurable overhead on resource-heavy pages. The handler is tied
-  to the page's connection and stops when it goes down. On a `:session` page,
-  whose connection is the browser's and outlives the page, it also stops when its
-  session detaches: on `close_page/2`, a tab closed from outside, or a crash.
+  Every other paused request is let through with `Fetch.continueRequest`. With auth
+  on, `Fetch.enable` pauses **every** request (Chrome raises `Fetch.authRequired` only
+  for intercepted ones), so each request round-trips through this process —
+  measurable overhead on resource-heavy pages.
 
-  This is an internal building block; use `CDPEx.Page.authenticate/4`.
+  The Browser starts one per page on the first auth or interception request, and
+  sends it requests with `request/3`; each result comes back to the Browser as
+  `{:fetch_reply, pid, tag, result}`. The owner stays alive, idle once both modes are
+  off, until the page ends: it stops when the page's connection goes down, when a
+  `:session` page's session detaches, or on `stop/1`.
+
+  This is an internal building block; use the `CDPEx.Page` functions.
   """
 
   use GenServer
@@ -26,117 +33,99 @@ defmodule CDPEx.Fetch do
   require Logger
 
   @call_timeout 10_000
-  @max_tracked_challenges 1024
+  @max_tracked 1024
+  @events ["Fetch.requestPaused", "Fetch.authRequired"]
 
   defstruct [
     :conn,
     :session_id,
-    :username,
-    :password,
-    :source,
     :browser,
+    # nil | %{username, password, source, tag}
+    auth: nil,
+    # nil | %{owner, ref, patterns, matchers}
+    intercept: nil,
+    subscribed: false,
     attempts: %{},
-    # The session detached: its Fetch domain went with it, so there is nothing to disable.
+    # requestIds forwarded to the interception owner, released if it goes away
+    forwarded: MapSet.new(),
+    # The session detached or the page ended: its Fetch domain went with it, so there
+    # is nothing to disable.
     detached: false
   ]
 
   @type t :: %__MODULE__{}
+
+  @typedoc false
+  @type request ::
+          {:auth, %{username: String.t(), password: String.t(), source: atom()}}
+          | {:drop_auth, reference()}
+          | {:intercept, pid(), [map()], timeout()}
+          | {:release_intercept, timeout()}
 
   @doc false
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
   @doc false
-  # Cancel an armed/arming handler whose authenticate/4 caller has departed. Async so the
-  # Browser never blocks on the Fetch.disable in terminate/2; the handler stops :normal
-  # (running terminate → Fetch.disable, releasing any paused request) and its {:EXIT}
-  # lets the Browser clear its auths entry.
-  @spec cancel(pid()) :: :ok
-  def cancel(pid), do: GenServer.cast(pid, :cancel)
+  # Asynchronous: the result arrives at the Browser as {:fetch_reply, pid, tag, result}.
+  @spec request(pid(), reference(), request()) :: :ok
+  def request(pid, tag, request) do
+    send(pid, {:fetch_request, tag, request})
+    :ok
+  end
+
+  @doc false
+  # The page ended: stop without touching its (gone) Fetch domain.
+  @spec stop(pid()) :: :ok
+  def stop(pid), do: GenServer.cast(pid, :page_gone)
 
   @impl true
   def init(opts) do
     conn = Keyword.fetch!(opts, :conn)
-    ProcessLabel.set({:cdp_fetch_auth, Keyword.get(opts, :source, :any)})
-    # Monitor the page connection so we stop when it goes down. The blocking arm
-    # work (subscribe ×2 + Fetch.enable, up to @call_timeout) is deferred to
-    # handle_continue/2 so that init/1 — and therefore the Browser GenServer that
-    # called start_link — returns immediately instead of blocking the whole enable.
+    ProcessLabel.set({:cdp_fetch, Keyword.get(opts, :target_id)})
+    # Stop when the page connection goes down.
     Process.monitor(conn)
 
     {:ok,
      %__MODULE__{
        conn: conn,
        session_id: Keyword.get(opts, :session_id),
-       username: Keyword.fetch!(opts, :username),
-       password: Keyword.fetch!(opts, :password),
-       source: Keyword.get(opts, :source, :any),
        browser: Keyword.fetch!(opts, :browser)
-     }, {:continue, :arm}}
+     }}
   end
 
   @impl true
-  def handle_continue(:arm, state) do
-    # Subscribe BEFORE enabling so no paused request can slip through between the
-    # enable and the first event delivery. If `conn` already died (a rare race where
-    # the Browser processed authenticate/4 just ahead of the page-conn EXIT) the
-    # subscribe fails, and so does the arm.
-    with :ok <- subscribe(state, "Fetch.requestPaused"),
-         :ok <- subscribe(state, "Fetch.authRequired"),
-         :ok <- subscribe_detach(state),
-         {:ok, _} <- call(state, "Fetch.enable", %{"handleAuthRequests" => true}) do
-      # Signal the Browser we're armed so it can reply :ok to the still-waiting
-      # authenticate/4 caller — preserving the "armed before return" guarantee
-      # while leaving the Browser free to process other messages during the enable.
-      send(state.browser, {:armed, self()})
-      {:noreply, state}
-    else
-      {:error, reason}
-      when reason == :noproc or
-             (is_tuple(reason) and elem(reason, 0) in [:ws_closed, :session_closed]) ->
-        # The page connection died, or a :session page's session detached, mid-arm (a
-        # close/authenticate race) — benign, no log.
-        send(state.browser, {:arm_failed, self(), reason})
-        {:stop, :normal, state}
-
-      {:error, reason} ->
-        # A real CDP error on a live conn — worth a log line, since the caller only
-        # gets {:error, _}. Tell the Browser to fail the waiting authenticate/4 caller,
-        # then stop quietly (:normal — no GenServer crash report for a benign failure).
-        Logger.warning("[CDPEx.Fetch] arming failed: #{inspect(reason)}")
-        send(state.browser, {:arm_failed, self(), reason})
-        {:stop, :normal, state}
-    end
-  end
+  def handle_cast(:page_gone, state), do: {:stop, :normal, %{state | detached: true}}
 
   @impl true
-  def handle_cast(:cancel, state) do
-    # The authenticate/4 caller departed before (or while) we armed. If this arrives
-    # after a successful arm, we're idle and stop now; if it was queued behind the
-    # in-flight Fetch.enable, we process it once arming returns. Either way terminate/2
-    # disables Fetch and the Browser's {:EXIT} clears its auths entry. :normal → no crash
-    # report for a benign cancellation.
-    {:stop, :normal, state}
-  end
-
-  @impl true
-  def handle_info(
-        {:cdp_event, conn, "Fetch.requestPaused", %{"requestId" => request_id}, sid},
-        %__MODULE__{conn: conn, session_id: sid} = state
-      ) do
-    # Let every paused request proceed unchanged (no rewrite/fulfill/fail yet).
-    _ = call(state, "Fetch.continueRequest", %{"requestId" => request_id})
+  def handle_info({:fetch_request, tag, request}, state) do
+    {result, state} = apply_request(request, tag, state)
+    send(state.browser, {:fetch_reply, self(), tag, result})
     {:noreply, state}
   end
 
   def handle_info(
-        {:cdp_event, conn, "Fetch.authRequired", %{"requestId" => request_id} = params, sid},
+        {:cdp_event, conn, "Fetch.requestPaused", %{"requestId" => request_id} = params, sid} =
+          event,
         %__MODULE__{conn: conn, session_id: sid} = state
       ) do
+    if forward?(state, params) do
+      send(state.intercept.owner, event)
+      {:noreply, %{state | forwarded: track(state.forwarded, request_id)}}
+    else
+      _ = call(state, "Fetch.continueRequest", %{"requestId" => request_id})
+      {:noreply, state}
+    end
+  end
+
+  def handle_info(
+        {:cdp_event, conn, "Fetch.authRequired", %{"requestId" => request_id} = params, sid},
+        %__MODULE__{conn: conn, session_id: sid, auth: %{} = auth} = state
+      ) do
     {response, attempts} =
-      auth_decision(state.source, state.attempts, request_id, params["authChallenge"] || %{},
-        username: state.username,
-        password: state.password
+      auth_decision(auth.source, state.attempts, request_id, params["authChallenge"] || %{},
+        username: auth.username,
+        password: auth.password
       )
 
     _ =
@@ -152,6 +141,26 @@ defmodule CDPEx.Fetch do
     {:stop, :normal, state}
   end
 
+  def handle_info(
+        {:DOWN, ref, :process, _pid, _reason},
+        %__MODULE__{intercept: %{ref: ref}} = state
+      ) do
+    # The interception owner died without disabling: leave the page usable.
+    case drop_intercept(state, @call_timeout) do
+      {:ok, state} ->
+        {:noreply, state}
+
+      {{:error, reason}, state} ->
+        if not benign?(reason) do
+          Logger.warning(
+            "[CDPEx.Fetch] releasing interception after its owner died returned #{inspect(reason)}; the page may remain intercepted"
+          )
+        end
+
+        {:noreply, state}
+    end
+  end
+
   # Our :session page's session ended. Chrome sends the detach on the parent session,
   # so it is matched on params, not on the event's session id.
   def handle_info(
@@ -162,16 +171,207 @@ defmodule CDPEx.Fetch do
     {:stop, :normal, %{state | detached: true}}
   end
 
+  # Includes Fetch.authRequired while auth is off: it isn't ours to answer (a caller
+  # that enabled handleAuthRequests itself answers it).
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
   def terminate(_reason, state) do
     # Best-effort: the connection may already be gone (Connection.call and
     # safe_unsubscribe both tolerate that), leaving nothing to disable.
-    _ = if not state.detached, do: call(state, "Fetch.disable", %{})
-    safe_unsubscribe(state.conn)
+    _ =
+      if not state.detached and (state.auth != nil or state.intercept != nil),
+        do: call(state, "Fetch.disable", %{})
+
+    _ = if state.subscribed, do: safe_unsubscribe(state)
     :ok
   end
+
+  # ── requests ────────────────────────────────────────────────────────────────
+
+  defp apply_request({:auth, _creds}, _tag, %__MODULE__{auth: %{}} = state),
+    do: {{:error, :already_authenticated}, state}
+
+  defp apply_request({:auth, creds}, tag, state) do
+    next = %{state | auth: Map.put(creds, :tag, tag), attempts: %{}}
+    rearm(state, next, @call_timeout)
+  end
+
+  defp apply_request({:drop_auth, tag}, _tag, %__MODULE__{auth: %{tag: tag}} = state),
+    do: rearm(state, %{state | auth: nil, attempts: %{}}, @call_timeout)
+
+  defp apply_request({:drop_auth, _other}, _tag, state), do: {:ok, state}
+
+  defp apply_request({:intercept, _, _, _}, _tag, %__MODULE__{intercept: %{}} = state),
+    do: {{:error, :already_intercepting}, state}
+
+  defp apply_request({:intercept, owner, patterns, timeout}, _tag, state) do
+    ref = Process.monitor(owner)
+
+    intercept = %{
+      owner: owner,
+      ref: ref,
+      patterns: patterns,
+      matchers: compile_matchers(patterns)
+    }
+
+    case rearm(state, %{state | intercept: intercept, forwarded: MapSet.new()}, timeout) do
+      {:ok, _} = ok ->
+        ok
+
+      {error, state} ->
+        Process.demonitor(ref, [:flush])
+        {error, state}
+    end
+  end
+
+  defp apply_request({:release_intercept, _timeout}, _tag, %__MODULE__{intercept: nil} = state),
+    do: {:ok, state}
+
+  defp apply_request({:release_intercept, timeout}, _tag, state) do
+    Process.demonitor(state.intercept.ref, [:flush])
+    drop_intercept(state, timeout)
+  end
+
+  # Interception ends (released or its owner died). With auth on, the pauses already
+  # forwarded would stay paused after the re-enable, so let them through first; a
+  # continueRequest for one the owner already resolved fails harmlessly. With auth off,
+  # Fetch.disable releases them.
+  defp drop_intercept(state, timeout) do
+    if state.auth do
+      Enum.each(state.forwarded, &call(state, "Fetch.continueRequest", %{"requestId" => &1}))
+    end
+
+    {result, next} =
+      rearm(state, %{state | intercept: nil, forwarded: MapSet.new()}, timeout)
+
+    # The mode is gone whatever the CDP result: its owner is gone or released it.
+    {result, %{next | intercept: nil, forwarded: MapSet.new()}}
+  end
+
+  # Apply `next`'s modes to the page's Fetch domain. On success the state becomes
+  # `next`; on failure it stays `prev`, whose enable is still in effect.
+  defp rearm(prev, next, timeout) do
+    case enable_params(next.auth, next.intercept && next.intercept.patterns) do
+      nil -> disable(prev, next, timeout)
+      params -> enable(prev, next, params, timeout)
+    end
+  end
+
+  defp disable(%__MODULE__{auth: nil, intercept: nil}, next, _timeout), do: {:ok, next}
+
+  defp disable(_prev, next, timeout) do
+    case call(next, "Fetch.disable", %{}, timeout) do
+      {:ok, _} -> {:ok, next}
+      {:error, reason} -> {{:error, reason}, next}
+    end
+  end
+
+  defp enable(prev, next, params, timeout) do
+    case ensure_subscribed(next, timeout) do
+      {:ok, next} ->
+        case call(next, "Fetch.enable", params, timeout) do
+          {:ok, _} -> {:ok, next}
+          {:error, reason} -> arm_failed(reason, %{prev | subscribed: true})
+        end
+
+      {:error, reason} ->
+        arm_failed(reason, prev)
+    end
+  end
+
+  defp arm_failed(reason, state) do
+    if not benign?(reason), do: Logger.warning("[CDPEx.Fetch] arming failed: #{inspect(reason)}")
+    {{:error, reason}, state}
+  end
+
+  # Subscribe BEFORE the first enable so no paused request can slip through between
+  # the enable and the first event delivery.
+  defp ensure_subscribed(%__MODULE__{subscribed: true} = state, _timeout), do: {:ok, state}
+
+  defp ensure_subscribed(state, timeout) do
+    methods = if state.session_id, do: ["Target.detachedFromTarget" | @events], else: @events
+
+    Enum.reduce_while(methods, {:ok, state}, fn method, {:ok, acc} ->
+      case Connection.subscribe(acc.conn, method, timeout, session_id: acc.session_id) do
+        :ok -> {:cont, {:ok, %{acc | subscribed: true}}}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  # The page connection died, or a :session page's session detached, mid-arm (a
+  # close/arm race) — no log.
+  defp benign?(:noproc), do: true
+  defp benign?({tag, _}) when tag in [:ws_closed, :session_closed], do: true
+  defp benign?(_), do: false
+
+  # ── pure helpers ────────────────────────────────────────────────────────────
+
+  @doc false
+  # The Fetch.enable params for a page's modes, or nil when both are off.
+  @spec enable_params(map() | nil, [map()] | nil) :: map() | nil
+  def enable_params(nil, nil), do: nil
+  def enable_params(nil, patterns), do: %{"patterns" => patterns}
+  def enable_params(_auth, nil), do: %{"handleAuthRequests" => true}
+
+  def enable_params(_auth, patterns) do
+    response = Enum.filter(patterns, &response_stage?/1)
+    %{"patterns" => [%{"urlPattern" => "*"} | response], "handleAuthRequests" => true}
+  end
+
+  @doc false
+  # Whether a paused request goes to the interception owner. With auth off, Chrome
+  # paused exactly the owner's patterns. With auth on, every request pauses at the
+  # Request stage, so match it here; the Response stage only has the owner's patterns.
+  @spec forward?(t(), map()) :: boolean()
+  def forward?(%__MODULE__{intercept: nil}, _params), do: false
+  def forward?(%__MODULE__{auth: nil}, _params), do: true
+
+  def forward?(%__MODULE__{intercept: %{matchers: matchers}}, params) do
+    response_pause?(params) or matches?(matchers, params)
+  end
+
+  @doc false
+  # Compile the owner's Request-stage patterns into {url_regex, resource_type | nil}.
+  @spec compile_matchers([map()]) :: [{Regex.t(), String.t() | nil}]
+  def compile_matchers(patterns) do
+    for pattern <- patterns, not response_stage?(pattern) do
+      {glob_regex(Map.get(pattern, "urlPattern", "*")), Map.get(pattern, "resourceType")}
+    end
+  end
+
+  @doc false
+  @spec matches?([{Regex.t(), String.t() | nil}], map()) :: boolean()
+  def matches?(matchers, params) do
+    url = get_in(params, ["request", "url"]) || ""
+    type = params["resourceType"]
+
+    Enum.any?(matchers, fn {regex, resource_type} ->
+      (resource_type == nil or resource_type == type) and Regex.match?(regex, url)
+    end)
+  end
+
+  defp response_stage?(pattern), do: Map.get(pattern, "requestStage") == "Response"
+
+  defp response_pause?(params),
+    do: Map.has_key?(params, "responseStatusCode") or Map.has_key?(params, "responseErrorReason")
+
+  # CDP's urlPattern: `*` is zero or more characters, `?` exactly one, `\` escapes.
+  defp glob_regex(glob) do
+    Regex.compile!("\\A" <> glob_source(glob, []) <> "\\z", "su")
+  end
+
+  defp glob_source(<<"\\", c::utf8, rest::binary>>, acc),
+    do: glob_source(rest, [Regex.escape(<<c::utf8>>) | acc])
+
+  defp glob_source(<<"*", rest::binary>>, acc), do: glob_source(rest, [".*" | acc])
+  defp glob_source(<<"?", rest::binary>>, acc), do: glob_source(rest, ["." | acc])
+
+  defp glob_source(<<c::utf8, rest::binary>>, acc),
+    do: glob_source(rest, [Regex.escape(<<c::utf8>>) | acc])
+
+  defp glob_source(<<>>, acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
 
   @doc false
   # Decide the authChallengeResponse and the next attempts map for a challenge.
@@ -205,31 +405,32 @@ defmodule CDPEx.Fetch do
   # challenges. In practice (proxy creds are cached after the first success) the
   # live size is 0–1, so the cap is a safety valve; dropping entries at the cap at
   # most re-offers credentials once for a challenge still in flight.
-  defp track_attempt(attempts, request_id) when map_size(attempts) >= @max_tracked_challenges,
+  defp track_attempt(attempts, request_id) when map_size(attempts) >= @max_tracked,
     do: %{request_id => 1}
 
   defp track_attempt(attempts, request_id), do: Map.put(attempts, request_id, 1)
+
+  # Forwarded ids are never pruned on resolution (the owner resolves them directly on
+  # the connection), so cap the set the same way. Dropping ids at the cap can only
+  # miss releasing a pause that was forwarded more than @max_tracked pauses ago.
+  defp track(forwarded, request_id) do
+    if MapSet.size(forwarded) >= @max_tracked,
+      do: MapSet.new([request_id]),
+      else: MapSet.put(forwarded, request_id)
+  end
 
   defp source_match?(:any, _source), do: true
   defp source_match?(:proxy, "Proxy"), do: true
   defp source_match?(:server, "Server"), do: true
   defp source_match?(_filter, _source), do: false
 
-  # Scoped to the page's session, so a handler on the shared browser connection isn't
-  # sent every other page's Fetch events.
-  defp subscribe(state, method),
-    do: Connection.subscribe(state.conn, method, @call_timeout, session_id: state.session_id)
-
-  defp subscribe_detach(%__MODULE__{session_id: nil}), do: :ok
-  defp subscribe_detach(state), do: subscribe(state, "Target.detachedFromTarget")
-
-  defp call(state, method, params) do
-    Connection.call(state.conn, method, params, @call_timeout, session_id: state.session_id)
+  defp call(state, method, params, timeout \\ @call_timeout) do
+    Connection.call(state.conn, method, params, timeout, session_id: state.session_id)
   end
 
-  defp safe_unsubscribe(conn) do
-    Connection.unsubscribe(conn, "Fetch.requestPaused")
-    Connection.unsubscribe(conn, "Fetch.authRequired")
-    Connection.unsubscribe(conn, "Target.detachedFromTarget")
+  defp safe_unsubscribe(state) do
+    for method <- ["Target.detachedFromTarget" | @events] do
+      Connection.unsubscribe(state.conn, method)
+    end
   end
 end

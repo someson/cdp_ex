@@ -34,6 +34,8 @@ defmodule CDPExTest do
       {:timeout, :new_page},
       {:timeout, :close_page},
       {:timeout, :authenticate},
+      {:timeout, :enable_request_interception},
+      {:timeout, :disable_request_interception},
       {:timeout, :subscribe},
       :deadline_exceeded,
       {:chrome_exited, 1, "stderr excerpt"},
@@ -67,8 +69,6 @@ defmodule CDPExTest do
       {:invalid_response_body, "not-base64"},
       {:invalid_pdf_data, "not-base64"},
       {:invalid_screenshot_data, "not-base64"},
-      {:conflict, :authenticated},
-      {:conflict, :intercepting},
       :unknown_page,
       :already_authenticated,
       :already_intercepting
