@@ -156,6 +156,11 @@ defmodule CDPEx.ChromeTest do
       assert File.dir?(dir)
     end
 
+    test "marks the dir with its owner, so only a matching sweep removes it", %{tmp_dir: tmp} do
+      assert {:ok, dir, true} = Chrome.create_temp_profile_dir(tmp)
+      assert File.read!(Path.join(dir, ".cdp_ex_owner")) == Chrome.owner_id()
+    end
+
     test "returns a different dir on each call", %{tmp_dir: tmp} do
       assert {:ok, a, true} = Chrome.create_temp_profile_dir(tmp)
       assert {:ok, b, true} = Chrome.create_temp_profile_dir(tmp)
@@ -195,15 +200,37 @@ defmodule CDPEx.ChromeTest do
 
     test "removes the profile dirs of a dead OS pid", %{tmp_dir: tmp} do
       dead = dead_os_pid()
-      dirs = for n <- [1, 42], do: mkdir!(tmp, "cdp_ex-#{dead}-#{n}")
+      dirs = for n <- [1, 42], do: owned_dir!(tmp, "cdp_ex-#{dead}-#{n}", Chrome.owner_id())
       File.write!(Path.join(hd(dirs), "SingletonLock"), "")
 
       assert Chrome.sweep_stale_profile_dirs(tmp) == :ok
       refute Enum.any?(dirs, &File.exists?/1)
     end
 
+    test "keeps a dead pid's dir made on another host or in another pid namespace", %{
+      tmp_dir: tmp
+    } do
+      dead = dead_os_pid()
+      foreign = owned_dir!(tmp, "cdp_ex-#{dead}-1", "other-host\npid:[1]\n")
+      unmarked = mkdir!(tmp, "cdp_ex-#{dead}-2")
+
+      assert Chrome.sweep_stale_profile_dirs(tmp) == :ok
+      assert File.dir?(foreign)
+      assert File.dir?(unmarked)
+    end
+
+    test "trusts only the marker that matches the owner it is given", %{tmp_dir: tmp} do
+      dead = dead_os_pid()
+      dir = owned_dir!(tmp, "cdp_ex-#{dead}-1", "host-b\npid:[7]\n")
+
+      assert Chrome.sweep_stale_profile_dirs(tmp, "host-a\npid:[7]\n") == :ok
+      assert File.dir?(dir)
+      assert Chrome.sweep_stale_profile_dirs(tmp, "host-b\npid:[7]\n") == :ok
+      refute File.exists?(dir)
+    end
+
     test "keeps the profile dirs of this VM", %{tmp_dir: tmp} do
-      dir = mkdir!(tmp, "cdp_ex-#{System.pid()}-1")
+      dir = owned_dir!(tmp, "cdp_ex-#{System.pid()}-1", Chrome.owner_id())
 
       assert Chrome.sweep_stale_profile_dirs(tmp) == :ok
       assert File.dir?(dir)
@@ -213,7 +240,7 @@ defmodule CDPEx.ChromeTest do
       port = Port.open({:spawn_executable, "/bin/sleep"}, [:exit_status, args: ["30"]])
       {:os_pid, live} = Port.info(port, :os_pid)
       on_exit(fn -> System.cmd("kill", ["-9", to_string(live)]) end)
-      dir = mkdir!(tmp, "cdp_ex-#{live}-1")
+      dir = owned_dir!(tmp, "cdp_ex-#{live}-1", Chrome.owner_id())
 
       assert Chrome.sweep_stale_profile_dirs(tmp) == :ok
       assert File.dir?(dir)
@@ -234,7 +261,7 @@ defmodule CDPEx.ChromeTest do
         "other"
       ]
 
-      dirs = Enum.map(names, &mkdir!(tmp, &1))
+      dirs = Enum.map(names, &owned_dir!(tmp, &1, Chrome.owner_id()))
 
       assert Chrome.sweep_stale_profile_dirs(tmp) == :ok
       assert Enum.all?(dirs, &File.dir?/1)
@@ -244,7 +271,7 @@ defmodule CDPEx.ChromeTest do
       dead = dead_os_pid()
       file = Path.join(tmp, "cdp_ex-#{dead}-1")
       File.write!(file, "")
-      target = mkdir!(tmp, "target")
+      target = owned_dir!(tmp, "target", Chrome.owner_id())
       File.write!(Path.join(target, "keep"), "")
       link = Path.join(tmp, "cdp_ex-#{dead}-2")
       File.ln_s!(target, link)
@@ -452,6 +479,12 @@ defmodule CDPEx.ChromeTest do
     File.write!(path, body)
     File.chmod!(path, 0o755)
     path
+  end
+
+  defp owned_dir!(tmp, name, owner) do
+    dir = mkdir!(tmp, name)
+    File.write!(Path.join(dir, ".cdp_ex_owner"), owner)
+    dir
   end
 
   defp mkdir!(tmp, name) do

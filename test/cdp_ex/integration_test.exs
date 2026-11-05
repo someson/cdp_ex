@@ -1616,6 +1616,11 @@ defmodule CDPEx.IntegrationTest do
       assert map_size(:sys.get_state(browser).intercepts) == 1
       :ok = CDPEx.close_page(browser, page)
       assert :sys.get_state(browser).intercepts == %{}
+
+      # The owner never disabled; its subscription for the closed session goes anyway.
+      assert eventually(fn ->
+               :sys.get_state(page.conn).subscribers["Fetch.requestPaused"][self()] == nil
+             end)
     end
   end
 

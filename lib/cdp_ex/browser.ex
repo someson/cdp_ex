@@ -1136,7 +1136,9 @@ defmodule CDPEx.Browser do
   end
 
   # The page's target is already gone: dispose its context, if it had one, and forget
-  # its interception owner.
+  # its interception owner. The dispose runs off the Browser process: this is called
+  # from handle_info, where a Chrome that is alive but not answering would otherwise
+  # block every other page op for the call timeout, once per page that went.
   defp page_gone(state, tid) do
     state = drop_intercept(state, tid)
 
@@ -1145,9 +1147,21 @@ defmodule CDPEx.Browser do
         state
 
       {context_id, contexts} ->
-        dispose_context(state.browser_conn, context_id)
+        dispose_context_async(state.browser_conn, context_id)
         %{state | contexts: contexts}
     end
+  end
+
+  # Best-effort, like dispose_context/2. Should the browser connection drop before it
+  # runs, `disposeOnDetach` makes Chrome dispose the context anyway.
+  defp dispose_context_async(browser_conn, context_id) do
+    _ =
+      Task.start(fn ->
+        ProcessLabel.set({:cdp_context_dispose, context_id})
+        dispose_context(browser_conn, context_id)
+      end)
+
+    :ok
   end
 
   # The page ended, and its Fetch domain with it: forget its interception owner, so a
