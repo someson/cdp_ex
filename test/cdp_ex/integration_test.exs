@@ -1530,6 +1530,93 @@ defmodule CDPEx.IntegrationTest do
       assert {:error, {:conflict, :intercepting}} = Page.authenticate(p2, "cdpex", "secret")
       assert :ok = Page.disable_request_interception(p2)
     end
+
+    for launch_opts <- [[], [pipe: true]] do
+      test "fulfill_request on a :session page (#{inspect(launch_opts)})", %{fixture: fixture} do
+        {:ok, browser} = CDPEx.launch(unquote(launch_opts))
+        on_exit(fn -> stop_quietly(browser) end)
+        {:ok, page} = CDPEx.new_page(browser, transport: :session)
+        sid = page.session_id
+
+        assert :ok = Page.enable_request_interception(page)
+        conn = page.conn
+        nav = Task.async(fn -> Page.navigate(page, fixture, wait_until: :load) end)
+
+        assert_receive {:cdp_event, ^conn, "Fetch.requestPaused", %{"requestId" => req_id}, ^sid},
+                       5_000
+
+        assert :ok =
+                 Page.fulfill_request(page, req_id,
+                   status: 200,
+                   headers: %{"Content-Type" => "text/html"},
+                   body: ~s(<h1 id="x">intercepted</h1>)
+                 )
+
+        assert {:ok, _} = Task.await(nav, 10_000)
+        assert {:ok, "intercepted"} = Page.text(page, "#x")
+        assert :ok = Page.disable_request_interception(page)
+      end
+    end
+
+    test "one process intercepting two :session pages: disabling one keeps the other", %{
+      fixture: fixture
+    } do
+      {:ok, browser} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(browser) end)
+      {:ok, a} = CDPEx.new_page(browser, transport: :session)
+      {:ok, b} = CDPEx.new_page(browser, transport: :session)
+      conn = a.conn
+      sid_b = b.session_id
+
+      assert :ok = Page.enable_request_interception(a)
+      assert :ok = Page.enable_request_interception(b)
+      assert :ok = Page.disable_request_interception(a)
+
+      # a loads untouched; b's pause still reaches this process.
+      assert {:ok, _} = Page.navigate(a, fixture, wait_until: :load)
+      assert {:ok, "Hello"} = Page.text(a, "#greeting")
+
+      nav = Task.async(fn -> Page.navigate(b, fixture, wait_until: :load) end)
+
+      assert_receive {:cdp_event, ^conn, "Fetch.requestPaused", %{"requestId" => req_id}, ^sid_b},
+                     5_000
+
+      assert :ok = Page.continue_request(b, req_id)
+      assert {:ok, _} = Task.await(nav, 10_000)
+      assert :ok = Page.disable_request_interception(b)
+    end
+
+    test "auto-disables Fetch on a :session page when its owner dies", %{fixture: fixture} do
+      {:ok, browser} = CDPEx.launch()
+      {:ok, page} = CDPEx.new_page(browser, transport: :session)
+      on_exit(fn -> stop_quietly(browser) end)
+      test = self()
+
+      owner =
+        spawn(fn ->
+          send(test, {:enabled, Page.enable_request_interception(page)})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:enabled, :ok}, 5_000
+      Process.exit(owner, :kill)
+
+      assert eventually(fn ->
+               Page.navigate(page, fixture, wait_until: :load, timeout: 1_000)
+               match?({:ok, "Hello"}, Page.text(page, "#greeting"))
+             end)
+    end
+
+    test "closing an intercepted :session page drops its reservation" do
+      {:ok, browser} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(browser) end)
+      {:ok, page} = CDPEx.new_page(browser, transport: :session)
+
+      assert :ok = Page.enable_request_interception(page)
+      assert map_size(:sys.get_state(browser).intercepts) == 1
+      :ok = CDPEx.close_page(browser, page)
+      assert :sys.get_state(browser).intercepts == %{}
+    end
   end
 
   describe "tracer bullet" do

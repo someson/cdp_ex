@@ -217,8 +217,8 @@ It works with `with_page([pipe: true], fun)` and
 `Pool.start_link(launch_opts: [pipe: true])` too. The trade-offs:
 
 - Pages are `:session` pages only: `transport: :dedicated` returns
-  `{:error, {:unsupported_transport, :dedicated}}`, and request interception
-  isn't available. `Page.authenticate/4` and a `:proxy` with credentials work.
+  `{:error, {:unsupported_transport, :dedicated}}`. `Page.authenticate/4`,
+  request interception and a `:proxy` with credentials work.
 - Chrome's stderr is discarded, so a failed launch carries no stderr excerpt.
 - Unix only.
 - Startup is about 15 ms faster on Linux (104 vs 120 ms to the first CDP reply,
