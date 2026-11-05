@@ -235,6 +235,51 @@ defmodule CDPEx.ConnectionTest do
       refute Map.has_key?(:sys.get_state(conn).monitors, self())
     end
 
+    test "a session's detach drops the subscriptions scoped to it, after delivering it", %{
+      conn: conn,
+      fake: fake
+    } do
+      :ok = Connection.subscribe(conn, "Fetch.requestPaused", 1_000, session_id: "A")
+      :ok = Connection.subscribe(conn, "Target.detachedFromTarget", 1_000, session_id: "A")
+      :ok = Connection.subscribe(conn, :all, 1_000, session_id: "A")
+
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Target.detachedFromTarget","params":{"sessionId":"A","targetId":"T"}})
+      )
+
+      # Its own detach still reaches the subscriber scoped to it.
+      assert_receive {:cdp_event, ^conn, "Target.detachedFromTarget", %{"sessionId" => "A"}, nil},
+                     2_000
+
+      state = :sys.get_state(conn)
+      assert state.subscribers["Fetch.requestPaused"] == %{}
+      assert state.subscribers["Target.detachedFromTarget"] == %{}
+      assert state.all_subscribers == %{}
+      refute Map.has_key?(state.monitors, self())
+    end
+
+    test "a session's detach keeps other sessions' subscriptions", %{conn: conn, fake: fake} do
+      :ok = Connection.subscribe(conn, "Fetch.requestPaused", 1_000, session_id: "A")
+      :ok = Connection.subscribe(conn, "Fetch.requestPaused", 1_000, session_id: "B")
+
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Target.detachedFromTarget","params":{"sessionId":"A","targetId":"T"}})
+      )
+
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Fetch.requestPaused","sessionId":"B","params":{"s":"B"}})
+      )
+
+      assert_receive {:cdp_event, ^conn, "Fetch.requestPaused", %{"s" => "B"}, "B"}, 2_000
+
+      assert :sys.get_state(conn).subscribers["Fetch.requestPaused"] == %{
+               self() => MapSet.new(["B"])
+             }
+    end
+
     test "without options removes every filter, as before", %{conn: conn} do
       :ok = Connection.subscribe(conn, "Fetch.requestPaused", 1_000, session_id: "A")
       :ok = Connection.subscribe(conn, "Fetch.requestPaused", 1_000, session_id: "B")

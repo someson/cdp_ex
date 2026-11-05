@@ -620,6 +620,20 @@ defmodule CDPEx.BrowserTest do
       Connection.close(conn)
     end
 
+    test "page-conn EXIT doesn't wait on a browser connection that never answers" do
+      # A Chrome that is alive but hung: the dispose must not block the Browser.
+      silent = spawn(fn -> Process.sleep(:infinity) end)
+      page_conn = spawn(fn -> :ok end)
+      state = %Browser{browser_conn: silent, pages: %{"T1" => page_conn}, contexts: %{"T1" => "C1"}}
+
+      {us, {:noreply, new_state}} =
+        :timer.tc(fn -> Browser.handle_info({:EXIT, page_conn, :boom}, state) end)
+
+      assert us < 1_000_000
+      assert new_state.contexts == %{}
+      Process.exit(silent, :kill)
+    end
+
     test "Target.detachedFromTarget disposes the session page's context" do
       {state, conn} = fake_browser_state()
       state = %{state | sessions: %{"T1" => "S1"}, contexts: %{"T1" => "C1"}}

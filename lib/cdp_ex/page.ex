@@ -39,6 +39,10 @@ defmodule CDPEx.Page do
   @navigate_timeout 30_000
   @evaluate_timeout 15_000
   @selector_timeout 5_000
+  # The longest delay a browser timer holds: setTimeout/setInterval treat anything
+  # above 2^31 - 1 ms as 0, so a larger wait :timeout would fire at once and a larger
+  # :interval would poll every few ms.
+  @max_timer_ms 2_147_483_647
   # Extra time the CDP call for an in-page wait gets past the wait's own timeout,
   # so the page's timer normally settles it; see await_truthy/4.
   @wait_grace 500
@@ -864,7 +868,8 @@ defmodule CDPEx.Page do
   `:session` page, whose detach Chrome reports as "session not found"). This is
   the shared error taxonomy behind `wait_for_selector/3`.
   Options: `:timeout` (default 5_000), `:interval` (ms between timer-driven
-  checks, default 100).
+  checks, default 100). Both must be at most 2_147_483_647 ms (about 24.8 days),
+  the longest delay a browser timer holds; a larger value raises `ArgumentError`.
   """
   @spec wait_for_function(t(), String.t(), keyword()) :: :ok | {:error, term()}
   def wait_for_function(%__MODULE__{} = page, js, opts \\ []) when is_binary(js) do
@@ -878,12 +883,12 @@ defmodule CDPEx.Page do
   # integer in range is refused here rather than surfacing as a JS error.
   defp wait_opt!(opts, key, default, min) do
     case Keyword.get(opts, key, default) do
-      value when is_integer(value) and value >= min ->
+      value when is_integer(value) and value >= min and value <= @max_timer_ms ->
         value
 
       other ->
         raise ArgumentError,
-              "invalid #{inspect(key)} #{inspect(other)} (expected an integer >= #{min})"
+              "invalid #{inspect(key)} #{inspect(other)} (expected an integer in #{min}..#{@max_timer_ms})"
     end
   end
 

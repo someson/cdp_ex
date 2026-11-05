@@ -621,6 +621,34 @@ defmodule CDPEx.Connection do
     |> fail_detached_session(method, params)
     |> notify_waiters(session_id, params)
     |> notify_subscribers(method, session_id, params)
+    |> drop_detached_subscriptions(method, params)
+  end
+
+  # A detached session never sends another event, so a subscription scoped to it can
+  # only pile up: a process that closes :session pages without unsubscribing would keep
+  # one per page for the life of the connection. Dropped after delivery, so the
+  # subscribers scoped to `sid` still get its own detach (CDPEx.Fetch stops on it).
+  defp drop_detached_subscriptions(state, "Target.detachedFromTarget", %{"sessionId" => sid})
+       when is_binary(sid) do
+    pids =
+      Enum.flat_map(state.subscribers, fn {_method, subs} -> scoped_pids(subs, sid) end) ++
+        scoped_pids(state.all_subscribers, sid)
+
+    state = %{
+      state
+      | subscribers: Map.new(state.subscribers, fn {m, subs} -> {m, drop_session(subs, sid)} end),
+        all_subscribers: drop_session(state.all_subscribers, sid)
+    }
+
+    pids |> Enum.uniq() |> Enum.reduce(state, &demonitor_if_orphaned(&2, &1))
+  end
+
+  defp drop_detached_subscriptions(state, _method, _params), do: state
+
+  defp scoped_pids(subs, sid), do: for({pid, filters} <- subs, sid in filters, do: pid)
+
+  defp drop_session(subs, sid) do
+    Enum.reduce(subs, subs, fn {pid, _filters}, acc -> drop_filter(acc, pid, {:only, sid}) end)
   end
 
   # Chrome never answers a call that was in flight on a session when it detached,

@@ -387,6 +387,16 @@ defmodule CDPEx.PageTest do
         Page.wait_for_selector(page, "#x", timeout: "5000")
       end
     end
+
+    test "refuses a :timeout or :interval past the longest browser timer", %{page: page} do
+      assert_raise ArgumentError, ~r/invalid :timeout 2147483648 .*0\.\.2147483647/, fn ->
+        Page.wait_for_function(page, "true", timeout: 2_147_483_648)
+      end
+
+      assert_raise ArgumentError, ~r/invalid :interval 2147483648/, fn ->
+        Page.wait_for_selector(page, "#x", interval: 2_147_483_648)
+      end
+    end
   end
 
   describe "click/3 :wait" do

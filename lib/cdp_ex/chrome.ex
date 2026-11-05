@@ -81,14 +81,20 @@ defmodule CDPEx.Chrome do
   # Chrome keeps the Port's OS pid (`kill/1`, `await_exit/2` and the process label
   # are unchanged). The OS closes that pipe when the VM exits, however it exits;
   # the watchdog's read then returns and it kill -9s Chrome. On a normal stop it
-  # fires after `stop/1` already killed Chrome, which is harmless.
+  # fires after `stop/1` already killed Chrome.
+  #
+  # By then Chrome's pid may belong to another process, so on Linux the watchdog
+  # first checks that it is still Chrome's child: its parent in /proc/self/stat
+  # (read by the shell itself, so `self` is the watchdog) is `$$`, Chrome's pid, only
+  # while Chrome lives; once Chrome is gone the watchdog has been reparented. Without
+  # /proc (macOS) it kills unconditionally, as before.
   #
   # fd 3 carries stdin into the watchdog because POSIX shells give a background
   # job /dev/null as stdin. The watchdog drops stdout/stderr so it doesn't hold the
   # Port open after Chrome exits (the exit status only arrives once they close), and
   # Chrome gets fd 3 closed. If the exec itself fails, the shell exits 126 (not
   # executable) or 127 (not found) before Chrome runs; see exit_reason/1.
-  @watchdog ~S|exec 3<&0; (read -r _ <&3; kill -9 $$) >/dev/null 2>&1 & exec "$0" "$@" 3<&-|
+  @watchdog ~S{exec 3<&0; (read -r _ <&3; if [ -r /proc/self/stat ]; then read -r _ _ _ p _ </proc/self/stat; [ "$p" = $$ ] || exit 0; fi; kill -9 $$) >/dev/null 2>&1 & exec "$0" "$@" 3<&-}
 
   # The `pipe: true` wrapper: Chrome's --remote-debugging-pipe reads fd 3 and writes
   # fd 4, so the Port's stdin and stdout move there, and Chrome's own stdout and
@@ -104,6 +110,9 @@ defmodule CDPEx.Chrome do
 
   # Fresh names to try when a temp profile dir already exists (see create_temp_profile_dir/2).
   @temp_dir_attempts 10
+
+  # The file in a temp profile dir that names its creator (see owner_id/0).
+  @owner_marker ".cdp_ex_owner"
 
   # How often to poll the DevToolsActivePort file while waiting for readiness, so
   # a fast-ready Chrome returns promptly and @launch_timeout acts as a ceiling.
@@ -475,27 +484,56 @@ defmodule CDPEx.Chrome do
     dir = Path.join(tmp, next_name.())
 
     case File.mkdir(dir) do
-      :ok -> {:ok, dir, true}
-      {:error, :eexist} -> create_temp_profile_dir(tmp, next_name, attempts - 1)
-      {:error, posix} -> {:error, {:launch_failed, {:user_data_dir, posix}}}
+      :ok ->
+        # Best-effort: a dir without the marker is never swept, which is safe.
+        _ = File.write(Path.join(dir, @owner_marker), owner_id())
+        {:ok, dir, true}
+
+      {:error, :eexist} ->
+        create_temp_profile_dir(tmp, next_name, attempts - 1)
+
+      {:error, posix} ->
+        {:error, {:launch_failed, {:user_data_dir, posix}}}
     end
   end
 
   defp temp_profile_name, do: "cdp_ex-#{System.pid()}-#{System.unique_integer([:positive])}"
 
   @doc false
+  # Who created a temp profile dir, as far as `kill -0` can see: the host name and the
+  # pid namespace. Two VMs that share a temp dir but not a pid namespace (containers
+  # bind-mounting one /tmp, a host and a container) or a host (a network mount) can't
+  # tell each other's pids apart, so the sweep only trusts a dir whose marker matches
+  # its own. On a system without /proc (macOS) the namespace is "none".
+  @spec owner_id() :: String.t()
+  def owner_id do
+    {:ok, host} = :inet.gethostname()
+
+    pidns =
+      case File.read_link("/proc/self/ns/pid") do
+        {:ok, ns} -> ns
+        {:error, _} -> "none"
+      end
+
+    "#{host}\n#{pidns}\n"
+  end
+
+  @doc false
   # Removes the temp profile dirs under `tmp` left by VMs that died without running
   # `terminate/2` (`kill -9`, the OOM killer): the watchdog kills their Chrome, but
   # nothing removes the dir. A dir is removed only if its name is exactly
   # `cdp_ex-<os_pid>-<n>` (see temp_profile_name/0), it is a real dir (not a
-  # symlink), and `kill -0` says no process `<os_pid>` exists. A live pid, this
-  # VM's own, or any doubt (`kill` missing, `EPERM`, Windows) keeps the dir. If the
-  # OS has reused a dead VM's pid, its dir is kept too: safe, but incomplete.
+  # symlink), `kill -0` says no process `<os_pid>` exists, and its owner marker
+  # (see owner_id/0) says it was made on this host in this pid namespace, where that
+  # `kill -0` means something. A live pid, this VM's own, a missing or foreign marker,
+  # or any doubt (`kill` missing, `EPERM`, Windows) keeps the dir. If the OS has reused
+  # a dead VM's pid, its dir is kept too: safe, but incomplete. `owner` is injectable
+  # for tests.
   #
   # Best-effort: always returns `:ok`, so a dir that can't be listed or removed
   # never fails the launch.
-  @spec sweep_stale_profile_dirs(String.t()) :: :ok
-  def sweep_stale_profile_dirs(tmp) do
+  @spec sweep_stale_profile_dirs(String.t(), String.t()) :: :ok
+  def sweep_stale_profile_dirs(tmp, owner \\ owner_id()) do
     _ =
       with false <- match?({:win32, _}, :os.type()),
            {:ok, names} <- File.ls(tmp) do
@@ -504,7 +542,7 @@ defmodule CDPEx.Chrome do
         names
         |> Enum.flat_map(&stale_candidate(&1, own))
         |> Enum.group_by(fn {pid, _name} -> pid end, fn {_pid, name} -> name end)
-        |> Enum.each(fn {pid, pid_names} -> remove_if_gone(tmp, pid, pid_names) end)
+        |> Enum.each(fn {pid, pid_names} -> remove_if_gone(tmp, pid, pid_names, owner) end)
       end
 
     :ok
@@ -520,21 +558,20 @@ defmodule CDPEx.Chrome do
     end
   end
 
-  defp remove_if_gone(tmp, pid, names) do
-    if os_pid_gone?(pid), do: Enum.each(names, &remove_stale_dir(tmp, &1)), else: :ok
+  defp remove_if_gone(tmp, pid, names, owner) do
+    if os_pid_gone?(pid), do: Enum.each(names, &remove_stale_dir(tmp, &1, owner)), else: :ok
   end
 
-  defp remove_stale_dir(tmp, name) do
+  defp remove_stale_dir(tmp, name, owner) do
     dir = Path.join(tmp, name)
 
-    case File.lstat(dir) do
-      {:ok, %File.Stat{type: :directory}} ->
-        _ = File.rm_rf(dir)
-        :ok
+    _ =
+      with {:ok, %File.Stat{type: :directory}} <- File.lstat(dir),
+           {:ok, ^owner} <- File.read(Path.join(dir, @owner_marker)) do
+        File.rm_rf(dir)
+      end
 
-      _ ->
-        :ok
-    end
+    :ok
   end
 
   # ── DevTools URL discovery ──────────────────────────────────────────────────
