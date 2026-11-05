@@ -527,6 +527,16 @@ defmodule CDPEx.ConnectionTest do
     assert {:ok, %{"name" => "networkAlmostIdle"}} = Task.await(task)
   end
 
+  test "a blocking await_event whose caller dies is dropped before its timeout", %{conn: conn} do
+    caller = spawn(fn -> Connection.await_event(conn, fn _ -> false end, 30_000) end)
+
+    eventually(fn -> waiter_count(conn) == 1 end)
+    Process.exit(caller, :kill)
+
+    eventually(fn -> waiter_count(conn) == 0 end)
+    assert waiter_monitors(conn) == 0
+  end
+
   test "await_event times out when no event matches", %{conn: conn} do
     assert {:error, {:timeout, :await_event}} = Connection.await_event(conn, fn _ -> false end, 100)
   end
@@ -591,6 +601,53 @@ defmodule CDPEx.ConnectionTest do
       :ok = :sys.resume(conn)
       eventually(fn -> waiter_count(conn) == 0 end)
       refute_receive {:cdp_await, _, _}, 100
+    end
+
+    test "drops the waiter when its caller dies, before the timeout", %{conn: conn} do
+      caller =
+        spawn(fn ->
+          {:ok, _ref} = Connection.await_event_async(conn, fn _ -> false end, 30_000)
+          Process.sleep(:infinity)
+        end)
+
+      eventually(fn -> waiter_count(conn) == 1 end)
+      Process.exit(caller, :kill)
+
+      eventually(fn -> waiter_count(conn) == 0 end)
+      assert waiter_monitors(conn) == 0
+    end
+
+    test "releases its caller monitor on every other way the waiter ends", %{
+      conn: conn,
+      fake: fake
+    } do
+      # Matched.
+      {:ok, ref} = Connection.await_event_async(conn, &(&1["name"] == "x"), 5_000)
+      FakeCDP.send_text(fake, ~s({"method":"Page.lifecycleEvent","params":{"name":"x"}}))
+      assert_receive {:cdp_await, ^ref, {:ok, _}}, 2_000
+
+      # Timed out.
+      {:ok, ref} = Connection.await_event_async(conn, fn _ -> false end, 20)
+      assert_receive {:cdp_await, ^ref, {:error, {:timeout, :await_event}}}, 2_000
+
+      # Its session detached.
+      {:ok, ref} = Connection.await_event_async(conn, fn _ -> false end, 5_000, session_id: "S")
+
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Target.detachedFromTarget","params":{"sessionId":"S","targetId":"T"}})
+      )
+
+      assert_receive {:cdp_await, ^ref, {:error, {:session_closed, "S"}}}, 2_000
+
+      # Cancelled.
+      {:ok, ref} = Connection.await_event_async(conn, fn _ -> false end, 5_000)
+      :ok = Connection.cancel_await(conn, ref)
+
+      eventually(fn -> waiter_count(conn) == 0 end)
+      assert waiter_monitors(conn) == 0
+      # The test process is the caller each time: no monitor on it is left behind.
+      refute conn in monitored_by(self())
     end
 
     test "cancel_await/2 drops a pending waiter", %{conn: conn, fake: fake} do
@@ -803,6 +860,13 @@ defmodule CDPEx.ConnectionTest do
   end
 
   defp waiter_count(conn), do: length(:sys.get_state(conn).waiters)
+
+  defp waiter_monitors(conn), do: map_size(:sys.get_state(conn).waiter_monitors)
+
+  defp monitored_by(pid) do
+    {:monitored_by, pids} = Process.info(pid, :monitored_by)
+    pids
+  end
 
   defp eventually(fun, retries \\ 100) do
     cond do

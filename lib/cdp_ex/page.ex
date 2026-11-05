@@ -1639,7 +1639,7 @@ defmodule CDPEx.Page do
   the wait. A raise, throw or exit in `trigger` propagates, and the wait is cancelled
   first. The outcome is delivered to the calling process's mailbox while `trigger`
   runs, so `trigger` must not consume messages it doesn't own. If the calling process
-  is killed mid-call, the wait stays registered in the connection until `:timeout`.
+  is killed mid-call, the connection drops the wait at once.
 
   `:timeout` bounds the enable and the wait, and `trigger`'s run time counts
   against it, but `trigger` runs in the calling process and is not interrupted.
