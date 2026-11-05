@@ -106,7 +106,8 @@ defmodule CDPEx do
   Two timeout shapes, by layer: the low-level `CDPEx.Connection.call/5`,
   `await_event/4` and `subscribe/4` and the `CDPEx.Browser` requests return
   `{:timeout, context}` (a CDP method, `:await_event`, `:subscribe`, `:new_page`,
-  `:close_page`, or `:authenticate`), while the high-level `CDPEx.Page` `wait_for_*` functions and `CDPEx.Pool.checkout/2`
+  `:close_page`, `:authenticate`, `:enable_request_interception` or
+  `:disable_request_interception`), while the high-level `CDPEx.Page` `wait_for_*` functions and `CDPEx.Pool.checkout/2`
   return a bare `:timeout` ("the awaited condition didn't happen in time").
 
   A WebSocket frame that fails to decode is not a standalone reason: the connection
@@ -123,8 +124,14 @@ defmodule CDPEx do
           | :unknown_page
           | :already_authenticated
           | :already_intercepting
-          | {:timeout, :await_event | :new_page | :close_page | :authenticate | :subscribe}
-          | {:conflict, :authenticated | :intercepting}
+          | {:timeout,
+             :await_event
+             | :new_page
+             | :close_page
+             | :authenticate
+             | :enable_request_interception
+             | :disable_request_interception
+             | :subscribe}
           | {:navigate, String.t()}
           | {:no_document_response, String.t()}
           | {:connect_discovery_failed, term()}
@@ -253,7 +260,6 @@ defmodule CDPEx do
   def classify_error({:invalid_response_body, _}), do: :terminal
   def classify_error({:invalid_pdf_data, _}), do: :terminal
   def classify_error({:invalid_screenshot_data, _}), do: :terminal
-  def classify_error({:conflict, _}), do: :terminal
   def classify_error(:unknown_page), do: :terminal
   def classify_error(:already_authenticated), do: :terminal
   def classify_error(:already_intercepting), do: :terminal

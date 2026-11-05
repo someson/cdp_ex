@@ -63,9 +63,11 @@ defmodule CDPEx.Browser do
     # target_id => browserContextId for pages opened with `isolated: true`; the
     # context is disposed (closing its target) when the page ends.
     contexts: %{},
-    auths: %{},
-    intercepts: %{},
-    pending_auth: %{}
+    # target_id => CDPEx.Fetch pid, the page's Fetch domain owner (auth + interception)
+    fetchers: %{},
+    # request tag => {from, caller_monitor_ref | nil, fetch_pid}: a caller parked until
+    # its page's Fetch owner reports the result of its request
+    pending: %{}
   ]
 
   @type t :: %__MODULE__{}
@@ -208,28 +210,29 @@ defmodule CDPEx.Browser do
   end
 
   # Internal hops for `CDPEx.Page.enable/disable_request_interception/2`, which own the
-  # public contract. Browser is the reservation + monitor authority: it records the
-  # interception owner (so auth and interception are mutually exclusive per page) and
-  # monitors it, auto-disabling Fetch if the owner dies. The actual subscribe +
-  # `Fetch.enable` stay on the caller's process (subscriptions key on the subscriber).
+  # public contract. The page's `CDPEx.Fetch` owner does the work: it monitors the
+  # calling process as the interception owner and forwards it the pauses that match
+  # `patterns`. `timeout` bounds the CDP calls; the Browser request gets 5s on top.
   @doc false
-  @spec reserve_interception(GenServer.server(), Page.t()) :: :ok | {:error, term()}
-  def reserve_interception(browser, %Page{} = page) do
-    GenServer.call(browser, {:reserve_interception, page}, 15_000)
-  catch
-    # A stalled or dead Browser must not crash the caller's interception-owner process
-    # with a raw exit — surface it as an error like the other page ops do.
-    :exit, _ -> {:error, :noproc}
+  @spec intercept(GenServer.server(), Page.t(), [map()], timeout()) :: :ok | {:error, term()}
+  def intercept(browser, %Page{} = page, patterns, timeout) do
+    call(
+      browser,
+      {:intercept, page, patterns, timeout},
+      timeout + 5_000,
+      :enable_request_interception
+    )
   end
 
   @doc false
-  @spec release_interception(GenServer.server(), Page.t()) :: :ok
-  def release_interception(browser, %Page{} = page) do
-    GenServer.call(browser, {:release_interception, page}, 15_000)
-  catch
-    # Best-effort: if the Browser is gone or stalled there's nothing to release, and a
-    # raw exit must not blow up the caller's disable path.
-    :exit, _ -> :ok
+  @spec release_interception(GenServer.server(), Page.t(), timeout()) :: :ok | {:error, term()}
+  def release_interception(browser, %Page{} = page, timeout) do
+    call(
+      browser,
+      {:release_interception, page, timeout},
+      timeout + 5_000,
+      :disable_request_interception
+    )
   end
 
   @doc """
@@ -499,97 +502,73 @@ defmodule CDPEx.Browser do
   end
 
   def handle_call(
-        {:authenticate, %Page{conn: conn, target_id: tid, session_id: sid}, opts},
-        from,
+        {:authenticate, %Page{conn: conn, target_id: tid, session_id: sid} = page, opts},
+        {caller, _} = from,
         state
       ) do
-    # A :session page's handler rides the shared browser connection, which outlives
-    # the page, so CDPEx.Fetch also stops on its session's detach.
-    cond do
-      not own_page?(state, tid, conn, sid) ->
-        # Not one of this browser's live pages (a handle from another browser, or an
-        # already-closed one) — mirror close_page/2 instead of arming a handler on a
-        # foreign connection and linking it to us.
-        {:reply, {:error, :unknown_page}, state}
+    if own_page?(state, tid, conn, sid) do
+      # The page's Fetch owner arms asynchronously and reports back with
+      # {:fetch_reply, pid, tag, result}; the caller stays parked in `pending` until
+      # then, so authenticate/4 returns once auth is armed without blocking this
+      # GenServer for the whole enable. A second auth on the page is rejected by the
+      # owner with :already_authenticated.
+      #
+      # We also MONITOR the caller: if its 15s authenticate/4 call times out (a slow
+      # arm under scheduler starvation), the caller exits and the page would be left
+      # armed with no waiting caller — a retry would hit :already_authenticated with
+      # no way to recover but closing the page. On the caller's :DOWN we ask the owner
+      # to drop that auth, so the page becomes re-authenticatable (#40).
+      creds = %{
+        username: Keyword.fetch!(opts, :username),
+        password: Keyword.fetch!(opts, :password),
+        source: Keyword.get(opts, :source, :any)
+      }
 
-      Map.has_key?(state.intercepts, tid) ->
-        # Request interception is active on this page; both drive the Fetch domain, so
-        # arming auth would clobber the interceptor. Enforce mutual exclusion.
-        {:reply, {:error, {:conflict, :intercepting}}, state}
+      caller_ref = Process.monitor(caller)
 
-      Map.has_key?(state.auths, tid) ->
-        # Already authenticated: a second handler would double every
-        # continueRequest/continueWithAuth, and its teardown would disable Fetch for
-        # the survivor. Reject the re-arm.
-        {:reply, {:error, :already_authenticated}, state}
+      case fetch_request(state, page, from, caller_ref, {:auth, creds}) do
+        {:ok, state} ->
+          {:noreply, state}
 
-      true ->
-        # Start a per-page Fetch handler linked to us (crash-isolated, dies with the
-        # browser). It arms asynchronously and signals {:armed, pid} when ready; we
-        # park the caller's `from` in pending_auth and reply only then, so
-        # authenticate/4 still returns once interception is armed — without blocking
-        # this GenServer for the whole enable. It self-stops when the page's connection
-        # goes down; we drop the auths entry when it exits (see the {:EXIT, …} clause).
-        #
-        # We also MONITOR the caller: if its 15s authenticate/4 call times out (a slow
-        # arm under scheduler starvation), the caller exits and we'd otherwise leave the
-        # page armed with auths[tid] set but no waiting caller — a retry would hit
-        # {:error, :already_authenticated} with no way to recover but closing the page.
-        # On the caller's :DOWN we cancel the orphaned handler so its {:EXIT} clears
-        # auths[tid] and the page becomes re-authenticatable (#40).
-        fetch_opts =
-          [conn: conn, session_id: sid, browser: self()] ++
-            Keyword.take(opts, [:username, :password, :source])
-
-        case Fetch.start_link(fetch_opts) do
-          {:ok, pid} ->
-            {caller, _tag} = from
-            caller_ref = Process.monitor(caller)
-
-            {:noreply,
-             %{
-               state
-               | auths: Map.put(state.auths, tid, pid),
-                 pending_auth: Map.put(state.pending_auth, pid, {from, caller_ref})
-             }}
-
-          {:error, reason} ->
-            {:reply, {:error, reason}, state}
-        end
+        {:error, reason} ->
+          Process.demonitor(caller_ref, [:flush])
+          {:reply, {:error, reason}, state}
+      end
+    else
+      # Not one of this browser's live pages (a handle from another browser, or an
+      # already-closed one) — mirror close_page/2 instead of arming a handler on a
+      # foreign connection and linking it to us.
+      {:reply, {:error, :unknown_page}, state}
     end
   end
 
   def handle_call(
-        {:reserve_interception, %Page{conn: conn, target_id: tid, session_id: sid}},
-        {caller, _tag},
+        {:intercept, %Page{conn: conn, target_id: tid, session_id: sid} = page, patterns, timeout},
+        {caller, _} = from,
         state
       ) do
-    cond do
-      not own_page?(state, tid, conn, sid) ->
-        {:reply, {:error, :unknown_page}, state}
-
-      Map.has_key?(state.auths, tid) ->
-        {:reply, {:error, {:conflict, :authenticated}}, state}
-
-      Map.has_key?(state.intercepts, tid) ->
-        {:reply, {:error, :already_intercepting}, state}
-
-      true ->
-        # Monitor (not link) the foreign caller; on its death we auto-disable Fetch so
-        # a crashed/forgetful owner can't leave the page bricked with no resolver.
-        ref = Process.monitor(caller)
-        {:reply, :ok, %{state | intercepts: Map.put(state.intercepts, tid, {caller, ref})}}
+    if own_page?(state, tid, conn, sid) do
+      # The Fetch owner monitors the caller as the interception owner and releases the
+      # page if it dies without disabling, so a crashed or forgetful caller can't leave
+      # it bricked with no resolver.
+      case fetch_request(state, page, from, nil, {:intercept, caller, patterns, timeout}) do
+        {:ok, state} -> {:noreply, state}
+        {:error, reason} -> {:reply, {:error, reason}, state}
+      end
+    else
+      {:reply, {:error, :unknown_page}, state}
     end
   end
 
-  def handle_call({:release_interception, %Page{target_id: tid}}, _from, state) do
-    case Map.pop(state.intercepts, tid) do
-      {nil, _} ->
+  def handle_call({:release_interception, %Page{target_id: tid}, timeout}, from, state) do
+    case Map.get(state.fetchers, tid) do
+      nil ->
         {:reply, :ok, state}
 
-      {{_caller, ref}, intercepts} ->
-        Process.demonitor(ref, [:flush])
-        {:reply, :ok, %{state | intercepts: intercepts}}
+      pid ->
+        tag = make_ref()
+        Fetch.request(pid, tag, {:release_intercept, timeout})
+        {:noreply, %{state | pending: Map.put(state.pending, tag, {from, nil, pid})}}
     end
   end
 
@@ -624,22 +603,11 @@ defmodule CDPEx.Browser do
   end
 
   def handle_info({:EXIT, pid, reason}, state) do
-    # A page connection or a Fetch auth handler exited (closed or crashed). If a Fetch
-    # handler was still arming, its authenticate/4 caller is parked on a delayed reply
-    # in pending_auth — fail it with the exit reason rather than let it hang to the
-    # call timeout. Then drop the pid from both maps: a stale page handle's next op
-    # returns {:error, :noproc}, and clearing the auths entry lets the page be
-    # authenticated again.
-    state =
-      case Map.pop(state.pending_auth, pid) do
-        {nil, _} ->
-          state
-
-        {{from, caller_ref}, pending_auth} ->
-          Process.demonitor(caller_ref, [:flush])
-          GenServer.reply(from, {:error, reason})
-          %{state | pending_auth: pending_auth}
-      end
+    # A page connection or a page's Fetch owner exited (closed or crashed). Callers
+    # still parked on that owner are failed now rather than left to their call
+    # timeout. Then drop the pid from both maps: a stale page handle's next op returns
+    # {:error, :noproc}, and a new auth or interception request starts a fresh owner.
+    state = fail_pending(state, pid, reason)
 
     # A page connection that went away on its own (tab crashed or closed from outside)
     # takes its isolated context with it.
@@ -649,7 +617,8 @@ defmodule CDPEx.Browser do
         nil -> state
       end
 
-    {:noreply, %{state | pages: drop_conn(state.pages, pid), auths: drop_value(state.auths, pid)}}
+    {:noreply,
+     %{state | pages: drop_conn(state.pages, pid), fetchers: drop_value(state.fetchers, pid)}}
   end
 
   def handle_info(
@@ -665,126 +634,90 @@ defmodule CDPEx.Browser do
     {:noreply, %{state | sessions: Map.delete(state.sessions, tid)}}
   end
 
-  def handle_info({:armed, pid}, state) do
-    # A Fetch handler finished arming; reply :ok to the authenticate/4 caller parked in
-    # pending_auth and release our monitor on it. Unknown pid → the caller already
-    # departed (its :DOWN dropped the entry and cancelled this handler), so this is an
-    # orphan whose cancel-stop {:EXIT} will clear auths — ignore the late signal.
-    case Map.pop(state.pending_auth, pid) do
+  def handle_info({:fetch_reply, _pid, tag, result}, state) do
+    # A Fetch owner finished a request; reply to the caller parked on it. Unknown tag →
+    # the caller already departed (an authenticate/4 caller whose :DOWN asked the owner
+    # to drop the auth), or a request nobody waits on — ignore it.
+    case Map.pop(state.pending, tag) do
       {nil, _} ->
         {:noreply, state}
 
-      {{from, caller_ref}, pending_auth} ->
-        Process.demonitor(caller_ref, [:flush])
-        GenServer.reply(from, :ok)
-        {:noreply, %{state | pending_auth: pending_auth}}
-    end
-  end
-
-  def handle_info({:arm_failed, pid, reason}, state) do
-    # A Fetch handler couldn't arm; fail the parked authenticate/4 caller and drop the
-    # (already-recorded) auths entry so the page can be authenticated again. The
-    # handler stops :normal, so this is the quiet failure path (no crash report); the
-    # {:EXIT} clause below is the fallback if a handler dies without signalling.
-    # Unknown pid → the caller already departed; its {:EXIT} clears auths, so ignore.
-    case Map.pop(state.pending_auth, pid) do
-      {nil, _} ->
-        {:noreply, state}
-
-      {{from, caller_ref}, pending_auth} ->
-        Process.demonitor(caller_ref, [:flush])
-        GenServer.reply(from, {:error, reason})
-        {:noreply, %{state | pending_auth: pending_auth, auths: drop_value(state.auths, pid)}}
+      {{from, caller_ref, _pid}, pending} ->
+        if caller_ref, do: Process.demonitor(caller_ref, [:flush])
+        GenServer.reply(from, result)
+        {:noreply, %{state | pending: pending}}
     end
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
-    # An interception owner died without disabling. Drop its reservation and disable
-    # Fetch on that page's connection so the page isn't left bricked with no resolver.
-    # The disable runs OFF the Browser process (a hung page conn must not stall every
-    # other page — the same responsiveness #36 protects for auth).
-    case pop_intercept_by_ref(state.intercepts, ref) do
-      {nil, _} ->
-        # Not an interception owner — maybe an authenticate/4 caller that departed (its
-        # 15s call timed out) while its Fetch handler was still arming.
-        cancel_orphaned_auth(state, ref)
+    # An authenticate/4 caller we were monitoring went down while its auth was still
+    # arming — typically because its 15s call timed out on a slow arm. Ask the owner to
+    # drop that auth (matched by its tag, so a later auth by someone else is safe), so
+    # the page can be authenticated again instead of being stuck on
+    # :already_authenticated (#40). We do not reply — the caller is gone. The owner's
+    # reply to the original request then finds no pending entry and is ignored.
+    #
+    # No demonitor here: a monitor is one-shot, and the runtime already removed it when
+    # it delivered this :DOWN.
+    case Enum.find(state.pending, fn {_tag, {_from, caller_ref, _pid}} -> caller_ref == ref end) do
+      nil ->
+        {:noreply, state}
 
-      {tid, intercepts} ->
-        case {Map.get(state.pages, tid), Map.get(state.sessions, tid)} do
-          # Page already closed: its Fetch domain went with it, nothing to disable.
-          {nil, nil} -> :ok
-          {nil, sid} -> disable_fetch_async(state.browser_conn, sid)
-          {conn, _} -> disable_fetch_async(conn, nil)
-        end
-
-        {:noreply, %{state | intercepts: intercepts}}
+      {tag, {_from, _ref, pid}} ->
+        Fetch.request(pid, make_ref(), {:drop_auth, tag})
+        {:noreply, %{state | pending: Map.delete(state.pending, tag)}}
     end
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
 
-  # An authenticate/4 caller we were monitoring (while its Fetch handler armed) went
-  # down — typically because its 15s call timed out on a slow arm. If a pending entry
-  # still matches the monitor ref, cancel the orphaned handler: it disables Fetch and
-  # stops, and its {:EXIT} clears the auths entry so the page can be authenticated again
-  # instead of being stuck on {:error, :already_authenticated} (#40). We do not reply —
-  # the caller is gone. Unknown ref → a stale monitor; ignore.
-  #
-  # Unlike the {:armed}/{:arm_failed}/{:EXIT} paths, this one does NOT demonitor: a
-  # monitor is one-shot and the runtime already removed it when it delivered the :DOWN
-  # that brought us here, so there is nothing left to demonitor.
-  defp cancel_orphaned_auth(state, ref) do
-    case pop_pending_auth_by_ref(state.pending_auth, ref) do
-      {nil, _} ->
-        {:noreply, state}
+  # Send `request` to the page's Fetch owner, starting it on first use, and park `from`
+  # under a fresh tag until the owner's {:fetch_reply, …}.
+  defp fetch_request(state, page, from, caller_ref, request) do
+    case ensure_fetcher(state, page) do
+      {:ok, pid, state} ->
+        tag = make_ref()
+        Fetch.request(pid, tag, request)
+        {:ok, %{state | pending: Map.put(state.pending, tag, {from, caller_ref, pid})}}
 
-      {fetch_pid, pending_auth} ->
-        Fetch.cancel(fetch_pid)
-        {:noreply, %{state | pending_auth: pending_auth}}
+      {:error, _} = error ->
+        error
     end
   end
 
-  # Find and remove the pending_auth entry whose caller monitor ref matches `ref`,
-  # returning {fetch_pid, remaining}. pending_auth is tiny (typically 0–1 entries).
-  defp pop_pending_auth_by_ref(pending_auth, ref) do
-    case Enum.find(pending_auth, fn {_pid, {_from, caller_ref}} -> caller_ref == ref end) do
-      nil -> {nil, pending_auth}
-      {fetch_pid, _entry} -> {fetch_pid, Map.delete(pending_auth, fetch_pid)}
-    end
-  end
+  # The page's Fetch owner: linked to us (crash-isolated, dies with the browser). It
+  # stops by itself when the page's connection goes down or its session detaches, and
+  # we stop it when we end the page (drop_fetcher/2).
+  defp ensure_fetcher(state, %Page{target_id: tid} = page) do
+    case Map.get(state.fetchers, tid) do
+      nil ->
+        opts = [conn: page.conn, session_id: page.session_id, target_id: tid, browser: self()]
 
-  # Best-effort Fetch.disable for a dead interception owner, on a throwaway process so
-  # an unresponsive page connection can't block the Browser GenServer. Connection.call
-  # tolerates a dead conn (returns {:error, _} rather than exiting); a genuine failure
-  # on a live conn is logged since it can leave the page intercepted.
-  defp disable_fetch_async(conn, session_id) do
-    _ =
-      Task.start(fn ->
-        ProcessLabel.set({:cdp_fetch_disable, conn})
-
-        case Connection.call(conn, "Fetch.disable", %{}, @create_timeout, session_id: session_id) do
-          {:ok, _} ->
-            :ok
-
-          {:error, :noproc} ->
-            :ok
-
-          {:error, {:ws_closed, _}} ->
-            :ok
-
-          # The :session page closed meanwhile, taking its Fetch domain with it.
-          {:error, {:session_closed, _}} ->
-            :ok
-
-          {:error, reason} ->
-            Logger.warning(
-              "[CDPEx.Browser] Fetch.disable after interception owner death returned #{inspect(reason)}; the page may remain intercepted"
-            )
+        case Fetch.start_link(opts) do
+          {:ok, pid} -> {:ok, pid, %{state | fetchers: Map.put(state.fetchers, tid, pid)}}
+          {:error, _} = error -> error
         end
-      end)
 
-    :ok
+      pid ->
+        {:ok, pid, state}
+    end
   end
+
+  # Fail every caller parked on Fetch owner `pid`, which exited with `reason`.
+  defp fail_pending(state, pid, reason) do
+    {gone, pending} = Map.split_with(state.pending, fn {_tag, {_, _, p}} -> p == pid end)
+
+    Enum.each(gone, fn {_tag, {from, caller_ref, _pid}} ->
+      if caller_ref, do: Process.demonitor(caller_ref, [:flush])
+      GenServer.reply(from, {:error, fetch_exit_reason(reason)})
+    end)
+
+    %{state | pending: pending}
+  end
+
+  # An owner that stops :normal does so because its page went away.
+  defp fetch_exit_reason(:normal), do: :noproc
+  defp fetch_exit_reason(reason), do: reason
 
   @impl true
   def terminate(_reason, state) do
@@ -847,29 +780,19 @@ defmodule CDPEx.Browser do
   # Browser launched with an authenticated `:proxy`: arm this page's proxy auth before
   # returning it, so the caller navigates straight away (no manual authenticate/4). Done
   # synchronously within new_page — which already blocks the Browser for target creation +
-  # bootstrap — so it needs none of the async pending_auth machinery authenticate/4 uses
-  # for its separate, concurrently-served call. The Fetch handler is recorded in `auths`
-  # exactly like authenticate/4, so mutual exclusion with interception and the
-  # drop-on-EXIT teardown apply unchanged. On any arm failure the just-created page (never
-  # handed to the caller) is closed and the error surfaced.
-  defp reply_proxy_authed_page(state, %Page{conn: conn, target_id: tid} = page, creds) do
-    fetch_opts = [
-      conn: conn,
-      session_id: page.session_id,
-      browser: self(),
-      username: creds.username,
-      password: creds.password,
-      source: :proxy
-    ]
+  # bootstrap — so it awaits the owner's reply here instead of parking a caller in
+  # `pending`. The owner is recorded in `fetchers` like any other, so interception can
+  # join it later and the drop-on-EXIT teardown applies unchanged. On any arm failure the
+  # just-created page (never handed to the caller) is closed and the error surfaced.
+  defp reply_proxy_authed_page(state, page, creds) do
+    case ensure_fetcher(state, page) do
+      {:ok, pid, state} ->
+        tag = make_ref()
+        Fetch.request(pid, tag, {:auth, Map.put(creds, :source, :proxy)})
 
-    case Fetch.start_link(fetch_opts) do
-      {:ok, pid} ->
-        case await_fetch_armed(pid) do
-          :ok ->
-            {:reply, {:ok, page}, %{state | auths: Map.put(state.auths, tid, pid)}}
-
-          {:error, reason} ->
-            {:reply, {:error, reason}, close_failed_auth_page(state, page)}
+        case await_fetch_reply(pid, tag) do
+          :ok -> {:reply, {:ok, page}, state}
+          {:error, reason} -> {:reply, {:error, reason}, close_failed_auth_page(state, page)}
         end
 
       {:error, reason} ->
@@ -879,7 +802,8 @@ defmodule CDPEx.Browser do
 
   # The proxy-auth arm failed; the just-created page was never handed to the caller, so
   # close its target + connection and drop it from `pages` (best-effort — either may
-  # already be gone). Returns the updated state for the {:reply, …} tuple.
+  # already be gone). Ending the target also stops its Fetch owner. Returns the updated
+  # state for the {:reply, …} tuple.
   defp close_failed_auth_page(state, %Page{target_id: tid, session_id: nil, conn: conn}) do
     safe_close(conn)
     state = end_target(state, tid)
@@ -892,20 +816,16 @@ defmodule CDPEx.Browser do
     %{state | sessions: Map.delete(state.sessions, tid)}
   end
 
-  # Block (inside the new_page call) until the Fetch handler signals it's armed. It is
-  # linked and we trap exits, so a crash arrives as {:EXIT, pid, _}. Bounded by
-  # @arm_timeout; on timeout cancel the handler so it can't linger. A late {:armed}/{:EXIT}
-  # for this pid arriving after we return is handled harmlessly by the handle_info clauses
-  # (on success the pid is in `auths`, so drop-on-EXIT applies; otherwise it's a no-op).
-  defp await_fetch_armed(pid) do
+  # Block (inside the new_page call) until the Fetch owner replies. It is linked and we
+  # trap exits, so a crash arrives as {:EXIT, pid, _}. Bounded by @arm_timeout; the
+  # caller then closes the page, which stops the owner. A late reply or {:EXIT} for this
+  # pid arriving after we return is handled harmlessly by the handle_info clauses.
+  defp await_fetch_reply(pid, tag) do
     receive do
-      {:armed, ^pid} -> :ok
-      {:arm_failed, ^pid, reason} -> {:error, reason}
-      {:EXIT, ^pid, reason} -> {:error, reason}
+      {:fetch_reply, ^pid, ^tag, result} -> result
+      {:EXIT, ^pid, reason} -> {:error, fetch_exit_reason(reason)}
     after
-      @arm_timeout ->
-        Fetch.cancel(pid)
-        {:error, :timeout}
+      @arm_timeout -> {:error, :timeout}
     end
   end
 
@@ -1094,15 +1014,6 @@ defmodule CDPEx.Browser do
     map |> Enum.reject(fn {_k, v} -> v == pid end) |> Map.new()
   end
 
-  # Pop the interception entry whose monitor ref matches, returning {tid, rest} — or
-  # {nil, intercepts} if none matches (a stale monitor we no longer track).
-  defp pop_intercept_by_ref(intercepts, ref) do
-    case Enum.find(intercepts, fn {_tid, {_caller, r}} -> r == ref end) do
-      nil -> {nil, intercepts}
-      {tid, _entry} -> {tid, Map.delete(intercepts, tid)}
-    end
-  end
-
   # Close a CDP target on the browser connection, ignoring failures (the browser
   # conn may be gone, or the target already closed).
   defp close_target(browser_conn, tid) do
@@ -1132,15 +1043,15 @@ defmodule CDPEx.Browser do
   # Ends one of our pages' targets (see discard_target/3) and forgets its context.
   defp end_target(state, tid) do
     discard_target(state.browser_conn, tid, Map.get(state.contexts, tid))
-    drop_intercept(%{state | contexts: Map.delete(state.contexts, tid)}, tid)
+    drop_fetcher(%{state | contexts: Map.delete(state.contexts, tid)}, tid)
   end
 
   # The page's target is already gone: dispose its context, if it had one, and forget
-  # its interception owner. The dispose runs off the Browser process: this is called
+  # its Fetch owner. The dispose runs off the Browser process: this is called
   # from handle_info, where a Chrome that is alive but not answering would otherwise
   # block every other page op for the call timeout, once per page that went.
   defp page_gone(state, tid) do
-    state = drop_intercept(state, tid)
+    state = drop_fetcher(state, tid)
 
     case Map.pop(state.contexts, tid) do
       {nil, _} ->
@@ -1164,16 +1075,16 @@ defmodule CDPEx.Browser do
     :ok
   end
 
-  # The page ended, and its Fetch domain with it: forget its interception owner, so a
-  # long-lived owner that never disables doesn't keep an entry and a monitor per page.
-  defp drop_intercept(state, tid) do
-    case Map.pop(state.intercepts, tid) do
+  # The page ended, and its Fetch domain with it: stop its Fetch owner, if any. Callers
+  # still parked on it are failed by its {:EXIT}.
+  defp drop_fetcher(state, tid) do
+    case Map.pop(state.fetchers, tid) do
       {nil, _} ->
         state
 
-      {{_caller, ref}, intercepts} ->
-        Process.demonitor(ref, [:flush])
-        %{state | intercepts: intercepts}
+      {pid, fetchers} ->
+        Fetch.stop(pid)
+        %{state | fetchers: fetchers}
     end
   end
 

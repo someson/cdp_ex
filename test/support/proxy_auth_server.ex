@@ -16,44 +16,53 @@ defmodule CDPEx.ProxyAuthServer do
   #
   #     {:ok, %{port: port}} = ProxyAuthServer.start(username: "u", password: "p")
   #     CDPEx.launch(proxy: "http://u:p@127.0.0.1:#{port}")
+  #
+  # `/with-image` serves a page that also loads `http://proxied.test/pixel.png`. With
+  # `report: pid`, every authorized request is reported to `pid` as
+  # `{:proxy_served, absolute_url}`, so a test can tell which requests reached the proxy.
 
   alias CDPEx.HttpFixture
 
   @body ~s(<!doctype html><html><body><h1 id="greeting">Proxied</h1></body></html>)
+  @image_body ~s(<!doctype html><html><body><h1 id="greeting">Proxied</h1><img id="pic" src="http://proxied.test/pixel.png"></body></html>)
 
   @spec start(keyword()) :: {:ok, %{port: non_neg_integer()}}
   def start(opts) do
     username = Keyword.fetch!(opts, :username)
     password = Keyword.fetch!(opts, :password)
     expected = "Basic " <> Base.encode64("#{username}:#{password}")
+    report = Keyword.get(opts, :report)
 
     {:ok, listen} = :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
     {:ok, port} = :inet.port(listen)
-    pid = spawn_link(fn -> accept_loop(listen, expected) end)
+    pid = spawn_link(fn -> accept_loop(listen, expected, report) end)
     _ = :gen_tcp.controlling_process(listen, pid)
     {:ok, %{port: port}}
   end
 
-  defp accept_loop(listen, expected) do
+  defp accept_loop(listen, expected, report) do
     case :gen_tcp.accept(listen) do
       {:ok, socket} ->
-        spawn(fn -> serve(socket, expected) end)
-        accept_loop(listen, expected)
+        spawn(fn -> serve(socket, expected, report) end)
+        accept_loop(listen, expected, report)
 
       {:error, :closed} ->
         :ok
     end
   end
 
-  defp serve(socket, expected) do
+  defp serve(socket, expected, report) do
     request = HttpFixture.recv_request(socket)
-    _ = :gen_tcp.send(socket, respond(request, expected))
+    _ = :gen_tcp.send(socket, respond(request, expected, report))
     :gen_tcp.close(socket)
   end
 
-  defp respond(request, expected) do
+  defp respond(request, expected, report) do
     if HttpFixture.header_value(request, "proxy-authorization") == expected do
-      HttpFixture.http_response("200 OK", @body)
+      url = request |> String.split(" ", parts: 3) |> Enum.at(1, "")
+      if report, do: send(report, {:proxy_served, url})
+      body = if String.ends_with?(url, "/with-image"), do: @image_body, else: @body
+      HttpFixture.http_response("200 OK", body)
     else
       # 407 + a Basic challenge → Chrome emits Fetch.authRequired (source: Proxy).
       HttpFixture.http_response("407 Proxy Authentication Required", "", [

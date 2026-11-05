@@ -89,7 +89,6 @@ defmodule CDPEx.Page do
   # In-flight accounting for wait_for_network_idle/2: requestWillBeSent (+1),
   # loadingFinished / loadingFailed (−1). responseReceived is deliberately excluded.
   @idle_events [@request_will_be_sent, @loading_finished, @loading_failed]
-  @fetch_paused "Fetch.requestPaused"
 
   @enforce_keys [:browser, :conn, :target_id]
   defstruct [:browser, :conn, :target_id, :session_id]
@@ -708,23 +707,22 @@ defmodule CDPEx.Page do
   the given credentials. It also covers Basic-auth-gated origins.
 
   This enables the CDP `Fetch` domain for the page, which pauses (and
-  auto-continues) **every** request — measurable overhead on heavy pages.
+  auto-continues) **every** request — measurable overhead on heavy pages. It
+  combines with `enable_request_interception/2` on the same page, in either order.
 
   Works on `:dedicated` and `:session` pages. A `:session` page's handler shares the
   browser connection and stops when the page's session ends: on `close_page/2`, a tab
   closed from outside, or a crash. Chrome caches the credentials it was given for
   the page's browser context, so other pages in that context may reuse them. A page that isn't one
   of this browser's open pages returns `{:error, :unknown_page}`, a page that is
-  already authenticated returns `{:error, :already_authenticated}`, and a page that
-  already has request interception enabled returns `{:error, {:conflict, :intercepting}}`
-  (auth and interception both drive the `Fetch` domain — use one per page). A browser
+  already authenticated returns `{:error, :already_authenticated}`. A browser
   that is gone returns `{:error, :noproc}`, and one that can't arm the handler within
   15s returns `{:error, {:timeout, :authenticate}}`.
 
   If an earlier `authenticate/4` on this page was abandoned while still arming (e.g. its
-  call timed out under heavy load), the orphaned handler is torn down automatically and
-  the page becomes re-authenticatable — a retry succeeds once that teardown completes (it
-  may briefly still see `{:error, :already_authenticated}` in the meantime).
+  call timed out under heavy load), its auth is dropped automatically and the page
+  becomes re-authenticatable — a retry succeeds once that completes (it may briefly
+  still see `{:error, :already_authenticated}` in the meantime).
   A timeout can also race the handler finishing arming, leaving the page authenticated
   after all: a retry then returns `{:error, :already_authenticated}` for good, which
   means the page is armed.
@@ -1970,81 +1968,119 @@ defmodule CDPEx.Page do
   the page.
 
   Each pause arrives as `{:cdp_event, conn, "Fetch.requestPaused", params, session_id}`;
-  handle it in a `handle_info`. The caller is subscribed **before** the domain is
-  enabled, so no paused request is missed.
+  handle it in a `handle_info`. Interception is armed before this returns, so no
+  paused request is missed.
 
   > #### Drive interception from one long-lived process {: .info}
   >
-  > Use the **same process** for `enable_request_interception/2`, the pause handling,
-  > and `disable_request_interception/2` — the subscription is keyed to its pid. That
-  > process is registered with the browser as the interception owner: if it exits
-  > without disabling, the browser auto-`Fetch.disable`s the page, so a crashed or
-  > forgetful caller can't leave it bricked (every request paused with no resolver).
-  > While interception is enabled you must still resolve every pause.
+  > The calling process becomes the page's **interception owner**: the pauses are
+  > sent to it, so handle them, and call `disable_request_interception/2`, from that
+  > process. If it exits without disabling, the page's interception is released
+  > automatically, so a crashed or forgetful caller can't leave it bricked (every
+  > request paused with no resolver). While interception is enabled you must still
+  > resolve every pause.
 
-  Works on `:dedicated` and `:session` pages. On a `:session` page the subscription is
-  scoped to its session, so one process can intercept several pages of a browser and
-  tell their pauses apart by the event's session id; disabling one leaves the others.
-  When the page closes, the browser forgets its interception owner.
+  Works on `:dedicated` and `:session` pages. On a `:session` page the pauses carry
+  its session id, so one process can intercept several pages of a browser and tell
+  them apart; disabling one leaves the others. When the page closes, its
+  interception ends with it. Re-enabling interception on a page that already has it
+  returns `{:error, :already_intercepting}`.
 
-  Mutually exclusive with `authenticate/4` on the same page — both drive the `Fetch`
-  domain. The conflict is **enforced**: enabling interception on an authenticated page
-  returns `{:error, {:conflict, :authenticated}}`, and `authenticate/4` on an
-  intercepting page returns `{:error, {:conflict, :intercepting}}`. Re-enabling
-  interception on a page that already has it returns `{:error, :already_intercepting}`.
+  Combines with `authenticate/4` and a credentialed `:proxy` on the same page, in
+  either order. Chrome only raises a login challenge for a paused request, so with
+  login on every request is paused: the library answers the challenges and lets
+  through the requests outside `:patterns`, and you still receive only the pauses
+  that match them. Each request then round-trips through the library, which costs
+  some time on resource-heavy pages.
 
   Options:
-    * `:patterns` — CDP `RequestPattern`s (default `[%{"urlPattern" => "*"}]`, all requests)
-    * `:timeout` — ms for the enable call (default 10_000)
+    * `:patterns` — CDP `RequestPattern`s (default `[%{"urlPattern" => "*"}]`, all
+      requests): maps with optional `"urlPattern"` (`*` matches any run of
+      characters, `?` one, `\\` escapes), `"resourceType"` (`"Image"`, `"Script"`,
+      ...) and `"requestStage"` (`"Request"`, the default, or `"Response"`). Atom
+      keys are accepted. A malformed list returns
+      `{:error, {:invalid_args, {:patterns, value}}}`.
+    * `:timeout` — ms for the CDP calls (default 10_000)
   """
   @spec enable_request_interception(t(), keyword()) :: :ok | {:error, term()}
   def enable_request_interception(%__MODULE__{} = page, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
-    patterns = Keyword.get(opts, :patterns, [%{"urlPattern" => "*"}])
+    raw = Keyword.get(opts, :patterns, [%{"urlPattern" => "*"}])
 
-    # Reserve the page's Fetch domain with the browser first: it enforces mutual
-    # exclusion with authenticate/4 and monitors this process so the domain is
-    # auto-disabled if we die. Only on a successful reservation do we subscribe +
-    # enable (on this process, mirroring observe_network/2); roll both back on failure.
-    case Browser.reserve_interception(page.browser, page) do
-      :ok ->
-        with :ok <- subscribe_each(page.conn, [@fetch_paused], timeout, page.session_id),
-             {:ok, _} <- do_call(page, "Fetch.enable", %{"patterns" => patterns}, timeout) do
-          :ok
-        else
-          {:error, _} = error ->
-            unsubscribe_each(page.conn, [@fetch_paused], page.session_id)
-            # A client-side timeout can mean Chrome actually enabled Fetch; disable it
-            # best-effort before releasing, so a timed-out enable can't leave the page
-            # bricked (Fetch on, no resolver) with the reservation/monitor already gone.
-            _ = ok_call(page, "Fetch.disable", %{}, timeout)
-            Browser.release_interception(page.browser, page)
-            error
-        end
+    with {:ok, patterns} <- normalize_patterns(raw) do
+      case Browser.intercept(page.browser, page, patterns, timeout) do
+        {:error, {:timeout, _}} = error ->
+          # The Browser request timed out, but the Fetch owner may still arm it: release
+          # best-effort so the page doesn't stay intercepted by a caller told it failed.
+          _ = Browser.release_interception(page.browser, page, timeout)
+          error
 
-      {:error, _} = error ->
-        error
+        result ->
+          result
+      end
     end
   end
 
   @doc """
-  Disables request interception — unsubscribes the caller from `Fetch.requestPaused`
-  and disables the `Fetch` domain. Resolve any still-paused requests first.
+  Disables request interception and lets through any request still paused at the
+  library. With `authenticate/4` or a credentialed `:proxy` on the page, login keeps
+  working. Resolve the pauses you already received first.
 
-  Call this from the **same process** that called `enable_request_interception/2`:
-  the unsubscribe is keyed to `self()`, so a disable from a different process leaves
-  the original subscriber still receiving (now-unresolvable) pauses.
+  Call this from the process that called `enable_request_interception/2`. A page
+  with no interception returns `:ok`.
   """
   @spec disable_request_interception(t(), keyword()) :: :ok | {:error, term()}
   def disable_request_interception(%__MODULE__{} = page, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
-    unsubscribe_each(page.conn, [@fetch_paused], page.session_id)
-    result = ok_call(page, "Fetch.disable", %{}, timeout)
-    # Release the browser-side reservation (demonitors this process) regardless of the
-    # disable result, so the eventual owner :DOWN can't re-issue a spurious disable.
-    Browser.release_interception(page.browser, page)
-    result
+    Browser.release_interception(page.browser, page, timeout)
   end
+
+  @pattern_keys %{
+    "urlPattern" => "urlPattern",
+    "resourceType" => "resourceType",
+    "requestStage" => "requestStage",
+    urlPattern: "urlPattern",
+    resourceType: "resourceType",
+    requestStage: "requestStage"
+  }
+
+  # The Fetch owner matches the patterns itself (with login on, they aren't all sent to
+  # Chrome), so check them here rather than leave it to Chrome's validation.
+  defp normalize_patterns(patterns) when is_list(patterns) do
+    patterns
+    |> Enum.reduce_while([], fn pattern, acc ->
+      case normalize_pattern(pattern) do
+        {:ok, p} -> {:cont, [p | acc]}
+        :error -> {:halt, :error}
+      end
+    end)
+    |> case do
+      :error -> {:error, {:invalid_args, {:patterns, patterns}}}
+      acc -> {:ok, Enum.reverse(acc)}
+    end
+  end
+
+  defp normalize_patterns(patterns), do: {:error, {:invalid_args, {:patterns, patterns}}}
+
+  defp normalize_pattern(pattern) when is_map(pattern) do
+    Enum.reduce_while(pattern, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
+      case {Map.get(@pattern_keys, key), value} do
+        {"requestStage", stage} when stage in ["Request", "Response"] ->
+          {:cont, {:ok, Map.put(acc, "requestStage", stage)}}
+
+        {"requestStage", _} ->
+          {:halt, :error}
+
+        {name, value} when is_binary(name) and is_binary(value) ->
+          {:cont, {:ok, Map.put(acc, name, value)}}
+
+        _ ->
+          {:halt, :error}
+      end
+    end)
+  end
+
+  defp normalize_pattern(_pattern), do: :error
 
   @doc """
   Lets a paused request proceed (`Fetch.continueRequest`), optionally rewriting it.

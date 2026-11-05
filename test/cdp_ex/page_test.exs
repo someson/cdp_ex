@@ -1,9 +1,9 @@
 defmodule CDPEx.PageTest.StubBrowser do
   @moduledoc false
   # Minimal stand-in for CDPEx.Browser so the page-level interception tests exercise
-  # the caller-side subscribe/enable path. Answers the reservation hops with a
-  # configurable reply; the reservation *logic* (exclusion, monitor, auto-disable on
-  # owner death) is covered directly in CDPEx.BrowserTest.
+  # the caller-side contract (pattern checks, the hop to the browser). Answers the
+  # interception hops with a configurable reply; the Fetch owner logic is covered in
+  # CDPEx.FetchTest and CDPEx.BrowserTest.
   use GenServer
 
   def start_link(reserve_reply \\ :ok, notify \\ nil),
@@ -13,13 +13,13 @@ defmodule CDPEx.PageTest.StubBrowser do
   def init(state), do: {:ok, state}
 
   @impl true
-  def handle_call({:reserve_interception, page}, _from, {reply, notify} = state) do
-    if notify, do: send(notify, {:stub_reserve, page})
+  def handle_call({:intercept, page, patterns, timeout}, _from, {reply, notify} = state) do
+    if notify, do: send(notify, {:stub_intercept, page, patterns, timeout})
     {:reply, reply, state}
   end
 
-  def handle_call({:release_interception, page}, _from, {_reply, notify} = state) do
-    if notify, do: send(notify, {:stub_release, page})
+  def handle_call({:release_interception, page, timeout}, _from, {_reply, notify} = state) do
+    if notify, do: send(notify, {:stub_release, page, timeout})
     {:reply, :ok, state}
   end
 end
@@ -1572,22 +1572,45 @@ defmodule CDPEx.PageTest do
   end
 
   describe "request interception" do
-    test "enable_request_interception subscribes the caller and enables Fetch with patterns", %{
-      page: page,
-      conn: conn,
-      fake: fake
+    test "enable_request_interception hands the default pattern and timeout to the browser", %{
+      page: page
     } do
-      task = Task.async(fn -> Page.enable_request_interception(page) end)
+      assert :ok = Page.enable_request_interception(page)
+      assert_receive {:stub_intercept, ^page, [%{"urlPattern" => "*"}], 10_000}
+    end
 
-      wait_until_subscribed(conn, task.pid, "Fetch.requestPaused")
+    test "enable_request_interception normalizes atom keys", %{page: page} do
+      assert :ok =
+               Page.enable_request_interception(page,
+                 patterns: [
+                   %{resourceType: "Image"},
+                   %{"urlPattern" => "*/api/*", requestStage: "Response"}
+                 ],
+                 timeout: 3_000
+               )
 
-      assert_receive {:fake_cdp_recv, ^fake,
-                      %{"id" => id, "method" => "Fetch.enable", "params" => params}},
-                     2_000
+      assert_receive {:stub_intercept, ^page,
+                      [
+                        %{"resourceType" => "Image"},
+                        %{"urlPattern" => "*/api/*", "requestStage" => "Response"}
+                      ], 3_000}
+    end
 
-      assert params["patterns"] == [%{"urlPattern" => "*"}]
-      FakeCDP.send_text(fake, ~s({"id":#{id},"result":{}}))
-      assert :ok = Task.await(task)
+    test "enable_request_interception rejects malformed patterns before the browser", %{
+      page: page
+    } do
+      for bad <- [
+            :all,
+            [%{"urlPattern" => :star}],
+            [%{"requestStage" => "HeadersReceived"}],
+            [%{"bogus" => "x"}],
+            ["*"]
+          ] do
+        assert {:error, {:invalid_args, {:patterns, ^bad}}} =
+                 Page.enable_request_interception(page, patterns: bad)
+      end
+
+      refute_received {:stub_intercept, _, _, _}
     end
 
     test "continue_request maps options to Fetch.continueRequest params", %{page: page, fake: fake} do
@@ -1690,80 +1713,9 @@ defmodule CDPEx.PageTest do
       assert :ok = Task.await(task)
     end
 
-    test "disable_request_interception unsubscribes the caller and disables Fetch", %{
-      page: page,
-      conn: conn,
-      fake: fake
-    } do
-      test = self()
-
-      caller =
-        spawn_link(fn ->
-          Connection.subscribe(conn, "Fetch.requestPaused")
-          send(test, :subscribed)
-
-          receive do
-            :go -> :ok
-          end
-
-          send(test, {:disabled, Page.disable_request_interception(page)})
-
-          receive do
-            :stop -> :ok
-          after
-            5_000 -> :ok
-          end
-        end)
-
-      assert_receive :subscribed, 2_000
-      assert subscribed?(conn, caller, "Fetch.requestPaused")
-      send(caller, :go)
-
-      # disable unsubscribes (synchronously) then blocks on Fetch.disable.
-      assert_receive {:fake_cdp_recv, ^fake, %{"id" => id, "method" => "Fetch.disable"}}, 2_000
-      refute subscribed?(conn, caller, "Fetch.requestPaused")
-
-      FakeCDP.send_text(fake, ~s({"id":#{id},"result":{}}))
-      assert_receive {:disabled, :ok}, 2_000
-      send(caller, :stop)
-    end
-
-    test "enable_request_interception rolls back the subscription when Fetch.enable fails", %{
-      page: page,
-      conn: conn,
-      fake: fake
-    } do
-      test = self()
-
-      observer =
-        spawn_link(fn ->
-          send(test, {:enable_result, Page.enable_request_interception(page)})
-
-          receive do
-            :stop -> :ok
-          after
-            5_000 -> :ok
-          end
-        end)
-
-      wait_until_subscribed(conn, observer, "Fetch.requestPaused")
-
-      assert_receive {:fake_cdp_recv, ^fake, %{"id" => id, "method" => "Fetch.enable"}}, 2_000
-      FakeCDP.send_text(fake, ~s({"id":#{id},"error":{"code":-32000,"message":"boom"}}))
-
-      # The rollback issues a best-effort Fetch.disable (covers the timed-out-but-
-      # enabled brick edge); answer it so the rollback completes promptly.
-      assert_receive {:fake_cdp_recv, ^fake, %{"id" => did, "method" => "Fetch.disable"}}, 2_000
-      FakeCDP.send_text(fake, ~s({"id":#{did},"result":{}}))
-
-      assert_receive {:enable_result, {:error, {:cdp_error, "Fetch.enable", _}}}, 2_000
-      refute subscribed?(conn, observer, "Fetch.requestPaused")
-
-      # The reservation must be released on the rollback path, else the page stays
-      # locked in the browser's intercepts map after a failed enable.
-      assert_receive {:stub_release, _}, 2_000
-
-      send(observer, :stop)
+    test "disable_request_interception hands the release to the browser", %{page: page} do
+      assert :ok = Page.disable_request_interception(page, timeout: 2_000)
+      assert_receive {:stub_release, ^page, 2_000}
     end
 
     test "fulfill_request maps :headers to responseHeaders", %{page: page, fake: fake} do

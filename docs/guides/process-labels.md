@@ -16,8 +16,7 @@ offers no way to label a supervisor from outside it.)
 | `{:cdp_page_helper, :idle_wait \| :capture, target_id}` | the short-lived process behind `wait_for_network_idle/2` and `navigate/3` with `response: true` |
 | `{:cdp_page_helper, :detach_watch, target_id}` | the short-lived process that watches a `:session` page's detach during `navigate/3` and `wait_for_navigation/2` |
 | `{:cdp_authenticate, target_id}` | the short-lived relay behind `Page.authenticate/4` |
-| `{:cdp_fetch_auth, source}` | the `Fetch` auth handler (`:proxy`, `:server`, or `:any`) |
-| `{:cdp_fetch_disable, conn}` | the throwaway task that releases interception after its owner dies |
+| `{:cdp_fetch, target_id}` | the page's `Fetch` owner: answers login challenges and forwards intercepted requests |
 | `{:cdp_context_dispose, context_id}` | the throwaway task that disposes an isolated page's context after the page went away on its own |
 | `{:cdp_pool, size}` / `{:cdp_pool_launch, pool}` | `CDPEx.Pool` and its browser-launch tasks |
 | `{:cdp_deadline, ms}` | the watchdog behind `with_page/3`'s `:deadline` |

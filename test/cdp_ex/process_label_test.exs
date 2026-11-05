@@ -200,7 +200,7 @@ defmodule CDPEx.ProcessLabelTest do
   end
 
   describe "CDPEx.Fetch" do
-    test "labels the auth handler with the challenge source it answers" do
+    test "labels the page's Fetch owner with its target id" do
       Process.flag(:trap_exit, true)
       {:ok, server} = FakeCDP.start()
       {:ok, conn} = Connection.start_link(server.url)
@@ -208,9 +208,9 @@ defmodule CDPEx.ProcessLabelTest do
       on_exit(fn -> close_quietly(conn) end)
 
       {:ok, pid} =
-        Fetch.start_link(conn: conn, browser: self(), username: "u", password: "p", source: :proxy)
+        Fetch.start_link(conn: conn, browser: self(), target_id: "TARGET-9")
 
-      assert label_of(pid) == {:cdp_fetch_auth, :proxy}
+      assert label_of(pid) == {:cdp_fetch, "TARGET-9"}
     end
   end
 

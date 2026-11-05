@@ -157,271 +157,226 @@ defmodule CDPEx.BrowserTest do
     end
   end
 
-  describe "interception reservation (#30)" do
-    test "reserves an owned :session page and rejects one it doesn't track" do
+  # A stand-in for a page's CDPEx.Fetch owner: relays every message it gets to the test.
+  defp fake_fetcher do
+    test = self()
+
+    spawn(fn ->
+      relay = fn relay ->
+        receive do
+          msg ->
+            send(test, {:fetcher_got, msg})
+            relay.(relay)
+        end
+      end
+
+      relay.(relay)
+    end)
+  end
+
+  describe "Fetch owner requests" do
+    setup do
       conn = self()
-      page = %Page{browser: self(), conn: conn, target_id: "T1", session_id: "S1"}
-      caller = spawn(fn -> Process.sleep(:infinity) end)
-
-      assert {:reply, :ok, reserved} =
-               Browser.handle_call(
-                 {:reserve_interception, page},
-                 {caller, make_ref()},
-                 %Browser{browser_conn: conn, sessions: %{"T1" => "S1"}}
-               )
-
-      assert {^caller, _ref} = reserved.intercepts["T1"]
-
-      other = %Browser{browser_conn: conn, sessions: %{"T1" => "OTHER"}}
-
-      assert {:reply, {:error, :unknown_page}, ^other} =
-               Browser.handle_call({:reserve_interception, page}, {caller, make_ref()}, other)
-
-      Process.exit(caller, :kill)
+      fetcher = fake_fetcher()
+      on_exit(fn -> Process.exit(fetcher, :kill) end)
+      %{conn: conn, fetcher: fetcher}
     end
 
-    test "a :session page's detach drops its reservation and the owner monitor" do
-      conn = self()
-      caller = spawn(fn -> Process.sleep(:infinity) end)
-      ref = Process.monitor(caller)
+    test "authenticate sends {:auth, creds} to the page's owner and parks the caller", %{
+      conn: conn,
+      fetcher: fetcher
+    } do
+      page = %Page{browser: self(), conn: conn, target_id: "T1"}
+      state = %Browser{pages: %{"T1" => conn}, fetchers: %{"T1" => fetcher}}
+      from = {self(), make_ref()}
+
+      assert {:noreply, new_state} =
+               Browser.handle_call(
+                 {:authenticate, page, [username: "u", password: "p", source: :proxy]},
+                 from,
+                 state
+               )
+
+      assert_receive {:fetcher_got,
+                      {:fetch_request, tag,
+                       {:auth, %{username: "u", password: "p", source: :proxy}}}}
+
+      assert {^from, caller_ref, ^fetcher} = new_state.pending[tag]
+      assert is_reference(caller_ref)
+    end
+
+    test "intercept sends the caller as owner with its patterns, without a caller monitor", %{
+      conn: conn,
+      fetcher: fetcher
+    } do
+      page = %Page{browser: self(), conn: conn, target_id: "T1", session_id: "S1"}
 
       state = %Browser{
         browser_conn: conn,
         sessions: %{"T1" => "S1"},
-        intercepts: %{"T1" => {caller, ref}}
+        fetchers: %{"T1" => fetcher}
+      }
+
+      caller = self()
+      patterns = [%{"urlPattern" => "*.png"}]
+
+      assert {:noreply, new_state} =
+               Browser.handle_call(
+                 {:intercept, page, patterns, 5_000},
+                 {caller, make_ref()},
+                 state
+               )
+
+      assert_receive {:fetcher_got, {:fetch_request, tag, {:intercept, ^caller, ^patterns, 5_000}}}
+
+      assert {_from, nil, ^fetcher} = new_state.pending[tag]
+    end
+
+    test "auth and interception reject a page this browser doesn't own" do
+      page = %Page{browser: self(), conn: self(), target_id: "T1", session_id: "S1"}
+      other = %Browser{browser_conn: self(), sessions: %{"T1" => "OTHER"}}
+
+      assert {:reply, {:error, :unknown_page}, ^other} =
+               Browser.handle_call({:intercept, page, [], 5_000}, {self(), make_ref()}, other)
+
+      assert {:reply, {:error, :unknown_page}, ^other} =
+               Browser.handle_call(
+                 {:authenticate, page, [username: "u", password: "p"]},
+                 {self(), make_ref()},
+                 other
+               )
+
+      foreign = %Browser{browser_conn: spawn(fn -> :ok end), sessions: %{"T1" => "S1"}}
+
+      assert {:reply, {:error, :unknown_page}, ^foreign} =
+               Browser.handle_call({:intercept, page, [], 5_000}, {self(), make_ref()}, foreign)
+    end
+
+    test "release with no Fetch owner is an idempotent :ok" do
+      page = %Page{browser: self(), conn: self(), target_id: "T_GONE"}
+      state = %Browser{}
+
+      assert {:reply, :ok, ^state} =
+               Browser.handle_call(
+                 {:release_interception, page, 5_000},
+                 {self(), make_ref()},
+                 state
+               )
+    end
+
+    test "release is forwarded to the page's owner", %{fetcher: fetcher} do
+      page = %Page{browser: self(), conn: self(), target_id: "T1"}
+      state = %Browser{fetchers: %{"T1" => fetcher}}
+
+      assert {:noreply, new_state} =
+               Browser.handle_call(
+                 {:release_interception, page, 5_000},
+                 {self(), make_ref()},
+                 state
+               )
+
+      assert_receive {:fetcher_got, {:fetch_request, tag, {:release_intercept, 5_000}}}
+      assert Map.has_key?(new_state.pending, tag)
+    end
+
+    test "{:fetch_reply} answers the parked caller and drops its monitor", %{fetcher: fetcher} do
+      from = {self(), make_ref()}
+      caller_ref = Process.monitor(fetcher)
+      tag = make_ref()
+      state = %Browser{pending: %{tag => {from, caller_ref, fetcher}}}
+
+      assert {:noreply, %Browser{pending: %{}}} =
+               Browser.handle_info({:fetch_reply, fetcher, tag, {:error, :boom}}, state)
+
+      {_pid, reply_tag} = from
+      assert_receive {^reply_tag, {:error, :boom}}
+
+      # The monitor is gone: the fetcher's death now sends nothing.
+      Process.exit(fetcher, :kill)
+      refute_receive {:DOWN, ^caller_ref, _, _, _}, 100
+    end
+
+    test "{:fetch_reply} for an unknown tag is a no-op (the caller departed)" do
+      state = %Browser{}
+
+      assert {:noreply, ^state} =
+               Browser.handle_info({:fetch_reply, self(), make_ref(), :ok}, state)
+    end
+
+    test "an owner {:EXIT} fails its parked callers and drops it", %{fetcher: fetcher} do
+      from1 = {self(), make_ref()}
+      from2 = {self(), make_ref()}
+      other = {self(), make_ref()}
+
+      state = %Browser{
+        fetchers: %{"T1" => fetcher, "T2" => self()},
+        pending: %{
+          make_ref() => {from1, nil, fetcher},
+          make_ref() => {from2, make_ref(), fetcher},
+          make_ref() => {other, nil, self()}
+        }
+      }
+
+      assert {:noreply, new_state} = Browser.handle_info({:EXIT, fetcher, :boom}, state)
+
+      assert new_state.fetchers == %{"T2" => self()}
+      assert [{_, {^other, nil, _}}] = Map.to_list(new_state.pending)
+
+      for {_, tag} <- [from1, from2], do: assert_receive({^tag, {:error, :boom}})
+    end
+
+    test "an owner that stopped :normal (its page went) fails callers with :noproc", %{
+      fetcher: fetcher
+    } do
+      from = {self(), make_ref()}
+      state = %Browser{fetchers: %{"T1" => fetcher}, pending: %{make_ref() => {from, nil, fetcher}}}
+
+      assert {:noreply, _} = Browser.handle_info({:EXIT, fetcher, :normal}, state)
+      {_, tag} = from
+      assert_receive {^tag, {:error, :noproc}}
+    end
+
+    test "a departed authenticate/4 caller makes the owner drop that auth (#40)", %{
+      fetcher: fetcher
+    } do
+      caller_ref = make_ref()
+      tag = make_ref()
+
+      state = %Browser{
+        fetchers: %{"T1" => fetcher},
+        pending: %{tag => {{self(), make_ref()}, caller_ref, fetcher}}
+      }
+
+      assert {:noreply, %Browser{pending: %{}}} =
+               Browser.handle_info({:DOWN, caller_ref, :process, self(), :timeout}, state)
+
+      assert_receive {:fetcher_got, {:fetch_request, _, {:drop_auth, ^tag}}}
+    end
+
+    test "a :DOWN matching no parked caller is ignored" do
+      state = %Browser{}
+
+      assert {:noreply, ^state} =
+               Browser.handle_info({:DOWN, make_ref(), :process, self(), :noproc}, state)
+    end
+
+    test "a :session page's detach stops its owner and forgets it", %{fetcher: fetcher} do
+      conn = self()
+
+      state = %Browser{
+        browser_conn: conn,
+        sessions: %{"T1" => "S1"},
+        fetchers: %{"T1" => fetcher}
       }
 
       event =
         {:cdp_event, conn, "Target.detachedFromTarget", %{"sessionId" => "S1", "targetId" => "T1"},
          nil}
 
-      assert {:noreply, %Browser{intercepts: %{}, sessions: %{}}} =
+      assert {:noreply, %Browser{fetchers: %{}, sessions: %{}}} =
                Browser.handle_info(event, state)
 
-      # The monitor is gone: the owner's death now sends nothing.
-      Process.exit(caller, :kill)
-      refute_receive {:DOWN, ^ref, :process, _, _}, 100
-    end
-
-    test "rejects a page this browser doesn't own" do
-      page = %Page{browser: self(), conn: self(), target_id: "T1"}
-      state = %Browser{pages: %{}}
-
-      assert {:reply, {:error, :unknown_page}, ^state} =
-               Browser.handle_call({:reserve_interception, page}, {self(), make_ref()}, state)
-    end
-
-    test "rejects when the page is already authenticated (mutual exclusion)" do
-      conn = self()
-      page = %Page{browser: self(), conn: conn, target_id: "T1"}
-      state = %Browser{pages: %{"T1" => conn}, auths: %{"T1" => self()}}
-
-      assert {:reply, {:error, {:conflict, :authenticated}}, ^state} =
-               Browser.handle_call({:reserve_interception, page}, {self(), make_ref()}, state)
-    end
-
-    test "rejects a double reservation" do
-      conn = self()
-      page = %Page{browser: self(), conn: conn, target_id: "T1"}
-      state = %Browser{pages: %{"T1" => conn}, intercepts: %{"T1" => {self(), make_ref()}}}
-
-      assert {:reply, {:error, :already_intercepting}, ^state} =
-               Browser.handle_call({:reserve_interception, page}, {self(), make_ref()}, state)
-    end
-
-    test "records and monitors the caller on success" do
-      conn = self()
-      page = %Page{browser: self(), conn: conn, target_id: "T1"}
-      state = %Browser{pages: %{"T1" => conn}}
-      caller = spawn(fn -> Process.sleep(:infinity) end)
-
-      assert {:reply, :ok, new_state} =
-               Browser.handle_call({:reserve_interception, page}, {caller, make_ref()}, state)
-
-      assert {^caller, ref} = new_state.intercepts["T1"]
-      assert is_reference(ref)
-
-      Process.exit(caller, :kill)
-    end
-
-    test "release demonitors and drops the entry" do
-      page = %Page{browser: self(), conn: self(), target_id: "T1"}
-      ref = Process.monitor(self())
-      state = %Browser{intercepts: %{"T1" => {self(), ref}}}
-
-      assert {:reply, :ok, %Browser{intercepts: %{}}} =
-               Browser.handle_call({:release_interception, page}, {self(), make_ref()}, state)
-    end
-
-    test "an owner :DOWN drops the reservation (the Fetch.disable runs off-process)" do
-      # A dead conn makes the fire-and-forget disable Task resolve to :noproc silently;
-      # the actual disable is verified end-to-end by the integration suite.
-      conn = spawn(fn -> :ok end)
-      ref = make_ref()
-      state = %Browser{pages: %{"T1" => conn}, intercepts: %{"T1" => {self(), ref}}}
-
-      assert {:noreply, %Browser{intercepts: %{}}} =
-               Browser.handle_info({:DOWN, ref, :process, self(), :killed}, state)
-    end
-
-    test "an owner :DOWN for an already-closed page drops the reservation without crashing" do
-      ref = make_ref()
-      state = %Browser{pages: %{}, intercepts: %{"T1" => {self(), ref}}}
-
-      assert {:noreply, %Browser{intercepts: %{}}} =
-               Browser.handle_info({:DOWN, ref, :process, self(), :killed}, state)
-    end
-
-    test "release of a page with no reservation is an idempotent :ok" do
-      page = %Page{browser: self(), conn: self(), target_id: "T_GONE"}
-      state = %Browser{intercepts: %{}}
-
-      assert {:reply, :ok, ^state} =
-               Browser.handle_call({:release_interception, page}, {self(), make_ref()}, state)
-    end
-
-    test "an owner :DOWN for an unknown ref is ignored" do
-      state = %Browser{intercepts: %{}}
-
-      assert {:noreply, ^state} =
-               Browser.handle_info({:DOWN, make_ref(), :process, self(), :killed}, state)
-    end
-
-    test "authenticate is rejected when interception is active (reverse exclusion)" do
-      conn = self()
-      page = %Page{browser: self(), conn: conn, target_id: "T1"}
-      state = %Browser{pages: %{"T1" => conn}, intercepts: %{"T1" => {self(), make_ref()}}}
-
-      assert {:reply, {:error, {:conflict, :intercepting}}, ^state} =
-               Browser.handle_call(
-                 {:authenticate, page, [username: "u", password: "p"]},
-                 {self(), make_ref()},
-                 state
-               )
-    end
-  end
-
-  describe "authenticate on a :session page" do
-    setup do
-      conn = self()
-      page = %Page{browser: self(), conn: conn, target_id: "T1", session_id: "S1"}
-      %{conn: conn, page: page, req: {:authenticate, page, [username: "u", password: "p"]}}
-    end
-
-    test "rejects a session this browser doesn't track", %{conn: conn, req: req} do
-      state = %Browser{browser_conn: conn, sessions: %{"T1" => "OTHER"}}
-
-      assert {:reply, {:error, :unknown_page}, ^state} =
-               Browser.handle_call(req, {self(), make_ref()}, state)
-    end
-
-    test "rejects a session handle on another connection", %{req: req} do
-      state = %Browser{browser_conn: spawn(fn -> :ok end), sessions: %{"T1" => "S1"}}
-
-      assert {:reply, {:error, :unknown_page}, ^state} =
-               Browser.handle_call(req, {self(), make_ref()}, state)
-    end
-
-    test "rejects a second authenticate on an armed session page", %{conn: conn, req: req} do
-      state = %Browser{browser_conn: conn, sessions: %{"T1" => "S1"}, auths: %{"T1" => self()}}
-
-      assert {:reply, {:error, :already_authenticated}, ^state} =
-               Browser.handle_call(req, {self(), make_ref()}, state)
-    end
-  end
-
-  describe "non-blocking authenticate (#36)" do
-    test "{:armed} replies :ok to the parked caller and clears pending_auth" do
-      from = {self(), make_ref()}
-      fetch = spawn(fn -> :ok end)
-      state = %Browser{pending_auth: %{fetch => {from, make_ref()}}}
-
-      assert {:noreply, %Browser{pending_auth: %{}}} = Browser.handle_info({:armed, fetch}, state)
-
-      {_pid, tag} = from
-      assert_receive {^tag, :ok}
-    end
-
-    test "{:arm_failed} fails the parked caller and clears its auths + pending_auth" do
-      from = {self(), make_ref()}
-      fetch = spawn(fn -> :ok end)
-      state = %Browser{auths: %{"T1" => fetch}, pending_auth: %{fetch => {from, make_ref()}}}
-
-      assert {:noreply, new_state} =
-               Browser.handle_info(
-                 {:arm_failed, fetch, {:cdp_error, "Fetch.enable", %{}}},
-                 state
-               )
-
-      assert new_state.pending_auth == %{}
-      assert new_state.auths == %{}
-
-      {_pid, tag} = from
-      assert_receive {^tag, {:error, {:cdp_error, "Fetch.enable", %{}}}}
-    end
-
-    test "a Fetch handler {:EXIT} during arming fails a still-parked caller (fallback)" do
-      from = {self(), make_ref()}
-      fetch = spawn(fn -> :ok end)
-      state = %Browser{auths: %{"T1" => fetch}, pending_auth: %{fetch => {from, make_ref()}}}
-
-      assert {:noreply, new_state} = Browser.handle_info({:EXIT, fetch, :boom}, state)
-
-      assert new_state.pending_auth == %{}
-      {_pid, tag} = from
-      assert_receive {^tag, {:error, :boom}}
-    end
-
-    test "{:armed} for an unknown pid is a no-op (late or duplicate signal)" do
-      state = %Browser{pending_auth: %{}}
-      assert {:noreply, ^state} = Browser.handle_info({:armed, spawn(fn -> :ok end)}, state)
-    end
-
-    test "{:arm_failed} for an unknown pid is a no-op" do
-      state = %Browser{pending_auth: %{}}
-
-      assert {:noreply, ^state} =
-               Browser.handle_info({:arm_failed, spawn(fn -> :ok end), :boom}, state)
-    end
-  end
-
-  describe "auth caller-departure cleanup (#40)" do
-    test "a monitored caller's :DOWN cancels the orphaned handler and drops pending_auth" do
-      # The authenticate/4 caller departed (e.g. its 15s call timed out) while the Fetch
-      # handler was still arming. Cancel the handler (a gen_cast) and drop its pending_auth
-      # entry, but leave auths for the handler's eventual {:EXIT} to clear (two phase).
-      test = self()
-      fetch = spawn(fn -> receive(do: (msg -> send(test, {:fetch_got, msg}))) end)
-      caller = spawn(fn -> :ok end)
-      caller_ref = make_ref()
-      from = {caller, make_ref()}
-      state = %Browser{auths: %{"T1" => fetch}, pending_auth: %{fetch => {from, caller_ref}}}
-
-      assert {:noreply, new_state} =
-               Browser.handle_info({:DOWN, caller_ref, :process, caller, :timeout}, state)
-
-      assert new_state.pending_auth == %{}
-      # auths is intentionally retained — the handler's cancel-stop {:EXIT} clears it.
-      assert new_state.auths == %{"T1" => fetch}
-      assert_receive {:fetch_got, {:"$gen_cast", :cancel}}
-    end
-
-    test "the orphaned handler's later {:EXIT} clears its auths entry (re-authenticatable)" do
-      # Phase two: after the cancel, the handler stops and its {:EXIT} arrives with no
-      # pending_auth entry left — it must still drop auths so a retry isn't stuck on
-      # {:error, :already_authenticated}.
-      fetch = spawn(fn -> :ok end)
-      state = %Browser{auths: %{"T1" => fetch}, pending_auth: %{}}
-
-      assert {:noreply, %Browser{auths: %{}, pending_auth: %{}}} =
-               Browser.handle_info({:EXIT, fetch, :normal}, state)
-    end
-
-    test "a :DOWN matching neither an interception owner nor an auth caller is ignored" do
-      state = %Browser{intercepts: %{}, pending_auth: %{}}
-
-      assert {:noreply, ^state} =
-               Browser.handle_info({:DOWN, make_ref(), :process, self(), :noproc}, state)
+      assert_receive {:fetcher_got, {:"$gen_cast", :page_gone}}
     end
   end
 
@@ -458,7 +413,7 @@ defmodule CDPEx.BrowserTest do
           # The page was opened then torn down: dropped from state, never recorded as
           # authed, and its orphaned Chrome tab actually closed (Target.closeTarget sent).
           assert new_state.pages == %{}
-          assert new_state.auths == %{}
+          assert new_state.fetchers == %{}
           assert_receive :close_target_sent, 1_000
         end)
 

@@ -11,6 +11,11 @@ Interception is event-driven: the process that enables it receives one
 long-lived process: an unresolved request stalls the page, so disable interception
 before that process stops resolving, or the page's next request hangs.
 
+It combines with `authenticate/4` and a credentialed `:proxy`: the library answers the
+login and lets through the requests outside `:patterns`, so the loop below still sees
+only the ones it asked for. To block images behind an authenticated proxy, pass
+`patterns: [%{"resourceType" => "Image"}]` and fail every pause.
+
 ```elixir
 defmodule ImageBlocker do
   # Drops image requests; lets everything else through.
