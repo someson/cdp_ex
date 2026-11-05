@@ -6,7 +6,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `isolated: true` on `new_page/2` and `with_page/3` opens the page in its own browser context (cookies, `localStorage`, cache), disposed when the page closes on every exit path, including a crashed tab and a connected browser's `stop/1`. Cookie functions on such a page act on its context only. The `[:cdp_ex, :page, :start | :stop]` metadata gains `:isolated` (#12).
+
 ### Changed
+- `Pool.with_page/3` runs each job in its own browser context by default, so a job no longer sees the cookies, `localStorage` or cache an earlier job left on the same pooled browser. Opening and closing an isolated page costs about 75 ms more. Pass `isolated: false` to share the browser's state as before (#12).
 - Chrome now launches with `--disable-field-trial-config`, as Puppeteer and Playwright do. Chromium and Chrome for Testing builds otherwise apply their bundled field-trial testing config, which turns on experimental features; with 8 concurrent pages this cut Chrome's peak memory by ~30% (660 → 462 MB PSS) and raised throughput by ~20%. Pass `:args` to restore the old flag list (#1).
 - `Page.wait_for_selector/3` and `Page.wait_for_function/3` wait inside the page instead of polling over CDP: one `Runtime.evaluate` awaits a promise that checks the expression at once, on every DOM mutation, and every `:interval` ms. An element is seen as soon as it is inserted rather than at the next 100 ms poll; navigating to an SPA and waiting for its content went from 129 to 99 ms at p50. A navigation mid-wait re-arms it in the new document, and the error taxonomy is unchanged. A non-integer `:timeout`, or an `:interval` below 1, now raises `ArgumentError` (#4).
 

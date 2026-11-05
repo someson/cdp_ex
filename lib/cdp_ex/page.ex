@@ -1462,7 +1462,9 @@ defmodule CDPEx.Page do
   end
 
   @doc """
-  Returns all browser cookies as a list of CDP cookie maps.
+  Returns the cookies of the page's browser context as a list of CDP cookie maps:
+  the page's own context for a page opened with `isolated: true`, otherwise the
+  browser's default context, shared by every page that isn't isolated.
 
   Lazily enables the `Network` domain. Options: `:timeout` (default 10_000).
   """
@@ -1478,8 +1480,9 @@ defmodule CDPEx.Page do
   end
 
   @doc """
-  Sets cookies. Each is a CDP `CookieParam` map — at least `"name"`, `"value"`,
-  and a `"url"` or `"domain"`. Lazily enables `Network`. Options: `:timeout`.
+  Sets cookies in the page's browser context (see `cookies/2`). Each is a CDP
+  `CookieParam` map — at least `"name"`, `"value"`, and a `"url"` or `"domain"`.
+  Lazily enables `Network`. Options: `:timeout`.
   """
   @spec set_cookies(t(), [map()], keyword()) :: :ok | {:error, term()}
   def set_cookies(%__MODULE__{} = page, cookies, opts \\ []) when is_list(cookies) do
@@ -1492,7 +1495,10 @@ defmodule CDPEx.Page do
     end
   end
 
-  @doc "Clears all browser cookies. Lazily enables `Network`. Options: `:timeout`."
+  @doc """
+  Clears the cookies of the page's browser context (see `cookies/2`). Lazily enables
+  `Network`. Options: `:timeout`.
+  """
   @spec clear_cookies(t(), keyword()) :: :ok | {:error, term()}
   def clear_cookies(%__MODULE__{} = page, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)

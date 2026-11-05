@@ -17,6 +17,22 @@ defmodule CDPEx.PoolTest do
     def init(:ok), do: {:ok, :ok}
   end
 
+  # A FakeBrowser that also answers new_page: it reports the page options it got
+  # and refuses the page, so with_page/3 returns without running its fun.
+  defmodule RecordingBrowser do
+    @moduledoc false
+    use GenServer
+
+    @impl true
+    def init(test), do: {:ok, test}
+
+    @impl true
+    def handle_call({:new_page, opts}, _from, test) do
+      send(test, {:new_page_opts, opts})
+      {:reply, {:error, :stub}, test}
+    end
+  end
+
   setup do
     # The pool is start_linked to the test process; trap exits so a pool stop in
     # teardown can't take the test down.
@@ -328,6 +344,25 @@ defmodule CDPEx.PoolTest do
     assert_receive {:w2, {:ok, _browser}}, 2_000
     send(w1, :stop)
     send(w2, :stop)
+  end
+
+  describe "with_page/3 isolation" do
+    setup do
+      test = self()
+      [pool: start_pool(start_fun: fn _ -> GenServer.start_link(RecordingBrowser, test) end)]
+    end
+
+    test "opens an isolated page by default", %{pool: pool} do
+      assert {:error, :stub} = Pool.with_page(pool, fn _ -> flunk("fun ran") end)
+      assert_receive {:new_page_opts, opts}
+      assert opts[:isolated] == true
+    end
+
+    test "passes isolated: false through", %{pool: pool} do
+      assert {:error, :stub} = Pool.with_page(pool, fn _ -> flunk("fun ran") end, isolated: false)
+      assert_receive {:new_page_opts, opts}
+      assert opts[:isolated] == false
+    end
   end
 
   defp start_pool(opts) do

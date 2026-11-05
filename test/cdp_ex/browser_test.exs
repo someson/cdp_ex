@@ -584,8 +584,8 @@ defmodule CDPEx.BrowserTest do
       :telemetry.attach_many(
         handler,
         [[:cdp_ex, :page, :start], [:cdp_ex, :page, :stop]],
-        fn event, _m, meta, _ -> send(test, {:telemetry, event, meta}) end,
-        nil
+        &__MODULE__.forward_telemetry/4,
+        test
       )
 
       on_exit(fn -> :telemetry.detach(handler) end)
@@ -603,6 +603,8 @@ defmodule CDPEx.BrowserTest do
       Connection.close(conn)
     end
   end
+
+  def forward_telemetry(event, _measurements, meta, test), do: send(test, {:telemetry, event, meta})
 
   defp call_in_task(state, request) do
     fn -> Browser.handle_call(request, {self(), make_ref()}, state) end
