@@ -424,9 +424,10 @@ defmodule CDPEx.Browser do
       ^sid ->
         # The page rides the shared browser connection; detach the session and
         # close the tab, but NEVER close that connection (other sessions use it).
+        isolated = Map.has_key?(state.contexts, tid)
         detach_session(state.browser_conn, sid)
         state = end_target(state, tid)
-        Telemetry.page(:stop, %{target_id: tid, transport: :session})
+        Telemetry.page(:stop, %{target_id: tid, transport: :session, isolated: isolated})
         {:reply, :ok, %{state | sessions: Map.delete(state.sessions, tid)}}
 
       _ ->
@@ -440,9 +441,10 @@ defmodule CDPEx.Browser do
         # Close the target on the browser connection first (a page connection can't
         # cleanly close its own target), then stop the page connection — best-effort,
         # since either may already be gone.
+        isolated = Map.has_key?(state.contexts, tid)
         state = end_target(state, tid)
         safe_close(conn)
-        Telemetry.page(:stop, %{target_id: tid, transport: :dedicated})
+        Telemetry.page(:stop, %{target_id: tid, transport: :dedicated, isolated: isolated})
         {:reply, :ok, %{state | pages: Map.delete(state.pages, tid)}}
 
       _ ->
@@ -772,7 +774,11 @@ defmodule CDPEx.Browser do
   defp reply_dedicated_page(state, opts) do
     case open_page(state, opts) do
       {:ok, page, context_id} ->
-        Telemetry.page(:start, %{target_id: page.target_id, transport: :dedicated})
+        Telemetry.page(:start, %{
+          target_id: page.target_id,
+          transport: :dedicated,
+          isolated: context_id != nil
+        })
 
         state = %{
           state
@@ -859,7 +865,12 @@ defmodule CDPEx.Browser do
   defp reply_session_page(state, opts) do
     case open_session_page(state, opts) do
       {:ok, page, context_id} ->
-        Telemetry.page(:start, %{target_id: page.target_id, transport: :session})
+        Telemetry.page(:start, %{
+          target_id: page.target_id,
+          transport: :session,
+          isolated: context_id != nil
+        })
+
         sessions = Map.put(state.sessions, page.target_id, page.session_id)
         contexts = put_context(state.contexts, page.target_id, context_id)
         {:reply, {:ok, page}, %{state | sessions: sessions, contexts: contexts}}

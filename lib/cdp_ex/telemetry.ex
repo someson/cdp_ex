@@ -47,7 +47,9 @@ defmodule CDPEx.Telemetry do
   Emitted when a page is opened (`CDPEx.new_page/2`) and closed (`CDPEx.close_page/2`).
 
     * measurements — `%{system_time: System.system_time()}`
-    * metadata — `%{target_id, transport}` where `transport` is `:dedicated` or `:session`
+    * metadata — `%{target_id, transport, isolated}` where `transport` is `:dedicated`
+      or `:session`, and `isolated` is `true` for a page opened in its own browser
+      context (`isolated: true`)
 
   `:stop` fires only on an explicit `close_page/2`. A page that dies any other way (a
   Chrome crash, the browser connection going down) emits `[:cdp_ex, :error]` **instead**

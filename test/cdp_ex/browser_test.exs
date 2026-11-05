@@ -576,6 +576,34 @@ defmodule CDPEx.BrowserTest do
     end
   end
 
+  describe "isolated pages: telemetry" do
+    test "page start/stop metadata carries isolated" do
+      handler = "isolated-telemetry-#{inspect(self())}"
+      test = self()
+
+      :telemetry.attach_many(
+        handler,
+        [[:cdp_ex, :page, :start], [:cdp_ex, :page, :stop]],
+        fn event, _m, meta, _ -> send(test, {:telemetry, event, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+      {state, conn} = fake_browser_state()
+
+      assert {:reply, {:ok, page}, opened} =
+               new_page_in_task(state, transport: :session, isolated: true)
+
+      assert_receive {:telemetry, [:cdp_ex, :page, :start], %{isolated: true}}
+      assert {:reply, :ok, _} = call_in_task(opened, {:close_page, page})
+      assert_receive {:telemetry, [:cdp_ex, :page, :stop], %{isolated: true}}
+
+      assert {:reply, {:ok, _}, _} = new_page_in_task(state, transport: :session)
+      assert_receive {:telemetry, [:cdp_ex, :page, :start], %{isolated: false}}
+      Connection.close(conn)
+    end
+  end
+
   defp call_in_task(state, request) do
     fn -> Browser.handle_call(request, {self(), make_ref()}, state) end
     |> Task.async()
