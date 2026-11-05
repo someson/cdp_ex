@@ -62,6 +62,12 @@ defmodule CDPEx.ChromeTest do
       assert "--remote-debugging-port=0" in args
     end
 
+    test "pipe: true swaps the debugging port for the pipe" do
+      args = Chrome.default_args("/tmp/p", pipe: true)
+      assert "--remote-debugging-pipe" in args
+      refute "--remote-debugging-port=0" in args
+    end
+
     test "applies a custom window size" do
       assert "--window-size=800,600" in Chrome.default_args("/tmp/p", window_size: {800, 600})
     end
@@ -89,6 +95,28 @@ defmodule CDPEx.ChromeTest do
                Chrome.spawn_command("/opt/chrome", ["--headless", "about:blank"])
 
       assert script =~ ~s(exec "$0" "$@")
+    end
+
+    test "pipe: true maps the Port's stdin and stdout onto Chrome's fds 3 and 4" do
+      assert {"/bin/sh", ["-c", script, "/opt/chrome", "--remote-debugging-pipe"]} =
+               Chrome.spawn_command("/opt/chrome", ["--remote-debugging-pipe"], true)
+
+      assert script =~ "3<&0 4>&1"
+      # Chrome's own output must stay off the CDP stream.
+      assert script =~ "1>/dev/null 2>/dev/null"
+    end
+  end
+
+  describe "validate_opts!/1 for :pipe" do
+    test "accepts booleans" do
+      assert Chrome.validate_opts!(pipe: false) == :ok
+      if !match?({:win32, _}, :os.type()), do: assert(Chrome.validate_opts!(pipe: true) == :ok)
+    end
+
+    test "rejects anything else" do
+      assert_raise ArgumentError, ~r/invalid :pipe "yes"/, fn ->
+        Chrome.validate_opts!(pipe: "yes")
+      end
     end
   end
 
@@ -325,6 +353,69 @@ defmodule CDPEx.ChromeTest do
                Chrome.launch(chrome_binary: stub, launch_timeout: 2_000)
 
       assert excerpt =~ "not-a-valid-devtools-port-file"
+    end
+
+    @tag :tmp_dir
+    test "pipe: true returns once the stand-in answers the probe on fd 4", %{tmp_dir: tmp_dir} do
+      stub =
+        write_stub!(tmp_dir, "stub-pipe", """
+        #!/bin/sh
+        printf '{"id":0,"result":{"product":"stub"}}\\000' >&4
+        exec sleep 30
+        """)
+
+      assert {:ok, handle} = Chrome.launch(chrome_binary: stub, pipe: true, launch_timeout: 5_000)
+      assert handle.pipe
+      assert handle.debug_url == nil
+      assert is_integer(handle.os_pid)
+
+      :ok = Chrome.stop(handle)
+      refute File.dir?(handle.user_data_dir)
+    end
+
+    @tag :tmp_dir
+    test "pipe: true times out to {:debug_url_not_found, \"\"} when nothing answers", %{
+      tmp_dir: tmp_dir
+    } do
+      stub =
+        write_stub!(tmp_dir, "stub-pipe-silent", """
+        #!/bin/sh
+        exec sleep 30
+        """)
+
+      {elapsed_us, result} =
+        :timer.tc(fn -> Chrome.launch(chrome_binary: stub, pipe: true, launch_timeout: 300) end)
+
+      assert result == {:error, {:debug_url_not_found, ""}}
+      assert elapsed_us < 3_000_000
+    end
+
+    @tag :tmp_dir
+    test "pipe: true reports an exit before the answer as {:chrome_exited, status, \"\"}", %{
+      tmp_dir: tmp_dir
+    } do
+      stub =
+        write_stub!(tmp_dir, "stub-pipe-exits", """
+        #!/bin/sh
+        echo 'stderr is dropped in pipe mode' 1>&2
+        exit 3
+        """)
+
+      assert Chrome.launch(chrome_binary: stub, pipe: true, launch_timeout: 5_000) ==
+               {:error, {:chrome_exited, 3, ""}}
+    end
+
+    @tag :tmp_dir
+    test "pipe: true rejects an answer that isn't the probe's reply", %{tmp_dir: tmp_dir} do
+      stub =
+        write_stub!(tmp_dir, "stub-pipe-garbage", """
+        #!/bin/sh
+        printf 'not json\\000' >&4
+        exec sleep 30
+        """)
+
+      assert Chrome.launch(chrome_binary: stub, pipe: true, launch_timeout: 5_000) ==
+               {:error, {:debug_url_not_found, "not json"}}
     end
 
     @tag :integration

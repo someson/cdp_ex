@@ -174,6 +174,40 @@ defmodule CDPEx.ProtocolTest do
     end
   end
 
+  describe "split_pipe_messages/2" do
+    test "an empty chunk keeps the buffer" do
+      assert Protocol.split_pipe_messages("{\"id", "") == {[], "{\"id"}
+    end
+
+    test "a chunk that starts with NUL completes the buffered message" do
+      assert Protocol.split_pipe_messages("{\"id\":1}", <<0, "{">>) == {["{\"id\":1}"], "{"}
+    end
+
+    test "drops empty messages between consecutive NULs" do
+      assert Protocol.split_pipe_messages("", <<"a", 0, 0, "b", 0>>) == {["a", "b"], ""}
+    end
+
+    test "rejoins a message split byte by byte, including a multi-byte character" do
+      message = Jason.encode!(%{"method" => "X", "params" => %{"s" => "ü€😀"}})
+
+      {messages, tail} =
+        (message <> <<0>>)
+        |> :binary.bin_to_list()
+        |> Enum.reduce({[], ""}, fn byte, {acc, buffer} ->
+          {done, buffer} = Protocol.split_pipe_messages(buffer, <<byte>>)
+          {acc ++ done, buffer}
+        end)
+
+      assert messages == [message]
+      assert tail == ""
+    end
+
+    test "pipe_frame/1 round-trips through split_pipe_messages/2" do
+      frame = IO.iodata_to_binary(Protocol.pipe_frame(~s({"id":1})))
+      assert Protocol.split_pipe_messages("", frame) == {[~s({"id":1})], ""}
+    end
+  end
+
   describe "sni/1" do
     test "disables SNI for IP literals (RFC 6066)" do
       assert Protocol.sni("127.0.0.1") == :disable

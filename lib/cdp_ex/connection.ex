@@ -14,7 +14,10 @@ defmodule CDPEx.Connection do
       if the socket drops — no caller is left hanging.
 
   One connection backs one socket: the browser endpoint, or a page endpoint at
-  `/devtools/page/<targetId>`. A single connection may carry both untagged
+  `/devtools/page/<targetId>`. Started with `{:pipe, port}` instead of a URL, it
+  speaks CDP over a `pipe: true` Chrome's Port (see `CDPEx.Chrome`): NUL-delimited
+  JSON, with no WebSocket framing. Chrome exiting then stops the connection with
+  `{:ws_closed, {:chrome_exited, status}}`. A single connection may carry both untagged
   browser/page frames and many flattened sessions' frames, demultiplexed by
   `sessionId`. `CDPEx.Browser` starts and monitors these.
   """
@@ -38,6 +41,9 @@ defmodule CDPEx.Connection do
     :conn,
     :ref,
     :websocket,
+    # The pipe transport: Chrome's Port, and the unterminated tail of its output.
+    :port,
+    buffer: "",
     next_id: 1,
     # id => {from, method, timer, session_id}. Keyed by id alone: ids are unique per
     # connection, and Chrome answers a call on an unknown session from the browser
@@ -65,11 +71,15 @@ defmodule CDPEx.Connection do
   GenServer). Returns `{:ok, pid}` once the WebSocket handshake completes. A failed
   connect or upgrade returns its `:ws_connect` / `:ws_upgrade` error without
   exiting the linked caller.
+
+  `{:pipe, port}` starts a connection over a `pipe: true` Chrome's Port instead. It
+  returns at once; the caller, the Port's owner, then moves the Port to it with
+  `Port.connect/2` before anyone calls it. The connection's exit closes the Port.
   """
-  @spec start_link(String.t(), keyword()) :: GenServer.on_start()
-  def start_link(ws_url, opts \\ []) do
+  @spec start_link(String.t() | {:pipe, port()}, keyword()) :: GenServer.on_start()
+  def start_link(endpoint, opts \\ []) do
     {gen_opts, conn_opts} = Keyword.split(opts, [:name])
-    GenServer.start_link(__MODULE__, {ws_url, conn_opts}, gen_opts)
+    GenServer.start_link(__MODULE__, {endpoint, conn_opts}, gen_opts)
   end
 
   @typedoc """
@@ -272,6 +282,13 @@ defmodule CDPEx.Connection do
   @dialyzer {:nowarn_function, init: 1}
 
   @impl true
+  def init({{:pipe, port}, _opts}) when is_port(port) do
+    ProcessLabel.set({:cdp_connection, :pipe})
+    # The handshake that delays trapping in the WebSocket clause doesn't exist here.
+    Process.flag(:trap_exit, true)
+    {:ok, %__MODULE__{port: port}}
+  end
+
   def init({ws_url, opts}) do
     {scheme, host, port, path} = Protocol.parse_ws_url(ws_url)
 
@@ -440,6 +457,22 @@ defmodule CDPEx.Connection do
     end
   end
 
+  # Pipe transport: Chrome's output, NUL-delimited, arriving in arbitrary chunks.
+  def handle_info({port, {:data, data}}, %{port: port} = state) when is_port(port) do
+    {messages, buffer} = Protocol.split_pipe_messages(state.buffer, data)
+    dispatch_frames(Enum.map(messages, &{:text, &1}), %{state | buffer: buffer})
+  end
+
+  def handle_info({port, {:exit_status, status}}, %{port: port} = state) when is_port(port) do
+    stop_ws_closed(state, {:chrome_exited, status})
+  end
+
+  # Port.connect/2 linked us to the Port, so its closing arrives here, after the exit
+  # status when Chrome exited, or alone when another process closed it.
+  def handle_info({:EXIT, port, _reason}, %{port: port} = state) when is_port(port) do
+    stop_ws_closed(state, :closed)
+  end
+
   # A subscriber process died without unsubscribing: drop it from every
   # subscription and forget its monitor, so dead pids can't accumulate. Must come
   # before the catch-all clause, which would otherwise feed it to WebSocket.stream.
@@ -456,7 +489,7 @@ defmodule CDPEx.Connection do
   end
 
   # Any other message is an inbound WebSocket transport frame.
-  def handle_info(message, state) do
+  def handle_info(message, %{port: nil} = state) do
     case WebSocket.stream(state.conn, message) do
       {:ok, conn, responses} ->
         state = %{state | conn: conn}
@@ -476,6 +509,9 @@ defmodule CDPEx.Connection do
         {:noreply, state}
     end
   end
+
+  # A pipe connection has no socket to feed a stray message to.
+  def handle_info(_message, state), do: {:noreply, state}
 
   @impl true
   def terminate(reason, state) do
@@ -724,6 +760,14 @@ defmodule CDPEx.Connection do
   end
 
   # ── websocket plumbing ──────────────────────────────────────────────────────
+
+  # Port.command raises once the Port has closed (Chrome exited, or someone closed it).
+  defp ws_send(%{port: port} = state, data) when is_port(port) do
+    Port.command(port, Protocol.pipe_frame(data))
+    {:ok, state}
+  rescue
+    ArgumentError -> {:error, state, {:ws_send, :closed}}
+  end
 
   defp ws_send(state, data) do
     # Protocol.encode returns iodata; WebSocket.encode requires a binary

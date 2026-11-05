@@ -55,6 +55,9 @@ defmodule CDPEx.Browser do
     # default + the :dedicated rejection in new_page. Distinct from `chrome: nil`,
     # which a launched browser never is in production but a unit fixture can be.
     connected: false,
+    # A `pipe: true` launch: CDP rides Chrome's Port, so there is no endpoint for a
+    # :dedicated page's own socket. Like connect-mode, it defaults to :session.
+    pipe: false,
     pages: %{},
     sessions: %{},
     # target_id => browserContextId for pages opened with `isolated: true`; the
@@ -111,8 +114,8 @@ defmodule CDPEx.Browser do
       or `:session` (multiplexed over the browser socket via a flattened CDP
       session — fewer sockets, but all session pages share the browser
       connection's fate: if it drops, they all go). A **launched** browser
-      defaults to `:dedicated`; a **connected** browser (`CDPEx.connect/2`)
-      defaults to `:session` and rejects `:dedicated` with
+      defaults to `:dedicated`; a **connected** browser (`CDPEx.connect/2`) or one
+      launched with `pipe: true` defaults to `:session` and rejects `:dedicated` with
       `{:error, {:unsupported_transport, :dedicated}}`. Any other value returns
       `{:error, {:invalid_transport, value}}`.
     * `:prevent_alerts` — inject no-op `alert`/`confirm`/`prompt` (default `true`)
@@ -288,7 +291,7 @@ defmodule CDPEx.Browser do
              {:ok, chrome} <- Chrome.launch(launch_opts) do
           connect_browser(
             chrome,
-            chrome.debug_url,
+            endpoint(chrome),
             launch_opts,
             owner || parent_pid(),
             proxy_auth,
@@ -313,6 +316,9 @@ defmodule CDPEx.Browser do
     {:stop, reason}
   end
 
+  defp endpoint(%{pipe: true, port: port}), do: {:pipe, port}
+  defp endpoint(%{debug_url: debug_url}), do: debug_url
+
   # Translate the `:proxy` launch option into a `--proxy-server` flag (appended to
   # `:extra_args`) plus the credentials to arm each page with. A bad proxy value stops
   # init with `{:invalid_proxy, _}`, surfaced from `launch/1` as `{:error, _}`.
@@ -330,7 +336,7 @@ defmodule CDPEx.Browser do
         {:ok, parsed} ->
           arg = Proxy.to_arg(parsed)
           launch_opts = Keyword.update(launch_opts, :extra_args, [arg], &(&1 ++ [arg]))
-          {:ok, Proxy.credentials(parsed), launch_opts}
+          proxy_with_auth(Proxy.credentials(parsed), launch_opts)
 
         {:error, _reason} = error ->
           error
@@ -338,12 +344,23 @@ defmodule CDPEx.Browser do
     end
   end
 
+  # Proxy credentials are answered per page through Fetch, which needs a :dedicated
+  # page, and a pipe browser has only :session pages: every page would fail. Fail
+  # the launch instead.
+  defp proxy_with_auth(nil, launch_opts), do: {:ok, nil, launch_opts}
+
+  defp proxy_with_auth(creds, launch_opts) do
+    if Keyword.get(launch_opts, :pipe, false),
+      do: {:error, {:invalid_proxy, :pipe}},
+      else: {:ok, creds, launch_opts}
+  end
+
   # Connect the browser WebSocket (the launched Chrome's debug URL, or a remote
   # endpoint for connect-mode where `chrome` is nil). If the connect fails, init/1
   # returns {:stop, _} *before* the GenServer loop starts, so terminate/2 never
   # runs — reap Chrome here (when we own it) or leak the OS process and temp profile.
-  defp connect_browser(chrome, ws_url, launch_opts, parent, proxy_auth, conn_opts) do
-    {_scheme, host, port, _path} = Protocol.parse_ws_url(ws_url)
+  defp connect_browser(chrome, endpoint, launch_opts, parent, proxy_auth, conn_opts) do
+    {host, port} = endpoint_host(endpoint)
 
     # The OS pid is the one identifier that ties this GenServer to a row in `ps`.
     ProcessLabel.set({:cdp_browser, browser_label_id(chrome)})
@@ -354,12 +371,13 @@ defmodule CDPEx.Browser do
     # dropped in the window after start_link, subscribe/4 fails — and since the
     # GenServer loop hasn't started, terminate/2 never runs, so reap Chrome (and the
     # conn) here or leak the OS process and temp profile.
-    with {:ok, conn} <- Connection.start_link(ws_url, conn_opts),
+    with {:ok, conn} <- start_browser_conn(endpoint, conn_opts),
          :ok <- subscribe_detached(conn) do
       {:ok,
        %__MODULE__{
          chrome: chrome,
          connected: is_nil(chrome),
+         pipe: match?({:pipe, _}, endpoint),
          browser_conn: conn,
          host: host,
          port: port,
@@ -373,6 +391,38 @@ defmodule CDPEx.Browser do
         stop_init(reason)
     end
   end
+
+  # A pipe browser has no host or port: its pages can't open their own socket.
+  defp endpoint_host({:pipe, _port}), do: {nil, nil}
+
+  defp endpoint_host(ws_url) do
+    {_scheme, host, port, _path} = Protocol.parse_ws_url(ws_url)
+    {host, port}
+  end
+
+  # The pipe connection must own Chrome's Port to receive its output. Nothing has
+  # been sent on the Port since Chrome.launch/1's probe, so nothing lands in this
+  # process's mailbox meanwhile. Port.connect/2 raises if Chrome already exited; the
+  # exit status it delivered to us first says why.
+  defp start_browser_conn({:pipe, port} = endpoint, conn_opts) do
+    with {:ok, conn} <- Connection.start_link(endpoint, conn_opts) do
+      try do
+        Port.connect(port, conn)
+        {:ok, conn}
+      rescue
+        ArgumentError ->
+          safe_close(conn)
+
+          receive do
+            {^port, {:exit_status, status}} -> {:error, {:chrome_exited, status, ""}}
+          after
+            0 -> {:error, {:ws_closed, :closed}}
+          end
+      end
+    end
+  end
+
+  defp start_browser_conn(ws_url, conn_opts), do: Connection.start_link(ws_url, conn_opts)
 
   defp subscribe_detached(conn) do
     case Connection.subscribe(conn, "Target.detachedFromTarget") do
@@ -404,10 +454,11 @@ defmodule CDPEx.Browser do
   def handle_call({:new_page, opts}, _from, state) do
     # A connected browser defaults to :session and can't do :dedicated yet —
     # a per-page socket would have to target the remote host.
-    default = if state.connected, do: :session, else: :dedicated
+    session_only? = state.connected or state.pipe
+    default = if session_only?, do: :session, else: :dedicated
 
     case Keyword.get(opts, :transport, default) do
-      :dedicated when state.connected ->
+      :dedicated when session_only? ->
         {:reply, {:error, {:unsupported_transport, :dedicated}}, state}
 
       :dedicated ->
@@ -566,6 +617,17 @@ defmodule CDPEx.Browser do
 
   @impl true
   def handle_info({port, {:exit_status, status}}, %{chrome: %{port: port}} = state) do
+    Logger.warning("[CDPEx.Browser] Chrome exited with status #{status}")
+    Telemetry.error(status, :chrome_exited)
+    {:stop, {:chrome_exited, status}, state}
+  end
+
+  # A pipe browser's connection owns Chrome's Port, so Chrome's exit status reaches
+  # the connection, which stops with it: report it as the Port clause above does.
+  def handle_info(
+        {:EXIT, pid, {:shutdown, {:ws_closed, {:chrome_exited, status}}}},
+        %{browser_conn: pid, pipe: true} = state
+      ) do
     Logger.warning("[CDPEx.Browser] Chrome exited with status #{status}")
     Telemetry.error(status, :chrome_exited)
     {:stop, {:chrome_exited, status}, state}

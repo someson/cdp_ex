@@ -43,23 +43,13 @@ test/docker/run.sh` if a leftover dir shows up again. If one does leak, wait
 for the whole Chrome process group to exit before removing the dir, or retry
 removal for longer.
 
-## 3. Cold start: pipe transport
+## 3. Pipe transport — done
 
-**Problem.** A cold launch → page → navigate → stop cycle is still slower than
-Playwright: 532 ms vs 458 ms at p50. Playwright talks to Chrome over
-`--remote-debugging-pipe` and knows it is ready at once; CDPEx waits for the
-`DevTools listening on` stderr line, polling `DevToolsActivePort` every 150 ms
-as a fallback, then opens a WebSocket.
-
-**Direction.** A pipe transport: Chrome reads CDP on fd 3 and writes on fd 4,
-as NUL-delimited JSON. A Port only gives fd 0/1, so it needs the same kind of
-`/bin/sh` wrapper the watchdog already uses (`exec 3<&0 4>&1`). ChromicPDF
-does this. Side benefits: no TCP port is opened, and Chrome exits on its own
-when the pipe closes.
-
-**Cost.** A second transport next to the WebSocket one, with its own framing,
-session handling and tests. Worth it only if cold start matters; a warm
-`CDPEx.Pool` hides it.
+`pipe: true` on `launch/1` (#13). Design and measurements:
+`docs/design/2026-11-05-pipe-transport.md`. The measured cold-start gain is
+small (about 15 ms on Linux, none on macOS); the stronger reason to use it is
+that no DevTools TCP port is opened. The rest of the gap to Playwright is not in
+the transport.
 
 ## 4. Default flags: what hasn't been measured
 
