@@ -78,7 +78,7 @@ defmodule CDPEx.Chrome do
   # crashing script, `kill -9`, the OOM killer), and Chrome ignores its stdin, so the
   # Port closing doesn't stop it either. The script starts a background watchdog
   # that blocks reading the Port's stdin, then execs Chrome in its own place, so
-  # Chrome keeps the Port's OS pid (`kill/1`, `await_exit/2` and the process label
+  # Chrome keeps the Port's OS pid (`kill/1`, `await_exit/3` and the process label
   # are unchanged). The OS closes that pipe when the VM exits, however it exits;
   # the watchdog's read then returns and it kill -9s Chrome. On a normal stop it
   # fires after `stop/1` already killed Chrome.
@@ -705,12 +705,19 @@ defmodule CDPEx.Chrome do
     _ -> :ok
   end
 
-  defp await_exit(nil, _deadline), do: :ok
+  # Each check runs `kill -0` as an OS process, so the interval backs off from 10 ms
+  # (Chrome usually exits within ~100 ms of the kill) to 100 ms (one that lingers
+  # costs ~30 checks over the 3 s wait instead of ~150).
+  defp await_exit(os_pid, deadline, interval \\ 10)
 
-  defp await_exit(os_pid, deadline) do
-    if os_alive?(os_pid) and remaining_ms(deadline) > 0 do
-      Process.sleep(20)
-      await_exit(os_pid, deadline)
+  defp await_exit(nil, _deadline, _interval), do: :ok
+
+  defp await_exit(os_pid, deadline, interval) do
+    remaining = remaining_ms(deadline)
+
+    if remaining > 0 and os_alive?(os_pid) do
+      Process.sleep(min(interval, remaining))
+      await_exit(os_pid, deadline, min(interval * 2, 100))
     else
       :ok
     end
