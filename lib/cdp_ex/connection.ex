@@ -260,6 +260,9 @@ defmodule CDPEx.Connection do
 
   # Drops a waiter from await_event_async/4 and flushes an outcome that already
   # arrived. A cast, so a wedged or dead connection can't block the cleanup.
+  # Must run in the process that called await_event_async/4: only the alias's owner
+  # can unalias it (elsewhere unalias/1 returns false and the alias stays live), and
+  # only its mailbox holds an outcome to flush.
   @doc false
   @spec cancel_await(GenServer.server(), reference()) :: :ok
   def cancel_await(conn, ref) when is_reference(ref) do

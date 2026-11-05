@@ -115,3 +115,65 @@ Chromes (an estimated ~3 GB at ~360 MB each). One browser ran 8 concurrent
 isolated pages at ~850 MB peak PSS (`bench/`, 4 CPUs). A `pages_per_browser:`
 option would let `size: 2, pages_per_browser: 4` serve the same 8 jobs on 2
 Chromes. Measure 8×1, 2×4 and 1×8 with `bench/` before building it.
+
+Prerequisite: `CDPEx.Browser` opens pages one at a time. `handle_call({:new_page,
+_})` runs the whole setup inside the GenServer (browser context,
+`Target.createTarget`, the per-page WebSocket upgrade, the bootstrap calls,
+proxy auth), so concurrent `new_page/2` calls on one browser queue behind each
+other, and a slow one also delays `close_page/2` for every other page. Moving
+the setup out of the GenServer means reworking how pages, contexts, auth and
+interception are tracked, which today rely on calls being served one at a
+time. Measure how long the queue gets with 4 pages per browser first.
+
+## 9. Proxy login and request interception on one page
+
+**Problem.** A page can either answer the proxy's 407 (a credentialed
+`:proxy`, or `Page.authenticate/4`) or intercept requests
+(`enable_request_interception/2`), not both: the second returns
+`{:error, {:conflict, :authenticated}}` or `{:conflict, :intercepting}`. Both
+run on the `Fetch` domain. Puppeteer allows the combination.
+
+**Evidence.** ReqBot (a consumer that blocks images and fonts behind an
+authenticated proxy) works around it in its own interceptor process: after
+`enable_request_interception/2` it re-sends `Fetch.enable` with
+`handleAuthRequests: true` through `CDPEx.Connection` and answers
+`Fetch.authRequired` itself (credentials once per request, `CancelAuth` on a
+repeat, `Default` for a `Server` challenge). Any change to our `Fetch` internals
+can break it.
+
+**Plan.** One `Fetch.enable` per page carrying both the interception patterns
+and `handleAuthRequests: true`; the auth handler answers `Fetch.authRequired`
+and the interception owner keeps receiving `Fetch.requestPaused`. With
+credentials, every request is paused (the proxy challenge only arrives for
+paused requests), so requests outside the caller's patterns must be continued
+by the library, not the caller. Needs an integration test against a proxy that
+requires Basic auth. Estimate: half a day to a day.
+
+## 10. Block resources by type
+
+`block: [:image, :font, :media, :stylesheet]` on a page: requests of those
+`resourceType`s fail with `net::ERR_BLOCKED_BY_CLIENT` before reaching the
+network. A common scraping speed-up (less proxy traffic, faster loads). ReqBot
+builds it from request interception plus a dedicated process that owns the
+paused requests, because the caller is blocked in a navigation wait and cannot
+answer them. Should be a library-owned handler on the `Fetch` domain, so it
+lands after item 9. Estimate: about half a day on top of 9.
+
+## 11. Full document response from `navigate/3`
+
+`navigate(page, url, response: true)` returns only `%{status, url}`. ReqBot
+needs the headers and body of the main document, so it re-implements the
+capture: `Network.responseReceived` with `type: "Document"` for the page's
+frame, then `Network.loadingFinished`, then `Network.getResponseBody`. Add
+`headers` and `request_id` to the returned map so the body can be read with
+`response_body/3`. Estimate: 2–3 hours.
+
+## 12. Read a response body without racing `loadingFinished`
+
+`response_body/3` called between `Network.responseReceived` (what
+`wait_for_response/3` resolves on) and `Network.loadingFinished` returns
+`{:cdp_error, "Network.getResponseBody", %{"code" => -32000}}` ("No data
+found"); the docs tell the caller to retry. ReqBot's capture retries 3 times,
+500 ms apart. Add `body: true` to `wait_for_response/3`: wait for this
+request's `loadingFinished` (or `loadingFailed`) and return the body with the
+response. Estimate: 2–3 hours.
