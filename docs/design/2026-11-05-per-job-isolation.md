@@ -129,10 +129,12 @@ All in `CDPEx.Browser`.
 - **Proxy auth:** a launched browser with `:proxy` credentials arms Fetch auth
   per page; contexts inherit the browser's `--proxy-server`. Covered by an
   integration test.
-- **Deadline / caller death:** unchanged paths: they end in `close_page/2`,
-  which disposes. A caller that dies while `new_page/2` is in flight leaves the
-  page open today; with `:isolated` its context stays too, until the browser
-  stops.
+- **Deadline / caller death:** both end in `close_page/2`, which disposes. On a
+  browser pid, `with_page/3` without `:deadline` used to close nothing when its
+  caller was killed mid-`fun` (an Oban job timeout under `Pool.with_page/3`); a
+  monitor process now closes the page then, as the deadline watchdog already
+  did. A caller that dies while `new_page/2` is in flight still leaves the page,
+  and with `:isolated` its context, until the browser stops.
 
 ## Tests
 

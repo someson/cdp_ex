@@ -6,26 +6,12 @@ benchmark setup unless noted: a 4 vCPU / 16 GB Linux container, Chromium build
 1243 (Playwright's bundle) for both libraries, headless, a local fixture server,
 3 rounds, medians.
 
-## 1. Per-job isolation (browser contexts)
+## 1. Per-job isolation (browser contexts) — done
 
-**Problem.** A pooled browser is reused as is. With a size-1 `CDPEx.Pool`, a
-second `Pool.with_page/3` call saw the first job's cookie and `localStorage`
-entry. `Page.cookies/2` and `Page.clear_cookies/2` are browser-wide
-(`Network.getAllCookies`, `Network.clearBrowserCookies`), and there is no
-built-in way to reset storage. The README warns about this; it doesn't fix it.
-
-**Direction.** Open each page in its own browser context
-(`Target.createBrowserContext`, then `Target.createTarget` with that
-`browserContextId`) and dispose the context
-(`Target.disposeBrowserContext`) when the page closes. Playwright does this:
-each context has its own cookies, storage and cache. Likely an option on
-`new_page/2` and `with_page/3` first, then the default for `Pool.with_page/3`.
-
-**Open questions.** Cost of a context per job (time and memory, to measure);
-how it interacts with the `:dedicated` and `:session` transports and with
-`connect/2`; whether `cookies/2` should become per-context.
-
-Write a design note in `docs/design/` before implementing.
+`isolated: true` on `new_page/2` and `with_page/3`, the default for
+`Pool.with_page/3` (#12). Design and measurements:
+`docs/design/2026-11-05-per-job-isolation.md`. Kept here so the item numbers
+below stay stable.
 
 ## 2. Empty profile dir left by a launch cut short
 

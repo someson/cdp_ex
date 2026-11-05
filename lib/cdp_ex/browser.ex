@@ -124,16 +124,19 @@ defmodule CDPEx.Browser do
   `{:error, {:session_closed, session_id}}` (`:transient`; open a new page).
 
   A browser that is gone, or stops before replying, returns `{:error, :noproc}`. One
-  that can't serve the request within 75s returns `{:error, {:timeout, :new_page}}`;
+  that can't serve the request within 95s returns `{:error, {:timeout, :new_page}}`;
   a page it still opens after that is not handed to anyone and stays open until the
   browser stops, so retrying on the same browser can pile these up — prefer a fresh
   browser (or stop this one) after a timeout.
   """
   @spec new_page(GenServer.server(), keyword()) :: {:ok, Page.t()} | {:error, term()}
-  # The call timeout covers the worst-case internal budget — Target.createTarget
-  # (@create_timeout) + bootstrap (up to ~4 × @bootstrap_timeout) + the proxy-auth arm
-  # (@arm_timeout) — so a stalled stage can't make the caller give up while the Browser is
-  # still working, which would orphan an armed page. Normal new_page returns in well under
+  # The call timeout covers the worst-case internal budget — Target.createBrowserContext
+  # for an isolated page and Target.createTarget (@create_timeout each), the page
+  # socket's WebSocket upgrade (15s, Connection's default) or Target.attachToTarget
+  # (@create_timeout), bootstrap (up to 4 × @bootstrap_timeout) and the proxy-auth arm
+  # (@arm_timeout): 90s on the slowest (dedicated, isolated, proxied) path, plus 5s of
+  # slack — so a stalled stage can't make the caller give up while the Browser is
+  # still working, which would orphan an armed page and its context. Normal new_page returns in well under
   # a second; this is only the pathological ceiling.
   def new_page(browser, opts \\ []) do
     # Validated here, in the caller: a bad option must not crash the Browser.
@@ -142,7 +145,7 @@ defmodule CDPEx.Browser do
       other -> raise ArgumentError, ":isolated must be a boolean, got: #{inspect(other)}"
     end
 
-    call(browser, {:new_page, opts}, 75_000, :new_page)
+    call(browser, {:new_page, opts}, 95_000, :new_page)
   end
 
   @doc """
