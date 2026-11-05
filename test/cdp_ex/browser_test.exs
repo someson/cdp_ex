@@ -411,4 +411,123 @@ defmodule CDPEx.BrowserTest do
 
     fake_chrome_failing_arm(test)
   end
+
+  describe "isolated pages: opening" do
+    test "isolated: true creates a context and opens the target in it (:session)" do
+      {state, conn} = fake_browser_state()
+
+      assert {:reply, {:ok, %Page{target_id: "T1", session_id: "S1"}}, new_state} =
+               new_page_in_task(state, transport: :session, isolated: true)
+
+      assert_receive {:sent, "Target.createBrowserContext", %{"disposeOnDetach" => true}}
+      assert_receive {:sent, "Target.createTarget", %{"browserContextId" => "C1"}}
+      assert new_state.contexts == %{"T1" => "C1"}
+      assert new_state.sessions == %{"T1" => "S1"}
+      Connection.close(conn)
+    end
+
+    test "isolated: true on :dedicated records the context" do
+      {state, conn} = fake_browser_state()
+
+      assert {:reply, {:ok, %Page{target_id: "T1", session_id: nil}}, new_state} =
+               new_page_in_task(state, transport: :dedicated, isolated: true)
+
+      assert_receive {:sent, "Target.createTarget", %{"browserContextId" => "C1"}}
+      assert new_state.contexts == %{"T1" => "C1"}
+      assert Map.has_key?(new_state.pages, "T1")
+      Connection.close(conn)
+    end
+
+    test "a failed createTarget in a new context disposes the context" do
+      {state, conn} = fake_browser_state(%{"Target.createTarget" => :error})
+
+      assert {:reply, {:error, {:cdp_error, "Target.createTarget", _}}, new_state} =
+               new_page_in_task(state, transport: :session, isolated: true)
+
+      assert_receive {:sent, "Target.disposeBrowserContext", %{"browserContextId" => "C1"}}
+      assert new_state.contexts == %{}
+      Connection.close(conn)
+    end
+
+    test "a failed bootstrap disposes the context, not just the target" do
+      {state, conn} = fake_browser_state(%{"Page.enable" => :error})
+
+      assert {:reply, {:error, {:cdp_error, "Page.enable", _}}, new_state} =
+               new_page_in_task(state, transport: :session, isolated: true)
+
+      assert_receive {:sent, "Target.disposeBrowserContext", %{"browserContextId" => "C1"}}
+      refute_received {:sent, "Target.closeTarget", _}
+      assert new_state.contexts == %{}
+      assert new_state.sessions == %{}
+      Connection.close(conn)
+    end
+
+    test "isolated: false and no option send no context command" do
+      {state, conn} = fake_browser_state()
+
+      assert {:reply, {:ok, _}, s1} = new_page_in_task(state, transport: :session, isolated: false)
+      assert {:reply, {:ok, _}, _} = new_page_in_task(s1, transport: :session)
+
+      refute_received {:sent, "Target.createBrowserContext", _}
+      assert_received {:sent, "Target.createTarget", params}
+      refute Map.has_key?(params, "browserContextId")
+      Connection.close(conn)
+    end
+
+    test "a non-boolean :isolated raises ArgumentError in the caller" do
+      assert_raise ArgumentError, ~r/:isolated/, fn -> Browser.new_page(self(), isolated: :yes) end
+    end
+  end
+
+  # A Browser state whose browser_conn talks to a fake Chrome (see fake_chrome/2).
+  defp fake_browser_state(overrides \\ %{}) do
+    test = self()
+    fake = spawn_link(fn -> fake_chrome(test, overrides) end)
+    {:ok, server} = FakeCDP.start(fake)
+    {:ok, conn} = Connection.start_link(server.url)
+    {%Browser{browser_conn: conn, host: "127.0.0.1", port: server.port}, conn}
+  end
+
+  # Runs the blocking new_page handle_call off the test process, which receives the
+  # fake Chrome's {:sent, method, params} reports.
+  defp new_page_in_task(state, opts) do
+    fn -> Browser.handle_call({:new_page, opts}, {self(), make_ref()}, state) end
+    |> Task.async()
+    |> Task.await(30_000)
+  end
+
+  # A fake Chrome that answers every frame (on the browser and any page connection),
+  # reports each as {:sent, method, params} to `test`, and errors the methods named in
+  # `overrides` (method => :error).
+  defp fake_chrome(test, overrides) do
+    receive do
+      {:fake_cdp_recv, fake, %{"id" => id, "method" => method} = frame} ->
+        send(test, {:sent, method, Map.get(frame, "params", %{})})
+
+        reply =
+          case {Map.get(overrides, method), method} do
+            {:error, _} ->
+              ~s({"id":#{id},"error":{"code":-32000,"message":"boom"}})
+
+            {_, "Target.createBrowserContext"} ->
+              ~s({"id":#{id},"result":{"browserContextId":"C1"}})
+
+            {_, "Target.createTarget"} ->
+              ~s({"id":#{id},"result":{"targetId":"T1"}})
+
+            {_, "Target.attachToTarget"} ->
+              ~s({"id":#{id},"result":{"sessionId":"S1"}})
+
+            _ ->
+              ~s({"id":#{id},"result":{}})
+          end
+
+        FakeCDP.send_text(fake, reply)
+
+      {:fake_cdp_connected, _fake} ->
+        :ok
+    end
+
+    fake_chrome(test, overrides)
+  end
 end
