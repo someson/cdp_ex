@@ -2014,6 +2014,156 @@ defmodule CDPEx.IntegrationTest do
     |> map_size() > 0
   end
 
+  describe "isolated pages" do
+    test "a size-1 pool doesn't leak cookies or localStorage between jobs", %{fixture: fixture} do
+      {:ok, pool} = Pool.start_link(size: 1)
+      on_exit(fn -> stop_pool_quietly(pool) end)
+
+      for transport <- [:dedicated, :session] do
+        :ok =
+          Pool.with_page(
+            pool,
+            fn page ->
+              {:ok, _} = Page.navigate(page, fixture)
+              {:ok, _} = Page.evaluate(page, "document.cookie = 'job=1'; localStorage.job = '1'")
+              :ok
+            end,
+            transport: transport
+          )
+
+        seen =
+          Pool.with_page(
+            pool,
+            fn page ->
+              {:ok, _} = Page.navigate(page, fixture)
+              {:ok, cookies} = Page.cookies(page)
+              {:ok, stored} = Page.evaluate(page, "localStorage.job || null")
+              {Enum.map(cookies, & &1["name"]), stored}
+            end,
+            transport: transport
+          )
+
+        assert seen == {[], nil}, "#{transport}: job 2 saw job 1's state: #{inspect(seen)}"
+      end
+    end
+
+    test "isolated: false on the pool shares state as before", %{fixture: fixture} do
+      {:ok, pool} = Pool.start_link(size: 1)
+      on_exit(fn -> stop_pool_quietly(pool) end)
+
+      shared = fn fun ->
+        Pool.with_page(
+          pool,
+          fn page ->
+            {:ok, _} = Page.navigate(page, fixture)
+            fun.(page)
+          end,
+          isolated: false
+        )
+      end
+
+      {:ok, _} = shared.(&Page.evaluate(&1, "document.cookie = 'job=1'"))
+      {:ok, cookies} = shared.(&Page.cookies/1)
+      assert "job" in Enum.map(cookies, & &1["name"])
+    end
+
+    test "clear_cookies on an isolated page leaves the default context alone", %{
+      fixture: fixture
+    } do
+      {:ok, browser} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(browser) end)
+
+      {:ok, plain} = CDPEx.new_page(browser)
+      {:ok, _} = Page.navigate(plain, fixture)
+      {:ok, _} = Page.evaluate(plain, "document.cookie = 'shared=1'")
+
+      {:ok, isolated} = CDPEx.new_page(browser, isolated: true)
+      assert {:ok, []} = Page.cookies(isolated)
+      assert :ok = Page.clear_cookies(isolated)
+
+      {:ok, cookies} = Page.cookies(plain)
+      assert "shared" in Enum.map(cookies, & &1["name"])
+    end
+
+    test "no context is left after close, raise in fun, deadline, or a target closed from outside" do
+      {:ok, browser} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(browser) end)
+
+      for transport <- [:dedicated, :session] do
+        opts = [transport: transport, isolated: true]
+
+        {:ok, page} = CDPEx.new_page(browser, opts)
+        assert contexts(browser) != []
+        :ok = CDPEx.close_page(browser, page)
+        assert eventually(fn -> contexts(browser) == [] end), "#{transport}: close_page"
+
+        assert_raise RuntimeError, fn ->
+          CDPEx.with_page(browser, fn _ -> raise "boom" end, opts)
+        end
+
+        assert eventually(fn -> contexts(browser) == [] end), "#{transport}: raise"
+
+        assert {:error, :deadline_exceeded} =
+                 CDPEx.with_page(browser, fn _ -> Process.sleep(2_000) end, [deadline: 300] ++ opts)
+
+        assert eventually(fn -> contexts(browser) == [] end), "#{transport}: deadline"
+
+        {:ok, page} = CDPEx.new_page(browser, opts)
+        %{browser_conn: conn} = :sys.get_state(browser)
+        {:ok, _} = Connection.call(conn, "Target.closeTarget", %{"targetId" => page.target_id})
+        assert eventually(fn -> contexts(browser) == [] end), "#{transport}: closed from outside"
+        assert eventually(fn -> :sys.get_state(browser).contexts == %{} end)
+      end
+    end
+
+    test "an isolated page works through an authenticated proxy" do
+      {:ok, %{port: proxy_port}} = ProxyAuthServer.start(username: "puser", password: "ppass")
+      {:ok, browser} = CDPEx.launch(proxy: "http://puser:ppass@127.0.0.1:#{proxy_port}")
+      on_exit(fn -> stop_quietly(browser) end)
+
+      {:ok, page} = CDPEx.new_page(browser, isolated: true)
+      assert {:ok, _} = Page.navigate(page, "http://proxied.test/")
+      assert {:ok, "Proxied"} = Page.text(page, "#greeting")
+    end
+
+    test "connect/2 + isolated page, then stop/1, leaves no context on the remote Chrome", %{
+      fixture: fixture
+    } do
+      {:ok, a} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(a) end)
+      %{host: host, port: port} = :sys.get_state(a)
+
+      {:ok, b} = CDPEx.connect("http://#{host}:#{port}")
+      {:ok, page} = CDPEx.new_page(b, isolated: true)
+      {:ok, _} = Page.navigate(page, fixture)
+      assert contexts(a) != []
+
+      assert :ok = CDPEx.stop(b)
+      assert eventually(fn -> contexts(a) == [] end)
+    end
+
+    test "with_page on a throwaway browser accepts isolated: true", %{fixture: fixture} do
+      result =
+        CDPEx.with_page(
+          [],
+          fn page ->
+            {:ok, _} = Page.navigate(page, fixture)
+            Page.text(page, "#greeting")
+          end,
+          isolated: true
+        )
+
+      assert {:ok, "Hello"} = result
+    end
+  end
+
+  # The browser contexts other than the default one, as Chrome reports them.
+  defp contexts(browser) do
+    %{browser_conn: conn} = :sys.get_state(browser)
+    {:ok, %{"browserContextIds" => ids}} = Connection.call(conn, "Target.getBrowserContexts", %{})
+    ids
+  end
+
   defp stop_quietly(browser) do
     if Process.alive?(browser), do: CDPEx.stop(browser)
   catch

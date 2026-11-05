@@ -461,6 +461,11 @@ defmodule CDPEx do
   `{:error, reason}`, never as a raise or an exit. A raise, throw or exit from `fun`
   itself propagates unchanged: that is the caller's code.
 
+  On a browser pid, a caller killed mid-`fun` (a linked crash, an Oban job timeout)
+  still gets its page closed, and an `isolated: true` page's context disposed: a
+  monitor process closes it. A caller that dies while `new_page/2` is still in
+  flight leaves that page open until the browser stops.
+
   With launch options, the throwaway browser is linked but **contained**: if it
   fails to start, or crashes during the call (e.g. its connection drops),
   `with_page` returns `{:error, reason}` instead of letting the exit propagate to
@@ -562,7 +567,7 @@ defmodule CDPEx do
   def with_page(browser, fun, opts) when is_pid(browser) and is_function(fun, 1) do
     case pop_deadline(opts) do
       {nil, opts} ->
-        run_page(browser, fun, opts, nil)
+        run_guarded(browser, fun, opts)
 
       {deadline, opts} ->
         deadline_at = now_ms() + deadline
@@ -631,6 +636,39 @@ defmodule CDPEx do
       {ref, :expired}
     else
       open_and_run(browser, fun, opts, watch)
+    end
+  end
+
+  # A caller-owned browser outlives the caller, so if the caller dies mid-`fun` (an
+  # Oban timeout, a linked crash) nothing would close the page — or dispose its
+  # isolated context. A guard process closes it then, as the deadline watchdog does
+  # when there is a :deadline. A caller that dies while new_page/2 is in flight still
+  # leaves that page open, as with a deadline.
+  defp run_guarded(browser, fun, opts) do
+    case new_page(browser, opts) do
+      {:ok, page} ->
+        ref = make_ref()
+        caller = self()
+        guard = spawn(fn -> guard_page(caller, ref, browser, page) end)
+
+        try do
+          fun.(page)
+        after
+          stop_watchdog(guard, ref)
+          safe(fn -> close_page(browser, page) end)
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp guard_page(caller, ref, browser, page) do
+    caller_mon = Process.monitor(caller)
+
+    receive do
+      {:cancel, ^ref} -> :ok
+      {:DOWN, ^caller_mon, :process, _, _} -> safe(fn -> close_page(browser, page) end)
     end
   end
 

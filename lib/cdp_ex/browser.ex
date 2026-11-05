@@ -57,6 +57,9 @@ defmodule CDPEx.Browser do
     connected: false,
     pages: %{},
     sessions: %{},
+    # target_id => browserContextId for pages opened with `isolated: true`; the
+    # context is disposed (closing its target) when the page ends.
+    contexts: %{},
     auths: %{},
     intercepts: %{},
     pending_auth: %{}
@@ -113,23 +116,37 @@ defmodule CDPEx.Browser do
       `{:error, {:unsupported_transport, :dedicated}}`. Any other value returns
       `{:error, {:invalid_transport, value}}`.
     * `:prevent_alerts` — inject no-op `alert`/`confirm`/`prompt` (default `true`)
+    * `:isolated` — `true` opens the page in a new browser context (its own cookies,
+      storage and cache), disposed when the page closes. Default `false`. A value that
+      isn't a boolean raises `ArgumentError`.
 
   A `:session` page whose target goes away while it is being set up returns
   `{:error, {:session_closed, session_id}}` (`:transient`; open a new page).
 
   A browser that is gone, or stops before replying, returns `{:error, :noproc}`. One
-  that can't serve the request within 75s returns `{:error, {:timeout, :new_page}}`;
+  that can't serve the request within 95s returns `{:error, {:timeout, :new_page}}`;
   a page it still opens after that is not handed to anyone and stays open until the
   browser stops, so retrying on the same browser can pile these up — prefer a fresh
   browser (or stop this one) after a timeout.
   """
   @spec new_page(GenServer.server(), keyword()) :: {:ok, Page.t()} | {:error, term()}
-  # The call timeout covers the worst-case internal budget — Target.createTarget
-  # (@create_timeout) + bootstrap (up to ~4 × @bootstrap_timeout) + the proxy-auth arm
-  # (@arm_timeout) — so a stalled stage can't make the caller give up while the Browser is
-  # still working, which would orphan an armed page. Normal new_page returns in well under
+  # The call timeout covers the worst-case internal budget — Target.createBrowserContext
+  # for an isolated page and Target.createTarget (@create_timeout each), the page
+  # socket's WebSocket upgrade (15s, Connection's default) or Target.attachToTarget
+  # (@create_timeout), bootstrap (up to 4 × @bootstrap_timeout) and the proxy-auth arm
+  # (@arm_timeout): 90s on the slowest (dedicated, isolated, proxied) path, plus 5s of
+  # slack — so a stalled stage can't make the caller give up while the Browser is
+  # still working, which would orphan an armed page and its context. Normal new_page returns in well under
   # a second; this is only the pathological ceiling.
-  def new_page(browser, opts \\ []), do: call(browser, {:new_page, opts}, 75_000, :new_page)
+  def new_page(browser, opts \\ []) do
+    # Validated here, in the caller: a bad option must not crash the Browser.
+    case Keyword.get(opts, :isolated, false) do
+      isolated when is_boolean(isolated) -> :ok
+      other -> raise ArgumentError, ":isolated must be a boolean, got: #{inspect(other)}"
+    end
+
+    call(browser, {:new_page, opts}, 95_000, :new_page)
+  end
 
   @doc """
   Closes a page opened with `new_page/2`.
@@ -410,9 +427,10 @@ defmodule CDPEx.Browser do
       ^sid ->
         # The page rides the shared browser connection; detach the session and
         # close the tab, but NEVER close that connection (other sessions use it).
+        isolated = Map.has_key?(state.contexts, tid)
         detach_session(state.browser_conn, sid)
-        close_target(state.browser_conn, tid)
-        Telemetry.page(:stop, %{target_id: tid, transport: :session})
+        state = end_target(state, tid)
+        Telemetry.page(:stop, %{target_id: tid, transport: :session, isolated: isolated})
         {:reply, :ok, %{state | sessions: Map.delete(state.sessions, tid)}}
 
       _ ->
@@ -426,9 +444,10 @@ defmodule CDPEx.Browser do
         # Close the target on the browser connection first (a page connection can't
         # cleanly close its own target), then stop the page connection — best-effort,
         # since either may already be gone.
-        close_target(state.browser_conn, tid)
+        isolated = Map.has_key?(state.contexts, tid)
+        state = end_target(state, tid)
         safe_close(conn)
-        Telemetry.page(:stop, %{target_id: tid, transport: :dedicated})
+        Telemetry.page(:stop, %{target_id: tid, transport: :dedicated, isolated: isolated})
         {:reply, :ok, %{state | pages: Map.delete(state.pages, tid)}}
 
       _ ->
@@ -582,6 +601,14 @@ defmodule CDPEx.Browser do
           %{state | pending_auth: pending_auth}
       end
 
+    # A page connection that went away on its own (tab crashed or closed from outside)
+    # takes its isolated context with it.
+    state =
+      case Enum.find(state.pages, fn {_tid, conn} -> conn == pid end) do
+        {tid, _conn} -> drop_context(state, tid)
+        nil -> state
+      end
+
     {:noreply, %{state | pages: drop_conn(state.pages, pid), auths: drop_value(state.auths, pid)}}
   end
 
@@ -592,7 +619,10 @@ defmodule CDPEx.Browser do
     # A flattened session ended. Drop its entry so it doesn't linger for the life
     # of the browser. Idempotent: our own close_page may have removed it already,
     # and a targetId we don't track is simply a no-op delete.
-    {:noreply, %{state | sessions: Map.delete(state.sessions, params["targetId"])}}
+    # An isolated page's context goes with it.
+    tid = params["targetId"]
+    state = drop_context(state, tid)
+    {:noreply, %{state | sessions: Map.delete(state.sessions, tid)}}
   end
 
   def handle_info({:armed, pid}, state) do
@@ -722,8 +752,9 @@ defmodule CDPEx.Browser do
         # Connect-mode: we don't own Chrome, so closing the socket wouldn't reap the
         # tabs we opened. Close just OUR targets (best-effort; close_target tolerates
         # a dead conn), leaving Chrome and any pre-existing tabs untouched.
-        Enum.each(state.sessions, fn {tid, _sid} -> close_target(state.browser_conn, tid) end)
-        Enum.each(state.pages, fn {tid, _conn} -> close_target(state.browser_conn, tid) end)
+        Enum.each(Map.keys(state.sessions) ++ Map.keys(state.pages), fn tid ->
+          discard_target(state.browser_conn, tid, Map.get(state.contexts, tid))
+        end)
       end
 
     Enum.each(state.pages, fn {_tid, conn} -> safe_close(conn) end)
@@ -745,9 +776,18 @@ defmodule CDPEx.Browser do
 
   defp reply_dedicated_page(state, opts) do
     case open_page(state, opts) do
-      {:ok, page} ->
-        Telemetry.page(:start, %{target_id: page.target_id, transport: :dedicated})
-        state = %{state | pages: Map.put(state.pages, page.target_id, page.conn)}
+      {:ok, page, context_id} ->
+        Telemetry.page(:start, %{
+          target_id: page.target_id,
+          transport: :dedicated,
+          isolated: context_id != nil
+        })
+
+        state = %{
+          state
+          | pages: Map.put(state.pages, page.target_id, page.conn),
+            contexts: put_context(state.contexts, page.target_id, context_id)
+        }
 
         case state.proxy_auth do
           nil -> {:reply, {:ok, page}, state}
@@ -797,7 +837,7 @@ defmodule CDPEx.Browser do
   # already be gone). Returns the updated state for the {:reply, …} tuple.
   defp close_failed_auth_page(state, tid, conn) do
     safe_close(conn)
-    close_target(state.browser_conn, tid)
+    state = end_target(state, tid)
     %{state | pages: Map.delete(state.pages, tid)}
   end
 
@@ -827,10 +867,16 @@ defmodule CDPEx.Browser do
 
   defp reply_session_page(state, opts) do
     case open_session_page(state, opts) do
-      {:ok, page} ->
-        Telemetry.page(:start, %{target_id: page.target_id, transport: :session})
+      {:ok, page, context_id} ->
+        Telemetry.page(:start, %{
+          target_id: page.target_id,
+          transport: :session,
+          isolated: context_id != nil
+        })
+
         sessions = Map.put(state.sessions, page.target_id, page.session_id)
-        {:reply, {:ok, page}, %{state | sessions: sessions}}
+        contexts = put_context(state.contexts, page.target_id, context_id)
+        {:reply, {:ok, page}, %{state | sessions: sessions, contexts: contexts}}
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}
@@ -838,37 +884,70 @@ defmodule CDPEx.Browser do
   end
 
   defp open_page(state, opts) do
-    case Connection.call(
-           state.browser_conn,
-           "Target.createTarget",
-           %{"url" => "about:blank"},
-           @create_timeout
-         ) do
-      {:ok, %{"targetId" => tid}} -> open_target(state, tid, opts)
-      {:error, reason} -> {:error, reason}
+    with {:ok, context_id} <- maybe_create_context(state.browser_conn, opts),
+         {:ok, tid} <- create_target(state.browser_conn, context_id) do
+      open_target(state, tid, context_id, opts)
+    end
+  end
+
+  # `isolated: true` → a fresh browser context for the page; otherwise nil (the
+  # browser's default context). `disposeOnDetach` makes Chrome dispose it if the
+  # browser connection drops, so a VM that dies without terminate/2 (connect-mode)
+  # doesn't leave it behind on a Chrome it doesn't own.
+  defp maybe_create_context(browser_conn, opts) do
+    if Keyword.get(opts, :isolated, false) do
+      case Connection.call(
+             browser_conn,
+             "Target.createBrowserContext",
+             %{"disposeOnDetach" => true},
+             @create_timeout
+           ) do
+        {:ok, %{"browserContextId" => context_id}} -> {:ok, context_id}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:ok, nil}
+    end
+  end
+
+  # Creates the page's target, in `context_id` when given. A failure disposes that
+  # context: nothing else references it yet.
+  defp create_target(browser_conn, context_id) do
+    params =
+      if context_id,
+        do: %{"url" => "about:blank", "browserContextId" => context_id},
+        else: %{"url" => "about:blank"}
+
+    case Connection.call(browser_conn, "Target.createTarget", params, @create_timeout) do
+      {:ok, %{"targetId" => tid}} ->
+        {:ok, tid}
+
+      {:error, reason} ->
+        if context_id, do: dispose_context(browser_conn, context_id)
+        {:error, reason}
     end
   end
 
   # The target exists now, so any failure past this point must close it (and the
   # page connection, if opened) — otherwise we leak a Chrome tab/socket that
   # isn't tracked in state.pages and can't be cleaned up deterministically.
-  defp open_target(state, tid, opts) do
+  defp open_target(state, tid, context_id, opts) do
     page_url = "ws://#{Protocol.bracket_host(state.host)}:#{state.port}/devtools/page/#{tid}"
 
     case Connection.start_link(page_url) do
       {:ok, conn} ->
         case bootstrap_page(conn, opts) do
           :ok ->
-            {:ok, %Page{browser: self(), conn: conn, target_id: tid}}
+            {:ok, %Page{browser: self(), conn: conn, target_id: tid}, context_id}
 
           {:error, reason} ->
             safe_close(conn)
-            close_target(state.browser_conn, tid)
+            discard_target(state.browser_conn, tid, context_id)
             {:error, reason}
         end
 
       {:error, reason} ->
-        close_target(state.browser_conn, tid)
+        discard_target(state.browser_conn, tid, context_id)
         {:error, reason}
     end
   end
@@ -878,18 +957,13 @@ defmodule CDPEx.Browser do
   # bootstrap it over that shared connection. On any failure NEVER `safe_close`
   # browser_conn — it is shared by every other session.
   defp open_session_page(state, opts) do
-    case Connection.call(
-           state.browser_conn,
-           "Target.createTarget",
-           %{"url" => "about:blank"},
-           @create_timeout
-         ) do
-      {:ok, %{"targetId" => tid}} -> attach_session(state, tid, opts)
-      {:error, reason} -> {:error, reason}
+    with {:ok, context_id} <- maybe_create_context(state.browser_conn, opts),
+         {:ok, tid} <- create_target(state.browser_conn, context_id) do
+      attach_session(state, tid, context_id, opts)
     end
   end
 
-  defp attach_session(state, tid, opts) do
+  defp attach_session(state, tid, context_id, opts) do
     case Connection.call(
            state.browser_conn,
            "Target.attachToTarget",
@@ -899,16 +973,17 @@ defmodule CDPEx.Browser do
       {:ok, %{"sessionId" => sid}} ->
         case bootstrap_page(state.browser_conn, sid, opts) do
           :ok ->
-            {:ok, %Page{browser: self(), conn: state.browser_conn, target_id: tid, session_id: sid}}
+            page = %Page{browser: self(), conn: state.browser_conn, target_id: tid, session_id: sid}
+            {:ok, page, context_id}
 
           {:error, reason} ->
             detach_session(state.browser_conn, sid)
-            close_target(state.browser_conn, tid)
+            discard_target(state.browser_conn, tid, context_id)
             {:error, reason}
         end
 
       {:error, reason} ->
-        close_target(state.browser_conn, tid)
+        discard_target(state.browser_conn, tid, context_id)
         {:error, reason}
     end
   end
@@ -978,6 +1053,46 @@ defmodule CDPEx.Browser do
     _ = Connection.call(browser_conn, "Target.closeTarget", %{"targetId" => tid}, @create_timeout)
     :ok
   end
+
+  # Ends a target we opened: disposing its own context closes it too; a target in
+  # the default context is closed directly. Best-effort, like close_target/2.
+  defp discard_target(browser_conn, _tid, context_id) when is_binary(context_id),
+    do: dispose_context(browser_conn, context_id)
+
+  defp discard_target(browser_conn, tid, nil), do: close_target(browser_conn, tid)
+
+  defp dispose_context(browser_conn, context_id) do
+    _ =
+      Connection.call(
+        browser_conn,
+        "Target.disposeBrowserContext",
+        %{"browserContextId" => context_id},
+        @create_timeout
+      )
+
+    :ok
+  end
+
+  # Ends one of our pages' targets (see discard_target/3) and forgets its context.
+  defp end_target(state, tid) do
+    discard_target(state.browser_conn, tid, Map.get(state.contexts, tid))
+    %{state | contexts: Map.delete(state.contexts, tid)}
+  end
+
+  # The page's target is already gone: dispose its context, if it had one.
+  defp drop_context(state, tid) do
+    case Map.pop(state.contexts, tid) do
+      {nil, _} ->
+        state
+
+      {context_id, contexts} ->
+        dispose_context(state.browser_conn, context_id)
+        %{state | contexts: contexts}
+    end
+  end
+
+  defp put_context(contexts, _tid, nil), do: contexts
+  defp put_context(contexts, tid, context_id), do: Map.put(contexts, tid, context_id)
 
   # Stop a page connection from teardown, where nothing may raise or exit.
   # `Connection.close/1` is already `:ok` on a gone process; the rescue and catch are

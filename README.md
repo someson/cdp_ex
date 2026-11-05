@@ -231,13 +231,16 @@ stays responsive during a cold start and warms multiple browsers concurrently
 under load. A caller that crashes returns its browser automatically, and a
 crashed browser is relaunched on demand.
 
-> #### Borrowers share browser state {: .warning}
+Each `CDPEx.Pool.with_page/3` job runs in its own browser context: the cookies,
+`localStorage` and cache one job leaves are gone for the next, and the context
+is disposed with the page. Pass `isolated: false` to share the browser's default
+context across jobs, for example to keep a login between calls.
+
+> #### `with_browser/3` and `checkout/2` don't isolate {: .warning}
 >
-> A pooled browser is reused as is: the next borrower sees the cookies,
-> `localStorage` and cache the previous one left, including a logged-in
-> session. `CDPEx.Page.clear_cookies/2` clears the browser's cookies; storage has
-> no built-in reset, so clear it with `CDPEx.Page.evaluate/3` on the origins you
-> use, or give jobs that must not share state their own browser.
+> A browser borrowed with `with_browser/3` or `checkout/2` is reused as is. Open
+> its pages with `isolated: true` (`CDPEx.new_page/2`, `CDPEx.with_page/3`) to
+> keep jobs apart.
 
 ## Page operations
 
@@ -264,7 +267,7 @@ crashed browser is relaunched on demand.
 | `set_user_agent/3` | Override the UA string, with optional Client-Hints metadata + `Accept-Language` |
 | `set_extra_headers/3` | Extra HTTP headers on every later request from the page |
 | `set_viewport/4` | Override the viewport size (and device scale factor) |
-| `cookies/2` / `set_cookies/3` / `clear_cookies/2` | Read, set, or clear the browser's cookies (browser-wide, not per page) |
+| `cookies/2` / `set_cookies/3` / `clear_cookies/2` | Read, set, or clear the cookies of the page's browser context (browser-wide for a page that isn't isolated) |
 | `observe_network/2` / `stop_observing_network/2` | Stream `Network` request/response events to the caller, or stop |
 | `response_body/3` | Fetch a response body by requestId (`Network.getResponseBody`) |
 | `enable_request_interception/2` / `disable_request_interception/2` | Pause matching requests for the caller to resolve, or stop |

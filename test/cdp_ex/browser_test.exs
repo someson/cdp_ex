@@ -411,4 +411,260 @@ defmodule CDPEx.BrowserTest do
 
     fake_chrome_failing_arm(test)
   end
+
+  describe "isolated pages: opening" do
+    test "isolated: true creates a context and opens the target in it (:session)" do
+      {state, conn} = fake_browser_state()
+
+      assert {:reply, {:ok, %Page{target_id: "T1", session_id: "S1"}}, new_state} =
+               new_page_in_task(state, transport: :session, isolated: true)
+
+      assert_receive {:sent, "Target.createBrowserContext", %{"disposeOnDetach" => true}}
+      assert_receive {:sent, "Target.createTarget", %{"browserContextId" => "C1"}}
+      assert new_state.contexts == %{"T1" => "C1"}
+      assert new_state.sessions == %{"T1" => "S1"}
+      Connection.close(conn)
+    end
+
+    test "isolated: true on :dedicated records the context" do
+      {state, conn} = fake_browser_state()
+
+      assert {:reply, {:ok, %Page{target_id: "T1", session_id: nil}}, new_state} =
+               new_page_in_task(state, transport: :dedicated, isolated: true)
+
+      assert_receive {:sent, "Target.createTarget", %{"browserContextId" => "C1"}}
+      assert new_state.contexts == %{"T1" => "C1"}
+      assert Map.has_key?(new_state.pages, "T1")
+      Connection.close(conn)
+    end
+
+    test "a failed createTarget in a new context disposes the context" do
+      {state, conn} = fake_browser_state(%{"Target.createTarget" => :error})
+
+      assert {:reply, {:error, {:cdp_error, "Target.createTarget", _}}, new_state} =
+               new_page_in_task(state, transport: :session, isolated: true)
+
+      assert_receive {:sent, "Target.disposeBrowserContext", %{"browserContextId" => "C1"}}
+      assert new_state.contexts == %{}
+      Connection.close(conn)
+    end
+
+    test "a failed bootstrap disposes the context, not just the target" do
+      {state, conn} = fake_browser_state(%{"Page.enable" => :error})
+
+      assert {:reply, {:error, {:cdp_error, "Page.enable", _}}, new_state} =
+               new_page_in_task(state, transport: :session, isolated: true)
+
+      assert_receive {:sent, "Target.disposeBrowserContext", %{"browserContextId" => "C1"}}
+      refute_received {:sent, "Target.closeTarget", _}
+      assert new_state.contexts == %{}
+      assert new_state.sessions == %{}
+      Connection.close(conn)
+    end
+
+    test "isolated: false and no option send no context command" do
+      {state, conn} = fake_browser_state()
+
+      assert {:reply, {:ok, _}, s1} = new_page_in_task(state, transport: :session, isolated: false)
+      assert {:reply, {:ok, _}, _} = new_page_in_task(s1, transport: :session)
+
+      refute_received {:sent, "Target.createBrowserContext", _}
+      assert_received {:sent, "Target.createTarget", params}
+      refute Map.has_key?(params, "browserContextId")
+      Connection.close(conn)
+    end
+
+    test "a non-boolean :isolated raises ArgumentError in the caller" do
+      assert_raise ArgumentError, ~r/:isolated/, fn -> Browser.new_page(self(), isolated: :yes) end
+    end
+  end
+
+  describe "isolated pages: disposing" do
+    test "close_page on an isolated session page disposes its context instead of closeTarget" do
+      {state, conn} = fake_browser_state()
+      state = %{state | sessions: %{"T1" => "S1"}, contexts: %{"T1" => "C1"}}
+      page = %Page{browser: self(), conn: conn, target_id: "T1", session_id: "S1"}
+
+      assert {:reply, :ok, new_state} = call_in_task(state, {:close_page, page})
+
+      assert_receive {:sent, "Target.detachFromTarget", %{"sessionId" => "S1"}}
+      assert_receive {:sent, "Target.disposeBrowserContext", %{"browserContextId" => "C1"}}
+      refute_received {:sent, "Target.closeTarget", _}
+      assert new_state.contexts == %{}
+      assert new_state.sessions == %{}
+      Connection.close(conn)
+    end
+
+    test "close_page on an isolated dedicated page disposes its context" do
+      {state, conn} = fake_browser_state()
+      {:ok, page_conn} = Connection.start_link("ws://127.0.0.1:#{state.port}/devtools/page/T1")
+      state = %{state | pages: %{"T1" => page_conn}, contexts: %{"T1" => "C1"}}
+      page = %Page{browser: self(), conn: page_conn, target_id: "T1"}
+
+      assert {:reply, :ok, new_state} = call_in_task(state, {:close_page, page})
+
+      assert_receive {:sent, "Target.disposeBrowserContext", %{"browserContextId" => "C1"}}
+      refute_received {:sent, "Target.closeTarget", _}
+      assert new_state.contexts == %{}
+      assert new_state.pages == %{}
+      Connection.close(conn)
+    end
+
+    test "a second close of an isolated page is :unknown_page and sends nothing" do
+      {state, conn} = fake_browser_state()
+      state = %{state | sessions: %{"T1" => "S1"}, contexts: %{"T1" => "C1"}}
+      page = %Page{browser: self(), conn: conn, target_id: "T1", session_id: "S1"}
+
+      assert {:reply, :ok, closed} = call_in_task(state, {:close_page, page})
+      assert_receive {:sent, "Target.disposeBrowserContext", _}
+
+      assert {:reply, {:error, :unknown_page}, ^closed} = call_in_task(closed, {:close_page, page})
+      refute_receive {:sent, "Target.disposeBrowserContext", _}, 200
+      Connection.close(conn)
+    end
+
+    test "page-conn EXIT disposes the page's context" do
+      {state, conn} = fake_browser_state()
+      page_conn = spawn(fn -> :ok end)
+      state = %{state | pages: %{"T1" => page_conn}, contexts: %{"T1" => "C1"}}
+
+      assert {:noreply, new_state} = info_in_task(state, {:EXIT, page_conn, :boom})
+
+      assert_receive {:sent, "Target.disposeBrowserContext", %{"browserContextId" => "C1"}}
+      assert new_state.contexts == %{}
+      assert new_state.pages == %{}
+      Connection.close(conn)
+    end
+
+    test "Target.detachedFromTarget disposes the session page's context" do
+      {state, conn} = fake_browser_state()
+      state = %{state | sessions: %{"T1" => "S1"}, contexts: %{"T1" => "C1"}}
+
+      event =
+        {:cdp_event, conn, "Target.detachedFromTarget", %{"sessionId" => "S1", "targetId" => "T1"},
+         nil}
+
+      assert {:noreply, new_state} = info_in_task(state, event)
+
+      assert_receive {:sent, "Target.disposeBrowserContext", %{"browserContextId" => "C1"}}
+      assert new_state.contexts == %{}
+      Connection.close(conn)
+    end
+
+    test "a failed proxy-auth arm disposes the context" do
+      {state, conn} = fake_browser_state(%{"Fetch.enable" => :error})
+      state = %{state | proxy_auth: %{username: "u", password: "p"}}
+
+      capture_log(fn ->
+        assert {:reply, {:error, {:cdp_error, "Fetch.enable", _}}, new_state} =
+                 new_page_in_task(state, transport: :dedicated, isolated: true)
+
+        assert_receive {:sent, "Target.disposeBrowserContext", %{"browserContextId" => "C1"}}, 1_000
+        assert new_state.contexts == %{}
+        assert new_state.pages == %{}
+      end)
+
+      Connection.close(conn)
+    end
+
+    test "terminate/2 on a connected browser disposes its contexts" do
+      {state, _conn} = fake_browser_state()
+      state = %{state | connected: true, sessions: %{"T1" => "S1"}, contexts: %{"T1" => "C1"}}
+
+      assert :ok = Task.await(Task.async(fn -> Browser.terminate(:normal, state) end), 30_000)
+      assert_receive {:sent, "Target.disposeBrowserContext", %{"browserContextId" => "C1"}}
+    end
+  end
+
+  describe "isolated pages: telemetry" do
+    test "page start/stop metadata carries isolated" do
+      handler = "isolated-telemetry-#{inspect(self())}"
+      test = self()
+
+      :telemetry.attach_many(
+        handler,
+        [[:cdp_ex, :page, :start], [:cdp_ex, :page, :stop]],
+        &__MODULE__.forward_telemetry/4,
+        test
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+      {state, conn} = fake_browser_state()
+
+      assert {:reply, {:ok, page}, opened} =
+               new_page_in_task(state, transport: :session, isolated: true)
+
+      assert_receive {:telemetry, [:cdp_ex, :page, :start], %{isolated: true}}
+      assert {:reply, :ok, _} = call_in_task(opened, {:close_page, page})
+      assert_receive {:telemetry, [:cdp_ex, :page, :stop], %{isolated: true}}
+
+      assert {:reply, {:ok, _}, _} = new_page_in_task(state, transport: :session)
+      assert_receive {:telemetry, [:cdp_ex, :page, :start], %{isolated: false}}
+      Connection.close(conn)
+    end
+  end
+
+  def forward_telemetry(event, _measurements, meta, test), do: send(test, {:telemetry, event, meta})
+
+  defp call_in_task(state, request) do
+    fn -> Browser.handle_call(request, {self(), make_ref()}, state) end
+    |> Task.async()
+    |> Task.await(30_000)
+  end
+
+  defp info_in_task(state, msg) do
+    fn -> Browser.handle_info(msg, state) end |> Task.async() |> Task.await(30_000)
+  end
+
+  # A Browser state whose browser_conn talks to a fake Chrome (see fake_chrome/2).
+  defp fake_browser_state(overrides \\ %{}) do
+    test = self()
+    fake = spawn_link(fn -> fake_chrome(test, overrides) end)
+    {:ok, server} = FakeCDP.start(fake)
+    {:ok, conn} = Connection.start_link(server.url)
+    {%Browser{browser_conn: conn, host: "127.0.0.1", port: server.port}, conn}
+  end
+
+  # Runs the blocking new_page handle_call off the test process, which receives the
+  # fake Chrome's {:sent, method, params} reports.
+  defp new_page_in_task(state, opts) do
+    fn -> Browser.handle_call({:new_page, opts}, {self(), make_ref()}, state) end
+    |> Task.async()
+    |> Task.await(30_000)
+  end
+
+  # A fake Chrome that answers every frame (on the browser and any page connection),
+  # reports each as {:sent, method, params} to `test`, and errors the methods named in
+  # `overrides` (method => :error).
+  defp fake_chrome(test, overrides) do
+    receive do
+      {:fake_cdp_recv, fake, %{"id" => id, "method" => method} = frame} ->
+        send(test, {:sent, method, Map.get(frame, "params", %{})})
+
+        reply =
+          case {Map.get(overrides, method), method} do
+            {:error, _} ->
+              ~s({"id":#{id},"error":{"code":-32000,"message":"boom"}})
+
+            {_, "Target.createBrowserContext"} ->
+              ~s({"id":#{id},"result":{"browserContextId":"C1"}})
+
+            {_, "Target.createTarget"} ->
+              ~s({"id":#{id},"result":{"targetId":"T1"}})
+
+            {_, "Target.attachToTarget"} ->
+              ~s({"id":#{id},"result":{"sessionId":"S1"}})
+
+            _ ->
+              ~s({"id":#{id},"result":{}})
+          end
+
+        FakeCDP.send_text(fake, reply)
+
+      {:fake_cdp_connected, _fake} ->
+        :ok
+    end
+
+    fake_chrome(test, overrides)
+  end
 end

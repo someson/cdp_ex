@@ -142,6 +142,12 @@ defmodule CDPEx.Pool do
   returning the browser afterwards. The pooled counterpart of `CDPEx.with_page/3`
   — it reuses a warm browser instead of launching one per call.
 
+  Each call runs in its own browser context (`isolated: true`, see
+  `CDPEx.Browser.new_page/2`): cookies, `localStorage` and cache set by one job
+  are gone for the next, and the context is disposed with the page. Pass
+  `isolated: false` to share the browser's default context across jobs (a login
+  kept between calls, say).
+
   `opts` are forwarded to `CDPEx.with_page/3` (e.g. `:prevent_alerts`, or
   `:deadline`, which closes the page — not the pooled browser — and whose clock
   starts after checkout, so it doesn't cover the wait for a free browser); pass
@@ -157,6 +163,7 @@ defmodule CDPEx.Pool do
         when result: var
   def with_page(pool, fun, opts \\ []) when is_function(fun, 1) do
     {timeout, page_opts} = Keyword.pop(opts, :checkout_timeout, @default_checkout_timeout)
+    page_opts = Keyword.put_new(page_opts, :isolated, true)
     with_browser(pool, fn browser -> CDPEx.with_page(browser, fun, page_opts) end, timeout)
   end
 
