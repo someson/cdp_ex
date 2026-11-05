@@ -61,13 +61,14 @@ the transport.
   13.9 jobs/s, 27 vs 29 Chrome processes). Weak evidence; re-measure on top
   of `--disable-field-trial-config` before adding it.
 
-## 5. Keep the benchmark reproducible
+## 5. Keep the benchmark reproducible — done
 
-The numbers in `CHANGELOG.md` and the PR descriptions came from a harness that
-isn't in this repository: a Node fixture server, matching CDPEx and Playwright
-scenario scripts, and a runner that samples PSS and CPU from `/proc`. Add it
-under `bench/` (outside the Hex package) with a short README, so a change can
-be checked against the same scenarios.
+`bench/` (see `bench/README.md`): a Node fixture server, matching CDPEx and
+Playwright scenarios (`cold`, `spa`, `concurrent`), a `/proc` sampler for
+Chrome's PSS and CPU, and `bench/docker.sh` for the reference setup (Ubuntu
+26.04 container, 4 CPUs, Playwright's Chromium for both libraries). The original
+harness was not recovered, so this one is a rebuild: its absolute numbers differ
+from the ones in `CHANGELOG.md` up to #13.
 
 ## 6. Upstream
 
