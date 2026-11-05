@@ -359,7 +359,7 @@ defmodule CDPEx.ChromeTest do
   # The OS pid of a process that has run and exited (and been reaped), so `kill -0`
   # reports it gone until the OS reuses the pid.
   defp dead_os_pid do
-    port = Port.open({:spawn_executable, "/bin/true"}, [:exit_status])
+    port = Port.open({:spawn_executable, System.find_executable("true")}, [:exit_status])
     {:os_pid, os_pid} = Port.info(port, :os_pid)
     assert_receive {^port, {:exit_status, 0}}, 5_000
     refute match?({_, 0}, System.cmd("kill", ["-0", to_string(os_pid)], stderr_to_stdout: true))
