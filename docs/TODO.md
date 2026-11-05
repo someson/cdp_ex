@@ -51,15 +51,35 @@ small (about 15 ms on Linux, none on macOS); the stronger reason to use it is
 that no DevTools TCP port is opened. The rest of the gap to Playwright is not in
 the transport.
 
-## 4. Default flags: what hasn't been measured
+## 4. Default flags — done
 
-- `--disable-field-trial-config` (on by default since #1) was measured on
-  Chromium only. Branded Google Chrome stable doesn't apply the field-trial
-  testing config, so the flag should be close to a no-op there. Confirm.
-- `--disable-component-extensions-with-background-pages` was the only other
-  flag with a visible effect in the bisection (8 concurrent pages: 15.2 vs
-  13.9 jobs/s, 27 vs 29 Chrome processes). Weak evidence; re-measure on top
-  of `--disable-field-trial-config` before adding it.
+Both measured (2026-11-05); the second is now a default (#15).
+
+- `--disable-field-trial-config` is a no-op on branded Google Chrome, as
+  expected. Read from `chrome://version/?show-variations-cmd` with and without
+  the flag (2026-11-05):
+
+  | Browser | Forced field-trial tokens, with / without | Enabled features, with / without |
+  |---------|------------------|------------------|
+  | Google Chrome 156, macOS arm64 | 4 / 4 | 1 / 1 |
+  | Google Chrome 157, Linux amd64 (`test/docker` `chrome`) | 4 / 4 | 1 / 1 |
+  | Chrome for Testing 156, Linux arm64 (`test/docker` `chromium`) | 2 / 1131 | 1 / 632 |
+
+  Keep it: it only changes builds that apply the testing config.
+- `--disable-component-extensions-with-background-pages`, re-measured on top of
+  `--disable-field-trial-config` with `bench/docker.sh` (Chrome for Testing 156,
+  4 CPUs), 5 alternating pairs of runs, medians:
+
+  | Scenario | Without | With |
+  |----------|---------|------|
+  | `cold` p50 | 255 ms, 376 MB, 11 procs | 247 ms, 363 MB, 10 procs |
+  | `concurrent` | 23.9 jobs/s, 500 MB, 17 procs | 24.5 jobs/s, 501 MB, 16 procs |
+
+  One Chrome process fewer at every cold start (and at peak in 4 of 5 loaded
+  runs), and about 13 MB less at cold start.
+  Throughput and peak memory under load are within run-to-run noise (22.4–25.2
+  vs 23.0–25.7 jobs/s). Playwright passes it by default (playwright-core 1.64.1).
+  Added as a default.
 
 ## 5. Keep the benchmark reproducible — done
 

@@ -89,7 +89,9 @@ stable on Linux (Ubuntu 24.04). The defaults target Linux containers:
 by default, so headless Chrome starts out of the box on a constrained host (e.g.
 2 vCPU / 2 GB). `--disable-field-trial-config` is on by default too: it keeps
 Chromium and Chrome for Testing builds from switching on experimental features,
-which cut Chrome's memory by about 30% with 8 concurrent pages. A few things
+which cut Chrome's memory by about 30% with 8 concurrent pages, and
+`--disable-component-extensions-with-background-pages` saves one Chrome process
+per browser. A few things
 smooth the path further:
 
 - **Tune `:launch_timeout` for cold starts.** Chrome's first launch in a fresh

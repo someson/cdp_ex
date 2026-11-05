@@ -50,7 +50,9 @@ defmodule CDPEx.Chrome do
   Defaults are deliberately neutral (stability + headless), not scraping-tuned.
   They include `--disable-field-trial-config`, so a Chromium or Chrome for Testing
   build runs without the experimental features its bundled field-trial testing
-  config would otherwise turn on (the same default Puppeteer and Playwright use).
+  config would otherwise turn on (the same default Puppeteer and Playwright use),
+  and `--disable-component-extensions-with-background-pages`, so built-in
+  extensions don't keep an extension process alive (Playwright's default too).
   Anti-bot flags (spoofed user-agent, `--disable-web-security`,
   `--disable-blink-features=AutomationControlled`, …) are **not** included — add
   them via `:extra_args` if you need them.
@@ -371,6 +373,11 @@ defmodule CDPEx.Chrome do
       # too) cut Chrome's peak memory ~30% and raised throughput ~20% with 8
       # concurrent pages, and makes behaviour reproducible across builds.
       "--disable-field-trial-config",
+      # Component extensions with a background page each keep an extension process
+      # alive that a headless client never uses. Disabling them (Playwright does too)
+      # saved one Chrome process and ~13 MB at cold start; throughput under load was
+      # unchanged (bench/, docs/TODO.md item 4).
+      "--disable-component-extensions-with-background-pages",
       "--window-size=#{width},#{height}",
       "--user-data-dir=#{user_data_dir}",
       debugging_flag(Keyword.get(opts, :pipe, false))
