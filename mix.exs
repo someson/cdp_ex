@@ -131,6 +131,8 @@ defmodule CDPEx.MixProject do
       source_url: @source_url,
       extras: [
         "README.md",
+        "docs/guides/usage.md",
+        "docs/guides/page-operations.md",
         "docs/guides/recipes.md",
         "docs/guides/error-handling.md",
         "docs/guides/telemetry.md",
