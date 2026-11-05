@@ -97,3 +97,21 @@ Changes in this fork that `patrols/cdp_ex` doesn't have yet: the
 (#2), unique temp profile dirs (#3), in-page waits (#4), the README fixes
 (#5), and sweeping stale temp profile dirs (#8). Upstream requires signed commits, so they need re-signing before being
 offered there, and the PR numbers in `CHANGELOG.md` will differ.
+
+## 7. Remote browser control — parked
+
+`CDPEx.connect/2` drives a Chrome CDPEx didn't launch, but only as a single
+connection with `:session` pages: launch options such as `:proxy` can't apply,
+nothing restarts a remote Chrome that dies or hangs, and whether `CDPEx.Pool`
+works with `launch_opts: [connect: url]` is unchecked. Worth revisiting for
+moving Chrome off the application host, a farm of browser hosts behind one pool,
+or a cloud browser provider. The remote DevTools endpoint needs TLS and a token
+in front of it, since it gives full control of the browser.
+
+## 8. Several pages per pooled browser — idea
+
+`CDPEx.Pool` hands a browser to one job at a time, so 8 parallel jobs run 8
+Chromes (an estimated ~3 GB at ~360 MB each). One browser ran 8 concurrent
+isolated pages at ~850 MB peak PSS (`bench/`, 4 CPUs). A `pages_per_browser:`
+option would let `size: 2, pages_per_browser: 4` serve the same 8 jobs on 2
+Chromes. Measure 8×1, 2×4 and 1×8 with `bench/` before building it.
