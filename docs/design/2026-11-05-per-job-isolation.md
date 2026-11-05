@@ -67,7 +67,19 @@ numbers are medians of 20):
   | `disposeBrowserContext` | 10 |
 
   About +75 ms per page against the default context, small next to a
-  navigation. To re-measure on Linux (`test/docker/`) before the default flips.
+  navigation.
+
+- Measured again through `new_page/2` / `close_page/2` once implemented (`:session`,
+  medians of 20; Linux is `test/docker/` Chromium arm64 capped to 4 CPUs, two runs):
+
+  | | open, plain | open, isolated | close, plain | close, isolated |
+  |---|---|---|---|---|
+  | macOS, Google Chrome | 40 | 153 | 1 | 8 |
+  | Linux, Chromium | 28–31 | 91–108 | 1–2 | 9–10 |
+
+  Disposing the context alone (it closes the target) took 8 ms against 20 ms for
+  `closeTarget` then dispose on macOS, and 9–10 against 7–13 on Linux, so
+  `close_page/2` only disposes.
 
 ## API
 
