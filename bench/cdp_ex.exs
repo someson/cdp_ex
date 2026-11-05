@@ -89,4 +89,12 @@ result =
       %{jobs: Enum.sum(counts), seconds: us / 1_000_000}
   end
 
-IO.puts(Jason.encode!(Map.merge(%{lib: "cdp_ex", scenario: scenario}, result)))
+# The options go into the result so runs with different ones can be told apart.
+meta = %{
+  lib: "cdp_ex",
+  scenario: scenario,
+  launch_opts: inspect(launch_opts),
+  page_opts: inspect(page_opts)
+}
+
+IO.puts(Jason.encode!(Map.merge(meta, result)))

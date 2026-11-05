@@ -80,6 +80,10 @@ defmodule CDPEx.ChromeTest do
       assert "--disable-field-trial-config" in Chrome.default_args("/tmp/p")
     end
 
+    test "disables component extensions with background pages" do
+      assert "--disable-component-extensions-with-background-pages" in Chrome.default_args("/tmp/p")
+    end
+
     test "ships no anti-bot defaults" do
       args = Chrome.default_args("/tmp/p")
       refute Enum.any?(args, &String.contains?(&1, "AutomationControlled"))
