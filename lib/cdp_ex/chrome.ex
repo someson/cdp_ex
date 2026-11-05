@@ -153,8 +153,9 @@ defmodule CDPEx.Chrome do
   end
 
   @doc false
-  @spec validate_opts!(keyword()) :: :ok
-  def validate_opts!(opts) do
+  # `os_type` is `:os.type()`; a test passes another to check the Windows rules on Unix.
+  @spec validate_opts!(keyword(), {atom(), atom()}) :: :ok
+  def validate_opts!(opts, os_type \\ :os.type()) do
     # A full :args override means build_args/2 never reads these, so they launched fine.
     ignored =
       if is_list(Keyword.get(opts, :args)), do: [:headless, :window_size, :extra_args], else: []
@@ -163,14 +164,17 @@ defmodule CDPEx.Chrome do
     opts
     |> Enum.uniq_by(&elem(&1, 0))
     |> Enum.each(fn {key, value} ->
-      if key not in ignored and !valid_opt?(key, value) do
+      if key not in ignored and !valid_opt?(key, value, os_type) do
         raise ArgumentError, "invalid #{inspect(key)} #{inspect(value)} (expected #{expected(key)})"
       end
     end)
   end
 
+  # Remapping fds 3 and 4 for the pipe needs /bin/sh, which Windows lacks.
+  defp valid_opt?(:pipe, true, os_type), do: not match?({:win32, _}, os_type)
+  defp valid_opt?(key, value, _os_type), do: valid_opt?(key, value)
+
   defp valid_opt?(:headless, value), do: is_boolean(value)
-  defp valid_opt?(:pipe, true), do: not match?({:win32, _}, :os.type())
   defp valid_opt?(:pipe, value), do: value == false
   defp valid_opt?(:chrome_binary, value), do: value in [nil, false] or string?(value)
   defp valid_opt?(:user_data_dir, value), do: is_nil(value) or string?(value)

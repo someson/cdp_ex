@@ -108,9 +108,18 @@ defmodule CDPEx.ChromeTest do
   end
 
   describe "validate_opts!/1 for :pipe" do
-    test "accepts booleans" do
-      assert Chrome.validate_opts!(pipe: false) == :ok
-      if !match?({:win32, _}, :os.type()), do: assert(Chrome.validate_opts!(pipe: true) == :ok)
+    test "accepts booleans on Unix" do
+      assert Chrome.validate_opts!([pipe: false], {:unix, :linux}) == :ok
+      assert Chrome.validate_opts!([pipe: true], {:unix, :linux}) == :ok
+      assert Chrome.validate_opts!([pipe: true], {:unix, :darwin}) == :ok
+    end
+
+    test "rejects pipe: true on Windows, before anything is launched" do
+      assert_raise ArgumentError, ~r/invalid :pipe true .*not on Windows/, fn ->
+        Chrome.validate_opts!([pipe: true], {:win32, :nt})
+      end
+
+      assert Chrome.validate_opts!([pipe: false], {:win32, :nt}) == :ok
     end
 
     test "rejects anything else" do
