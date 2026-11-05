@@ -130,6 +130,7 @@ defmodule CDPEx do
           | {:connect_discovery_failed, term()}
           | {:capture_failed, term()}
           | {:idle_wait_failed, term()}
+          | {:launch_crashed, term()}
           | {:selector_not_found, String.t()}
           | {:text_not_found, String.t()}
           | {:not_clickable, String.t()}
@@ -185,7 +186,9 @@ defmodule CDPEx do
       timed out (`:timeout`, `{:timeout, _}`, `:deadline_exceeded`), Chrome died
       or was slow to start (`{:chrome_exited, _, _}`, `{:debug_url_not_found, _}`,
       `{:devtools_file_malformed, _}`), an internal capture/idle helper crashed
-      (`{:capture_failed, _}`, `{:idle_wait_failed, _}`), or a navigation hit a
+      (`{:capture_failed, _}`, `{:idle_wait_failed, _}`), a `CDPEx.Pool` launch task
+      crashed or its start function returned something unexpected (`{:launch_crashed, _}`),
+      or a navigation hit a
       connection/network-layer `net::ERR_*` (e.g. `{:navigate, "net::ERR_CONNECTION_REFUSED"}`).
     * `:terminal` — deterministic outcomes: a selector or text didn't match, JS threw, a
       usage/validation error, or a missing Chrome binary. Retrying the same call
@@ -230,6 +233,7 @@ defmodule CDPEx do
   def classify_error({:devtools_file_malformed, _}), do: :transient
   def classify_error({:capture_failed, _}), do: :transient
   def classify_error({:idle_wait_failed, _}), do: :transient
+  def classify_error({:launch_crashed, _}), do: :transient
   # Terminal — deterministic; retrying the same call yields the same error.
   def classify_error({:chrome_not_found, _}), do: :terminal
   def classify_error({:selector_not_found, _}), do: :terminal

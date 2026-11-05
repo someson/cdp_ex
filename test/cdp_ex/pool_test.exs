@@ -71,6 +71,26 @@ defmodule CDPEx.PoolTest do
     assert {:error, :timeout} = Pool.checkout(pool, 100)
   end
 
+  test "an invalid checkout timeout raises in the caller and leaves the pool alive" do
+    pool = start_pool(size: 1)
+
+    for bad <- [1.5, -5, 4_294_967_296, :soon, nil] do
+      assert_raise ArgumentError, ~r/invalid :checkout_timeout/, fn -> Pool.checkout(pool, bad) end
+
+      assert_raise ArgumentError, ~r/invalid :checkout_timeout/, fn ->
+        Pool.with_browser(pool, fn _ -> :ran end, bad)
+      end
+
+      assert_raise ArgumentError, ~r/invalid :checkout_timeout/, fn ->
+        Pool.with_page(pool, fn _ -> :ran end, checkout_timeout: bad)
+      end
+    end
+
+    assert Process.alive?(pool)
+    assert {:ok, _browser} = Pool.checkout(pool, 0)
+    assert {:error, :timeout} = Pool.checkout(pool, 0)
+  end
+
   test "with_browser returns the fun's value and checks the browser back in" do
     pool = start_pool(size: 1)
     assert :hello = Pool.with_browser(pool, fn _b -> :hello end)
@@ -106,6 +126,26 @@ defmodule CDPEx.PoolTest do
     Process.exit(owner, :kill)
     # The pool reclaims b1 via the owner monitor, so it can be checked out again.
     assert {:ok, ^b1} = Pool.checkout(pool, 1_000)
+  end
+
+  test "a checkin from a process that doesn't hold the browser is ignored" do
+    pool = start_pool(size: 1)
+    {:ok, b1} = Pool.checkout(pool)
+
+    log =
+      capture_log(fn ->
+        Task.await(Task.async(fn -> Pool.checkin(pool, b1) end))
+        # A call after the cast: the pool has handled the stray checkin by now.
+        assert {:error, :timeout} = Pool.checkout(pool, 0)
+      end)
+
+    assert log =~ "checkin"
+    assert %{busy: %{^b1 => {owner, _ref}}} = :sys.get_state(pool)
+    assert owner == self()
+
+    # The holder can still check it in.
+    :ok = Pool.checkin(pool, b1)
+    assert {:ok, ^b1} = Pool.checkout(pool, 0)
   end
 
   test "a crashed browser is dropped and replaced on the next checkout" do
@@ -151,8 +191,22 @@ defmodule CDPEx.PoolTest do
     # The launch task crash logs a (expected) SASL report — capture it so it isn't noise.
     {result, _log} = with_log(fn -> Pool.checkout(pool, 1_000) end)
 
-    # The task's :DOWN reason (the raised exception) is propagated, not a bare atom.
-    assert {:error, {%RuntimeError{message: "launch crash"}, _stacktrace}} = result
+    # The task's :DOWN reason (the raised exception) is propagated inside a tagged,
+    # classified reason rather than as a bare crash term.
+    assert {:error, {:launch_crashed, {%RuntimeError{message: "launch crash"}, _stacktrace}}} =
+             result
+
+    assert CDPEx.classify_error(elem(result, 1)) == :transient
+    assert Process.alive?(pool)
+  end
+
+  test "a start_fun returning neither {:ok, _} nor {:error, _} surfaces as a launch failure" do
+    pool = start_pool(size: 1, start_fun: fn _ -> :ignore end)
+
+    assert {:error, {:launch_crashed, {:unexpected_launch_result, :ignore}} = reason} =
+             Pool.checkout(pool, 1_000)
+
+    assert CDPEx.classify_error(reason) == :transient
     assert Process.alive?(pool)
   end
 

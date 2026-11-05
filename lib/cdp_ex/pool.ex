@@ -95,9 +95,17 @@ defmodule CDPEx.Pool do
   caller and is generally worth retrying. A caller still waiting when the pool stops
   gets `{:error, :noproc}`. **Always** `checkin/2` it when done — or use
   `with_browser/3` / `with_page/3`, which do that for you.
+
+  `timeout` is integer ms in `0..4_294_967_295` or `:infinity`; anything else
+  raises `ArgumentError` in the caller and leaves the pool untouched. `0` takes a
+  free browser if there is one and returns `{:error, :timeout}` otherwise.
   """
   @spec checkout(GenServer.server(), timeout()) :: {:ok, pid()} | {:error, term()}
   def checkout(pool, timeout \\ @default_checkout_timeout) do
+    # Validate here, in the caller: a bad value reaching the pool's timer would crash
+    # the pool and every warm browser it owns.
+    validate_timeout!(timeout)
+
     # Wait indefinitely on the outer call; the pool's own per-request timer is the
     # authoritative timeout (it removes the waiter and replies {:error, :timeout}).
     # This avoids a stale waiter when a slow launch blocks the pool past a tight
@@ -112,9 +120,16 @@ defmodule CDPEx.Pool do
     :exit, {reason, {GenServer, :call, _}} when reason != :calling_self -> {:error, :noproc}
   end
 
-  @doc "Returns a browser borrowed with `checkout/2`."
+  @doc """
+  Returns a browser borrowed with `checkout/2`.
+
+  Only the process that checked the browser out can return it. A checkin from any
+  other process is ignored with a warning, so it can't hand a browser still in use
+  to the next caller; the browser stays with its holder until the holder checks it
+  in or exits.
+  """
   @spec checkin(GenServer.server(), pid()) :: :ok
-  def checkin(pool, browser), do: GenServer.cast(pool, {:checkin, browser})
+  def checkin(pool, browser), do: GenServer.cast(pool, {:checkin, browser, self()})
 
   @doc """
   Runs `fun` with a checked-out browser, returning it afterwards (even if `fun`
@@ -210,8 +225,23 @@ defmodule CDPEx.Pool do
   end
 
   @impl true
-  def handle_cast({:checkin, browser}, state) do
-    {:noreply, state |> release(browser) |> dispatch()}
+  def handle_cast({:checkin, browser, caller}, state) do
+    case Map.fetch(state.busy, browser) do
+      {:ok, {^caller, _ref}} ->
+        {:noreply, state |> release(browser) |> dispatch()}
+
+      {:ok, {_owner, _ref}} ->
+        Logger.warning(
+          "[CDPEx.Pool] ignored checkin of #{inspect(browser)} from #{inspect(caller)}: " <>
+            "it is checked out by another process"
+        )
+
+        {:noreply, state}
+
+      # Not checked out (already returned, or dropped after a crash): nothing to do.
+      :error ->
+        {:noreply, state}
+    end
   end
 
   @impl true
@@ -235,18 +265,25 @@ defmodule CDPEx.Pool do
     state = %{state | launching: Map.delete(launching, ref)}
 
     case result do
-      {:ok, browser} -> {:noreply, browser_launched(state, browser)}
-      {:error, reason} -> {:noreply, launch_failed(state, reason)}
+      {:ok, browser} ->
+        {:noreply, browser_launched(state, browser)}
+
+      {:error, reason} ->
+        {:noreply, launch_failed(state, reason)}
+
       # A start_fun that returns something other than {:ok, _} / {:error, _} (e.g. :ignore,
       # valid per GenServer.on_start) is treated as a failed launch rather than crashing us.
-      other -> {:noreply, launch_failed(state, {:unexpected_launch_result, other})}
+      other ->
+        {:noreply, launch_failed(state, {:launch_crashed, {:unexpected_launch_result, other}})}
     end
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %__MODULE__{launching: launching} = state)
       when is_map_key(launching, ref) do
     # A launch task crashed before returning a result (it never sent {ref, result}).
-    {:noreply, launch_failed(%{state | launching: Map.delete(launching, ref)}, reason)}
+    # Tagged, so the arbitrary crash term stays inside CDPEx.error_reason/0.
+    state = %{state | launching: Map.delete(launching, ref)}
+    {:noreply, launch_failed(state, {:launch_crashed, reason})}
   end
 
   def handle_info({:DOWN, ref, :process, _owner, _reason}, state) do
@@ -474,10 +511,20 @@ defmodule CDPEx.Pool do
     end
   end
 
+  # The upper bound is Process.send_after/3's limit; past it the pool's timer would crash.
+  defp validate_timeout!(:infinity), do: :ok
+  defp validate_timeout!(timeout) when is_integer(timeout) and timeout in 0..4_294_967_295, do: :ok
+
+  defp validate_timeout!(other) do
+    raise ArgumentError,
+          "invalid :checkout_timeout #{inspect(other)} " <>
+            "(expected integer ms in 0..4_294_967_295 or :infinity)"
+  end
+
   defp arm_timeout(_from, :infinity), do: nil
 
   defp arm_timeout(from, timeout) when is_integer(timeout) do
-    Process.send_after(self(), {:checkout_timeout, from}, max(timeout, 0))
+    Process.send_after(self(), {:checkout_timeout, from}, timeout)
   end
 
   defp cancel_timer(nil), do: :ok
