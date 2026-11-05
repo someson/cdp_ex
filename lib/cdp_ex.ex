@@ -335,10 +335,9 @@ defmodule CDPEx do
   the accepted forms (the keyword form avoids percent-encoding special-character
   passwords).
 
-  A credentialed proxy requires the default `:dedicated` transport: `new_page(transport:
-  :session)` on such a browser returns `{:error, {:unsupported_transport, :session}}`,
-  and an auto-armed page can't also use `enable_request_interception/2` (both drive the
-  `Fetch` domain). A malformed `:proxy` — or combining it with a full `:args` override —
+  Pages of both transports are armed, including the `:session` pages of a `pipe: true`
+  browser. An auto-armed page can't also use `enable_request_interception/2` (both
+  drive the `Fetch` domain). A malformed `:proxy` — or combining it with a full `:args` override —
   fails the launch with `{:error, {:invalid_proxy, _}}` (`:proxy` appends to `:extra_args`,
   which an `:args` override discards, so the two are mutually exclusive; use one). Don't
   set `--proxy-server` in `:extra_args` yourself when using `:proxy`.

@@ -336,23 +336,12 @@ defmodule CDPEx.Browser do
         {:ok, parsed} ->
           arg = Proxy.to_arg(parsed)
           launch_opts = Keyword.update(launch_opts, :extra_args, [arg], &(&1 ++ [arg]))
-          proxy_with_auth(Proxy.credentials(parsed), launch_opts)
+          {:ok, Proxy.credentials(parsed), launch_opts}
 
         {:error, _reason} = error ->
           error
       end
     end
-  end
-
-  # Proxy credentials are answered per page through Fetch, which needs a :dedicated
-  # page, and a pipe browser has only :session pages: every page would fail. Fail
-  # the launch instead.
-  defp proxy_with_auth(nil, launch_opts), do: {:ok, nil, launch_opts}
-
-  defp proxy_with_auth(creds, launch_opts) do
-    if Keyword.get(launch_opts, :pipe, false),
-      do: {:error, {:invalid_proxy, :pipe}},
-      else: {:ok, creds, launch_opts}
   end
 
   # Connect the browser WebSocket (the launched Chrome's debug URL, or a remote
@@ -509,23 +498,15 @@ defmodule CDPEx.Browser do
     end
   end
 
-  def handle_call({:authenticate, %Page{session_id: sid}, _opts}, _from, state)
-      when not is_nil(sid) do
-    # A :session page rides the shared browser connection, which `close_page/2`
-    # never stops — so the Fetch handler (which self-stops when its connection goes
-    # down) would linger for the life of the browser. Restrict authenticate/4 to
-    # :dedicated pages rather than leak a handler per authenticated session page.
-    {:reply, {:error, {:unsupported_transport, :session}}, state}
-  end
-
   def handle_call(
         {:authenticate, %Page{conn: conn, target_id: tid, session_id: sid}, opts},
         from,
         state
       ) do
-    # Dedicated page only (the :session clause above already returned).
+    # A :session page's handler rides the shared browser connection, which outlives
+    # the page, so CDPEx.Fetch also stops on its session's detach.
     cond do
-      Map.get(state.pages, tid) != conn ->
+      not own_page?(state, tid, conn, sid) ->
         # Not one of this browser's live pages (a handle from another browser, or an
         # already-closed one) — mirror close_page/2 instead of arming a handler on a
         # foreign connection and linking it to us.
@@ -872,7 +853,7 @@ defmodule CDPEx.Browser do
   defp reply_proxy_authed_page(state, %Page{conn: conn, target_id: tid} = page, creds) do
     fetch_opts = [
       conn: conn,
-      session_id: nil,
+      session_id: page.session_id,
       browser: self(),
       username: creds.username,
       password: creds.password,
@@ -886,21 +867,27 @@ defmodule CDPEx.Browser do
             {:reply, {:ok, page}, %{state | auths: Map.put(state.auths, tid, pid)}}
 
           {:error, reason} ->
-            {:reply, {:error, reason}, close_failed_auth_page(state, tid, conn)}
+            {:reply, {:error, reason}, close_failed_auth_page(state, page)}
         end
 
       {:error, reason} ->
-        {:reply, {:error, reason}, close_failed_auth_page(state, tid, conn)}
+        {:reply, {:error, reason}, close_failed_auth_page(state, page)}
     end
   end
 
   # The proxy-auth arm failed; the just-created page was never handed to the caller, so
   # close its target + connection and drop it from `pages` (best-effort — either may
   # already be gone). Returns the updated state for the {:reply, …} tuple.
-  defp close_failed_auth_page(state, tid, conn) do
+  defp close_failed_auth_page(state, %Page{target_id: tid, session_id: nil, conn: conn}) do
     safe_close(conn)
     state = end_target(state, tid)
     %{state | pages: Map.delete(state.pages, tid)}
+  end
+
+  defp close_failed_auth_page(state, %Page{target_id: tid, session_id: sid}) do
+    detach_session(state.browser_conn, sid)
+    state = end_target(state, tid)
+    %{state | sessions: Map.delete(state.sessions, tid)}
   end
 
   # Block (inside the new_page call) until the Fetch handler signals it's armed. It is
@@ -920,13 +907,6 @@ defmodule CDPEx.Browser do
     end
   end
 
-  defp reply_session_page(%{proxy_auth: creds} = state, _opts) when not is_nil(creds) do
-    # An authenticated proxy needs per-page Fetch auth, only supported on :dedicated pages
-    # (a :session page rides the shared connection close_page never stops). Reject rather
-    # than hand back a session page that can't answer the proxy challenge.
-    {:reply, {:error, {:unsupported_transport, :session}}, state}
-  end
-
   defp reply_session_page(state, opts) do
     case open_session_page(state, opts) do
       {:ok, page, context_id} ->
@@ -938,7 +918,12 @@ defmodule CDPEx.Browser do
 
         sessions = Map.put(state.sessions, page.target_id, page.session_id)
         contexts = put_context(state.contexts, page.target_id, context_id)
-        {:reply, {:ok, page}, %{state | sessions: sessions, contexts: contexts}}
+        state = %{state | sessions: sessions, contexts: contexts}
+
+        case state.proxy_auth do
+          nil -> {:reply, {:ok, page}, state}
+          creds -> reply_proxy_authed_page(state, page, creds)
+        end
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}
@@ -1091,6 +1076,13 @@ defmodule CDPEx.Browser do
       :ok
     end
   end
+
+  # One of this browser's open pages: a :dedicated page by its own connection, a
+  # :session page by its session on the browser connection.
+  defp own_page?(state, tid, conn, nil), do: Map.get(state.pages, tid) == conn
+
+  defp own_page?(state, tid, conn, sid),
+    do: conn == state.browser_conn and Map.get(state.sessions, tid) == sid
 
   defp drop_conn(pages, pid) do
     pages |> Enum.reject(fn {_tid, conn} -> conn == pid end) |> Map.new()
