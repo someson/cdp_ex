@@ -11,7 +11,9 @@ defmodule CDPEx.Fetch do
 
   Because `Fetch.enable` pauses **every** request, each one round-trips through
   this process — measurable overhead on resource-heavy pages. The handler is tied
-  to the page's connection and stops when it goes down.
+  to the page's connection and stops when it goes down. On a `:session` page,
+  whose connection is the browser's and outlives the page, it also stops when its
+  session detaches: on `close_page/2`, a tab closed from outside, or a crash.
 
   This is an internal building block; use `CDPEx.Page.authenticate/4`.
   """
@@ -26,7 +28,17 @@ defmodule CDPEx.Fetch do
   @call_timeout 10_000
   @max_tracked_challenges 1024
 
-  defstruct [:conn, :session_id, :username, :password, :source, :browser, attempts: %{}]
+  defstruct [
+    :conn,
+    :session_id,
+    :username,
+    :password,
+    :source,
+    :browser,
+    attempts: %{},
+    # The session detached: its Fetch domain went with it, so there is nothing to disable.
+    detached: false
+  ]
 
   @type t :: %__MODULE__{}
 
@@ -69,8 +81,9 @@ defmodule CDPEx.Fetch do
     # enable and the first event delivery. If `conn` already died (a rare race where
     # the Browser processed authenticate/4 just ahead of the page-conn EXIT) the
     # subscribe fails, and so does the arm.
-    with :ok <- Connection.subscribe(state.conn, "Fetch.requestPaused"),
-         :ok <- Connection.subscribe(state.conn, "Fetch.authRequired"),
+    with :ok <- subscribe(state, "Fetch.requestPaused"),
+         :ok <- subscribe(state, "Fetch.authRequired"),
+         :ok <- subscribe_detach(state),
          {:ok, _} <- call(state, "Fetch.enable", %{"handleAuthRequests" => true}) do
       # Signal the Browser we're armed so it can reply :ok to the still-waiting
       # authenticate/4 caller — preserving the "armed before return" guarantee
@@ -79,8 +92,10 @@ defmodule CDPEx.Fetch do
       {:noreply, state}
     else
       {:error, reason}
-      when reason == :noproc or (is_tuple(reason) and elem(reason, 0) == :ws_closed) ->
-        # The page connection died mid-arm (a close/authenticate race) — benign, no log.
+      when reason == :noproc or
+             (is_tuple(reason) and elem(reason, 0) in [:ws_closed, :session_closed]) ->
+        # The page connection died, or a :session page's session detached, mid-arm (a
+        # close/authenticate race) — benign, no log.
         send(state.browser, {:arm_failed, self(), reason})
         {:stop, :normal, state}
 
@@ -137,13 +152,23 @@ defmodule CDPEx.Fetch do
     {:stop, :normal, state}
   end
 
+  # Our :session page's session ended. Chrome sends the detach on the parent session,
+  # so it is matched on params, not on the event's session id.
+  def handle_info(
+        {:cdp_event, conn, "Target.detachedFromTarget", %{"sessionId" => sid}, _parent},
+        %__MODULE__{conn: conn, session_id: sid} = state
+      )
+      when is_binary(sid) do
+    {:stop, :normal, %{state | detached: true}}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
   def terminate(_reason, state) do
     # Best-effort: the connection may already be gone (Connection.call and
     # safe_unsubscribe both tolerate that), leaving nothing to disable.
-    _ = call(state, "Fetch.disable", %{})
+    _ = if not state.detached, do: call(state, "Fetch.disable", %{})
     safe_unsubscribe(state.conn)
     :ok
   end
@@ -190,6 +215,14 @@ defmodule CDPEx.Fetch do
   defp source_match?(:server, "Server"), do: true
   defp source_match?(_filter, _source), do: false
 
+  # Scoped to the page's session, so a handler on the shared browser connection isn't
+  # sent every other page's Fetch events.
+  defp subscribe(state, method),
+    do: Connection.subscribe(state.conn, method, @call_timeout, session_id: state.session_id)
+
+  defp subscribe_detach(%__MODULE__{session_id: nil}), do: :ok
+  defp subscribe_detach(state), do: subscribe(state, "Target.detachedFromTarget")
+
   defp call(state, method, params) do
     Connection.call(state.conn, method, params, @call_timeout, session_id: state.session_id)
   end
@@ -197,5 +230,6 @@ defmodule CDPEx.Fetch do
   defp safe_unsubscribe(conn) do
     Connection.unsubscribe(conn, "Fetch.requestPaused")
     Connection.unsubscribe(conn, "Fetch.authRequired")
+    Connection.unsubscribe(conn, "Target.detachedFromTarget")
   end
 end

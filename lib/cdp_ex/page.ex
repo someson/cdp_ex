@@ -706,8 +706,10 @@ defmodule CDPEx.Page do
   This enables the CDP `Fetch` domain for the page, which pauses (and
   auto-continues) **every** request — measurable overhead on heavy pages.
 
-  Only `:dedicated` pages (the `new_page/2` default) are supported; a `:session`
-  page returns `{:error, {:unsupported_transport, :session}}`. A page that isn't one
+  Works on `:dedicated` and `:session` pages. A `:session` page's handler shares the
+  browser connection and stops when the page's session ends: on `close_page/2`, a tab
+  closed from outside, or a crash. Chrome caches the credentials it was given for
+  the page's browser context, so other pages in that context may reuse them. A page that isn't one
   of this browser's open pages returns `{:error, :unknown_page}`, a page that is
   already authenticated returns `{:error, :already_authenticated}`, and a page that
   already has request interception enabled returns `{:error, {:conflict, :intercepting}}`
@@ -1976,9 +1978,8 @@ defmodule CDPEx.Page do
   > While interception is enabled you must still resolve every pause.
 
   Only `:dedicated` pages are supported; a `:session`-transport page is rejected with
-  `{:error, {:unsupported_transport, :session}}` (mirroring `authenticate/4`) — its
-  subscription and owner-monitor would outlive `close_page`, which never stops the
-  shared browser connection.
+  `{:error, {:unsupported_transport, :session}}` — its subscription and owner-monitor
+  would outlive `close_page`, which never stops the shared browser connection.
 
   Mutually exclusive with `authenticate/4` on the same page — both drive the `Fetch`
   domain. The conflict is **enforced**: enabling interception on an authenticated page

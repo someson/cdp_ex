@@ -1221,14 +1221,55 @@ defmodule CDPEx.IntegrationTest do
       assert {:ok, "Hello"} = Page.text(page, "#greeting")
     end
 
-    test "rejects a :session page rather than leak its handler" do
+    for launch_opts <- [[], [pipe: true]] do
+      test "authenticate answers a Basic challenge on a :session page (#{inspect(launch_opts)})",
+           %{fixture: fixture} do
+        {:ok, browser} = CDPEx.launch(unquote(launch_opts))
+        on_exit(fn -> stop_quietly(browser) end)
+
+        {:ok, page} = CDPEx.new_page(browser, transport: :session)
+        {:ok, other} = CDPEx.new_page(browser, transport: :session)
+        assert :ok = Page.authenticate(page, "cdpex", "secret")
+
+        # A sibling session page on the same connection isn't armed by it. Checked
+        # first: once a page has authenticated, Chrome caches the credentials for the
+        # whole context.
+        assert {:error, {:navigate, _}} = Page.navigate(other, fixture <> "basic-auth")
+
+        {:ok, _} = Page.navigate(page, fixture <> "basic-auth")
+        assert {:ok, "Hello"} = Page.text(page, "#greeting")
+      end
+    end
+
+    test "a :session page's handler stops on close_page, though the connection lives on" do
       {:ok, browser} = CDPEx.launch()
       on_exit(fn -> stop_quietly(browser) end)
 
-      {:ok, session_page} = CDPEx.new_page(browser, transport: :session)
+      before = fetch_handlers()
+      {:ok, page} = CDPEx.new_page(browser, transport: :session)
+      assert :ok = Page.authenticate(page, "cdpex", "secret")
+      assert [handler] = fetch_handlers() -- before
+      ref = Process.monitor(handler)
 
-      assert {:error, {:unsupported_transport, :session}} =
-               Page.authenticate(session_page, "cdpex", "secret")
+      :ok = CDPEx.close_page(browser, page)
+      assert_receive {:DOWN, ^ref, :process, ^handler, :normal}, 5_000
+      assert Process.alive?(page.conn)
+      assert eventually(fn -> :sys.get_state(browser).auths == %{} end)
+    end
+
+    test "a :session page's handler stops when its tab is closed from outside" do
+      {:ok, browser} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(browser) end)
+
+      before = fetch_handlers()
+      {:ok, page} = CDPEx.new_page(browser, transport: :session)
+      assert :ok = Page.authenticate(page, "cdpex", "secret")
+      assert [handler] = fetch_handlers() -- before
+      ref = Process.monitor(handler)
+
+      {:ok, _} = Connection.call(page.conn, "Target.closeTarget", %{"targetId" => page.target_id})
+      assert_receive {:DOWN, ^ref, :process, ^handler, :normal}, 5_000
+      assert eventually(fn -> :sys.get_state(browser).auths == %{} end)
     end
 
     test "the Fetch handler self-stops when the page's connection goes down" do
@@ -1304,12 +1345,12 @@ defmodule CDPEx.IntegrationTest do
       assert {:error, {:conflict, :authenticated}} = Page.enable_request_interception(page)
     end
 
-    test "launch(proxy: creds) rejects a :session page" do
+    test "launch(proxy: creds) auto-arms a :session page" do
       {:ok, browser} = CDPEx.launch(proxy: @creds_proxy)
       on_exit(fn -> stop_quietly(browser) end)
 
-      assert {:error, {:unsupported_transport, :session}} =
-               CDPEx.new_page(browser, transport: :session)
+      {:ok, page} = CDPEx.new_page(browser, transport: :session)
+      assert {:error, :already_authenticated} = Page.authenticate(page, "user", "pass")
     end
 
     test "launch(proxy: url) without creds sets the flag only — any transport works" do
@@ -1331,6 +1372,24 @@ defmodule CDPEx.IntegrationTest do
       {:ok, page} = CDPEx.new_page(browser)
       assert {:ok, _} = Page.navigate(page, "http://proxied.test/")
       assert {:ok, "Proxied"} = Page.text(page, "#greeting")
+    end
+
+    test "auto-auth answers a proxy 407 on a pipe browser's :session pages" do
+      {:ok, %{port: proxy_port}} = ProxyAuthServer.start(username: "puser", password: "ppass")
+
+      {:ok, browser} =
+        CDPEx.launch(pipe: true, proxy: "http://puser:ppass@127.0.0.1:#{proxy_port}")
+
+      on_exit(fn -> stop_quietly(browser) end)
+
+      for _ <- 1..2 do
+        {:ok, page} = CDPEx.new_page(browser)
+        assert {:ok, _} = Page.navigate(page, "http://proxied.test/")
+        assert {:ok, "Proxied"} = Page.text(page, "#greeting")
+        :ok = CDPEx.close_page(browser, page)
+      end
+
+      assert eventually(fn -> :sys.get_state(browser).auths == %{} end)
     end
 
     test "without credentials a proxy 407 blocks the navigation (the proxy enforces auth)" do

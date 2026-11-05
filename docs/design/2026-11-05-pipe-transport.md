@@ -65,8 +65,8 @@ mainly that no TCP port is opened; the speed gain is a side effect.
 - **Pages.** No endpoint exists for a per-page socket, so a pipe browser behaves
   like a connected one: pages default to `:session`, and `:dedicated` returns
   `{:error, {:unsupported_transport, :dedicated}}`. A `:proxy` with credentials
-  needs Fetch on `:dedicated` pages, so it fails the launch with
-  `{:invalid_proxy, :pipe}` rather than every page later.
+  first failed the launch with `{:invalid_proxy, :pipe}`, since proxy auth needed
+  `:dedicated` pages; since #17 it is answered on `:session` pages too.
 
 ## Reaping
 

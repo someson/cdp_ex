@@ -20,15 +20,6 @@ defmodule CDPEx.BrowserTest do
                Browser.handle_call({:new_page, [transport: :bogus]}, {self(), make_ref()}, state)
     end
 
-    test "a :session page is rejected when the browser has authenticated-proxy creds" do
-      # An authenticated proxy auto-arms per-page Fetch, which only works on :dedicated
-      # pages — the rejection fires before any I/O, so drive the callback directly.
-      state = %Browser{proxy_auth: %{username: "u", password: "p"}}
-
-      assert {:reply, {:error, {:unsupported_transport, :session}}, ^state} =
-               Browser.handle_call({:new_page, [transport: :session]}, {self(), make_ref()}, state)
-    end
-
     test "a :dedicated page is rejected on a connected (chrome-less) browser" do
       # Connect-mode can't open a dedicated page yet (its socket would have to target
       # the remote host); the rejection keys on `connected`, before any I/O.
@@ -44,8 +35,8 @@ defmodule CDPEx.BrowserTest do
   end
 
   describe "a pipe browser" do
-    test "defaults new pages to :session and rejects :dedicated, before any I/O" do
-      state = %Browser{pipe: true, proxy_auth: %{username: "u", password: "p"}}
+    test "rejects :dedicated pages, before any I/O" do
+      state = %Browser{pipe: true}
 
       assert {:reply, {:error, {:unsupported_transport, :dedicated}}, ^state} =
                Browser.handle_call(
@@ -53,18 +44,6 @@ defmodule CDPEx.BrowserTest do
                  {self(), make_ref()},
                  state
                )
-
-      # The default resolves to :session, which a credentialed proxy then rejects: proof
-      # the default reached the :session path without touching a connection.
-      assert {:reply, {:error, {:unsupported_transport, :session}}, ^state} =
-               Browser.handle_call({:new_page, []}, {self(), make_ref()}, state)
-    end
-
-    test "a proxy with credentials fails the launch with {:invalid_proxy, :pipe}" do
-      Process.flag(:trap_exit, true)
-
-      assert {:error, {:invalid_proxy, :pipe}} =
-               Browser.start_link(pipe: true, proxy: "http://u:p@host:8080")
     end
 
     test "Chrome's exit, reported by the pipe connection, stops the browser with its status" do
@@ -282,6 +261,35 @@ defmodule CDPEx.BrowserTest do
                  {self(), make_ref()},
                  state
                )
+    end
+  end
+
+  describe "authenticate on a :session page" do
+    setup do
+      conn = self()
+      page = %Page{browser: self(), conn: conn, target_id: "T1", session_id: "S1"}
+      %{conn: conn, page: page, req: {:authenticate, page, [username: "u", password: "p"]}}
+    end
+
+    test "rejects a session this browser doesn't track", %{conn: conn, req: req} do
+      state = %Browser{browser_conn: conn, sessions: %{"T1" => "OTHER"}}
+
+      assert {:reply, {:error, :unknown_page}, ^state} =
+               Browser.handle_call(req, {self(), make_ref()}, state)
+    end
+
+    test "rejects a session handle on another connection", %{req: req} do
+      state = %Browser{browser_conn: spawn(fn -> :ok end), sessions: %{"T1" => "S1"}}
+
+      assert {:reply, {:error, :unknown_page}, ^state} =
+               Browser.handle_call(req, {self(), make_ref()}, state)
+    end
+
+    test "rejects a second authenticate on an armed session page", %{conn: conn, req: req} do
+      state = %Browser{browser_conn: conn, sessions: %{"T1" => "S1"}, auths: %{"T1" => self()}}
+
+      assert {:reply, {:error, :already_authenticated}, ^state} =
+               Browser.handle_call(req, {self(), make_ref()}, state)
     end
   end
 

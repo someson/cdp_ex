@@ -132,5 +132,63 @@ defmodule CDPEx.FetchTest do
 
       assert_receive {:EXIT, ^pid, :normal}, 2_000
     end
+
+    test "a :session handler answers only its session and stops on its session's detach", %{
+      conn: conn,
+      fake: fake
+    } do
+      Process.flag(:trap_exit, true)
+
+      {:ok, pid} =
+        Fetch.start_link(
+          conn: conn,
+          session_id: "S1",
+          browser: self(),
+          username: "u",
+          password: "p"
+        )
+
+      assert_receive {:fake_cdp_recv, ^fake,
+                      %{"id" => id, "method" => "Fetch.enable", "sessionId" => "S1"}},
+                     2_000
+
+      FakeCDP.send_text(fake, ~s({"id":#{id},"result":{}}))
+      assert_receive {:armed, ^pid}, 2_000
+
+      # Another session's pause isn't ours to continue.
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Fetch.requestPaused","sessionId":"S2","params":{"requestId":"r2"}})
+      )
+
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Fetch.requestPaused","sessionId":"S1","params":{"requestId":"r1"}})
+      )
+
+      assert_receive {:fake_cdp_recv, ^fake,
+                      %{"id" => cid, "method" => "Fetch.continueRequest", "sessionId" => "S1"} =
+                        continue},
+                     2_000
+
+      assert continue["params"]["requestId"] == "r1"
+      FakeCDP.send_text(fake, ~s({"id":#{cid},"result":{}}))
+
+      # Another session's detach leaves it running; its own stops it.
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Target.detachedFromTarget","params":{"sessionId":"S2","targetId":"T2"}})
+      )
+
+      refute_receive {:EXIT, ^pid, _}, 200
+
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Target.detachedFromTarget","params":{"sessionId":"S1","targetId":"T1"}})
+      )
+
+      assert_receive {:EXIT, ^pid, :normal}, 2_000
+      refute_received {:fake_cdp_recv, ^fake, %{"params" => %{"requestId" => "r2"}}}
+    end
   end
 end
