@@ -41,6 +41,7 @@ defmodule CDPExTest do
       {:devtools_file_malformed, "contents excerpt"},
       {:capture_failed, :timeout},
       {:idle_wait_failed, {:badmatch, nil}},
+      {:launch_crashed, {%RuntimeError{message: "launch crash"}, []}},
       {:navigate, "net::ERR_CONNECTION_REFUSED"},
       {:navigate, "net::ERR_TIMED_OUT"}
     ]
