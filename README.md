@@ -39,6 +39,7 @@ scraper, where it replaced a Wallaby/ChromeDriver setup.
 | Per-job isolation | a browser context per job, the pool's default | browser contexts (`new_context`) | — | — |
 | Attach to a running browser | `connect/2` (`ws://`, `wss://`, discovery) | a remote Playwright server | experimental (`chrome_address`) | — |
 | Request interception | ✓ | ✓ (`route`) | — | — |
+| Block resources by type | ✓ (`block:`, no handler process) | by hand, with `route` | — | — |
 | Proxy with credentials | ✓ (`:proxy`, any page) | — | — | — |
 | Waits | selector, JS predicate (in the page), response, network idle | load state, events | a selector before printing | queries block until satisfied |
 | Screenshots / PDF | ✓ / ✓ | — | ✓ / ✓ (and PDF/A) | ✓ / — |
@@ -107,7 +108,7 @@ box on a constrained host (e.g. 2 vCPU / 2 GB).
 - [Connecting to an existing Chrome](docs/guides/usage.md#connecting-to-an-existing-chrome)
 - [Under your supervision tree](docs/guides/usage.md#under-your-supervision-tree)
 - [Pooling](docs/guides/usage.md#pooling), each job in its own browser context
-- [Page operations](docs/guides/page-operations.md): navigation, waits, evaluation, input, screenshots and PDFs, cookies, network, interception, auth
+- [Page operations](docs/guides/page-operations.md): navigation, waits, evaluation, input, screenshots and PDFs, cookies, network, interception, resource blocking, auth
 
 ## Guides
 

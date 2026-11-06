@@ -1496,6 +1496,158 @@ defmodule CDPEx.IntegrationTest do
     end
   end
 
+  describe "resource blocking" do
+    defp assets_server do
+      {:ok, %{url: url}} = FixtureServer.start(report: self())
+      url <> "with-assets"
+    end
+
+    defp served(path) do
+      receive do
+        {:fixture_served, ^path} -> true
+      after
+        0 -> false
+      end
+    end
+
+    for launch_opts <- [[], [pipe: true]] do
+      test "block: [:image, :font] drops them, the stylesheet loads (#{inspect(launch_opts)})" do
+        url = assets_server()
+        {:ok, browser} = CDPEx.launch(unquote(launch_opts))
+        on_exit(fn -> stop_quietly(browser) end)
+
+        {:ok, page} = CDPEx.new_page(browser, block: [:image, :font])
+        assert {:ok, _} = Page.navigate(page, url, wait_until: :load)
+        assert {:ok, "Assets"} = Page.text(page, "#greeting")
+
+        assert eventually(fn -> served("/style.css") end)
+        refute served("/pixel.png")
+        refute served("/font.woff2")
+      end
+    end
+
+    test "credentialed :proxy plus block: the proxy never sees the image" do
+      {:ok, %{port: proxy_port}} =
+        ProxyAuthServer.start(username: "puser", password: "ppass", report: self())
+
+      {:ok, browser} = CDPEx.launch(proxy: "http://puser:ppass@127.0.0.1:#{proxy_port}")
+      on_exit(fn -> stop_quietly(browser) end)
+
+      {:ok, page} = CDPEx.new_page(browser, block: [:image])
+      assert {:ok, _} = Page.navigate(page, "http://proxied.test/with-image", wait_until: :load)
+      assert {:ok, "Proxied"} = Page.text(page, "#greeting")
+
+      assert_received {:proxy_served, "http://proxied.test/with-image"}
+      refute_received {:proxy_served, "http://proxied.test/pixel.png"}
+    end
+
+    test "block plus interception of stylesheets: the owner sees only the stylesheet" do
+      url = assets_server()
+      {:ok, browser} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(browser) end)
+      {:ok, page} = CDPEx.new_page(browser, block: [:image])
+      test = self()
+
+      spawn_link(fn ->
+        send(
+          test,
+          {:enabled,
+           Page.enable_request_interception(page,
+             patterns: [%{"resourceType" => "Stylesheet"}, %{"resourceType" => "Image"}]
+           )}
+        )
+
+        continue_all(page, test)
+      end)
+
+      assert_receive {:enabled, :ok}, 5_000
+      assert {:ok, _} = Page.navigate(page, url, wait_until: :load)
+
+      assert_receive {:paused, _, "Stylesheet"}, 5_000
+      refute_received {:paused, _, "Image"}
+      refute served("/pixel.png")
+    end
+
+    test "block_resources(page, []) lets images through again" do
+      url = assets_server()
+      {:ok, browser} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(browser) end)
+
+      {:ok, page} = CDPEx.new_page(browser)
+      assert :ok = Page.block_resources(page, [:image])
+      assert {:ok, _} = Page.navigate(page, url, wait_until: :load)
+      refute served("/pixel.png")
+
+      # A new image, not a re-navigation: Chrome reuses the document's earlier image
+      # result from its memory cache without a request, whatever Fetch is doing.
+      assert :ok = Page.block_resources(page, [])
+      {:ok, _} = Page.evaluate(page, "new Image().src = '/pixel.png?after'; 1")
+      assert eventually(fn -> served("/pixel.png?after") end)
+    end
+
+    test "Pool.with_page(pool, fun, block: [:image])" do
+      url = assets_server()
+      {:ok, pool} = Pool.start_link(size: 1)
+      on_exit(fn -> stop_pool_quietly(pool) end)
+
+      assert {:ok, "Assets"} =
+               Pool.with_page(
+                 pool,
+                 fn page ->
+                   {:ok, _} = Page.navigate(page, url, wait_until: :load)
+                   Page.text(page, "#greeting")
+                 end,
+                 block: [:image]
+               )
+
+      assert eventually(fn -> served("/style.css") end)
+      refute served("/pixel.png")
+    end
+
+    # Known gap (docs/TODO.md item 13): a cross-site iframe is its own target, and only
+    # the page target's Fetch domain is driven. Flip these assertions once iframes are
+    # auto-attached.
+    test "a cross-site iframe's requests are not blocked (known gap)" do
+      {:ok, %{port: port}} = FixtureServer.start(report: self())
+      {:ok, browser} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(browser) end)
+
+      {:ok, page} = CDPEx.new_page(browser, block: [:image])
+      {:ok, _} = Page.navigate(page, "http://127.0.0.1:#{port}/")
+      inner = Jason.encode!("http://localhost:#{port}/with-assets")
+
+      {:ok, _} =
+        Page.evaluate(
+          page,
+          "const f = document.createElement('iframe'); f.src = #{inner}; document.body.appendChild(f); 1"
+        )
+
+      assert eventually(fn -> served("/pixel.png") end)
+    end
+
+    test "Chrome doesn't pause a WebSocket handshake (why :websocket is rejected)", %{
+      fixture: fixture
+    } do
+      {:ok, browser} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(browser) end)
+      {:ok, page} = CDPEx.new_page(browser)
+      {:ok, _} = Page.navigate(page, fixture)
+      test = self()
+
+      spawn_link(fn ->
+        send(test, {:enabled, Page.enable_request_interception(page)})
+        continue_all(page, test)
+      end)
+
+      assert_receive {:enabled, :ok}, 5_000
+      ws = String.replace(fixture, "http://", "ws://")
+      {:ok, _} = Page.evaluate(page, "new WebSocket(#{Jason.encode!(ws)}); 1")
+      Process.sleep(1_000)
+
+      refute_received {:paused, "ws" <> _, _}
+    end
+  end
+
   describe "request interception" do
     test "fulfill_request serves a synthetic response for an intercepted navigation", %{
       fixture: fixture
@@ -2215,6 +2367,15 @@ defmodule CDPEx.IntegrationTest do
   # can isolate the one a given authenticate/4 started.
   # An interception owner that fails every image it is handed (reporting it to `test`)
   # and continues anything else, until told to disable.
+  defp continue_all(page, test) do
+    receive do
+      {:cdp_event, _, "Fetch.requestPaused", %{"requestId" => id} = params, _sid} ->
+        send(test, {:paused, params["request"]["url"], params["resourceType"]})
+        _ = Page.continue_request(page, id)
+        continue_all(page, test)
+    end
+  end
+
   defp block_images(page, test) do
     receive do
       {:cdp_event, _, "Fetch.requestPaused", %{"requestId" => id} = params, _sid} ->

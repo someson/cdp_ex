@@ -133,15 +133,13 @@ the `Fetch` domain and forwards the caller only the pauses matching its
 patterns (#24). Design: `docs/design/2026-11-05-fetch-auth-and-interception.md`.
 ReqBot can drop the `Fetch.enable` workaround in its interceptor.
 
-## 10. Block resources by type
+## 10. Block resources by type — done
 
-`block: [:image, :font, :media, :stylesheet]` on a page: requests of those
-`resourceType`s fail with `net::ERR_BLOCKED_BY_CLIENT` before reaching the
-network. A common scraping speed-up (less proxy traffic, faster loads). ReqBot
-builds it from request interception plus a dedicated process that owns the
-paused requests, because the caller is blocked in a navigation wait and cannot
-answer them. Should be a library-owned handler on the `Fetch` domain, so it
-builds on item 9. Estimate: about half a day.
+`block: [...]` on `new_page/2` and `Page.block_resources/3`: requests of those
+resource types fail with `net::ERR_BLOCKED_BY_CLIENT`, resolved by the page's
+`CDPEx.Fetch` process as a third mode next to auth and interception. Design:
+`docs/design/2026-11-06-block-resources-by-type.md`. ReqBot can replace its
+image/font interceptor with `block:`.
 
 ## 11. Full document response from `navigate/3`
 
@@ -161,3 +159,15 @@ found"); the docs tell the caller to retry. ReqBot's capture retries 3 times,
 500 ms apart. Add `body: true` to `wait_for_response/3`: wait for this
 request's `loadingFinished` (or `loadingFailed`) and return the body with the
 response. Estimate: 2–3 hours.
+
+## 13. Cross-site iframes are outside the page's `Fetch` domain
+
+Chrome runs a cross-site iframe as its own `iframe` target. `CDPEx.Fetch` drives
+only the page target's `Fetch` domain, so `block:`, request interception and
+`authenticate/4` don't see that iframe's requests: checked with an image in a
+`localhost` iframe on a `127.0.0.1` page (Google Chrome 156, macOS), which reached
+the server with `block: [:image]`. The integration test "a cross-site iframe's
+requests are not blocked (known gap)" pins it. A fix would auto-attach to child
+targets (`Target.setAutoAttach` with `flatten: true` on the page session) and run
+the same Fetch modes on each iframe session. Unchecked: whether a credentialed
+`:proxy` still answers a 407 for such an iframe's requests.

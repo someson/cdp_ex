@@ -3,13 +3,16 @@ defmodule CDPEx.Fetch do
   Per-page owner of the CDP `Fetch` domain, backing `CDPEx.Page.authenticate/4`,
   the credentialed `:proxy` launch option and `CDPEx.Page.enable_request_interception/2`.
 
-  It has two independent modes, so a page can answer a proxy's login and intercept
-  requests at the same time:
+  It has three independent modes, so a page can answer a proxy's login, intercept
+  requests and block resource types at the same time:
 
     * **auth** — answers authentication challenges (`Fetch.authRequired` →
       `Fetch.continueWithAuth`) with the configured credentials;
     * **intercept** — forwards paused requests (`Fetch.requestPaused`) that match the
-      interception owner's patterns to that owner, as the original event tuple.
+      interception owner's patterns to that owner, as the original event tuple;
+    * **block** — fails Request-stage pauses of the blocked resource types with
+      `Fetch.failRequest` (`BlockedByClient`). It needs no owner process, and it wins
+      over interception: a blocked type never reaches the interception owner.
 
   Every other paused request is let through with `Fetch.continueRequest`. With auth
   on, `Fetch.enable` pauses **every** request (Chrome raises `Fetch.authRequired` only
@@ -18,7 +21,7 @@ defmodule CDPEx.Fetch do
 
   The Browser starts one per page on the first auth or interception request, and
   sends it requests with `request/3`; each result comes back to the Browser as
-  `{:fetch_reply, pid, tag, result}`. The owner stays alive, idle once both modes are
+  `{:fetch_reply, pid, tag, result}`. The owner stays alive, idle once every mode is
   off, until the page ends: it stops when the page's connection goes down, when a
   `:session` page's session detaches, or on `stop/1`.
 
@@ -44,6 +47,8 @@ defmodule CDPEx.Fetch do
     auth: nil,
     # nil | %{owner, ref, patterns, matchers}
     intercept: nil,
+    # nil | [CDP resource type string], deduplicated
+    block: nil,
     subscribed: false,
     attempts: %{},
     # requestIds forwarded to the interception owner, released if it goes away
@@ -61,6 +66,7 @@ defmodule CDPEx.Fetch do
           | {:drop_auth, reference()}
           | {:intercept, pid(), [map()], timeout()}
           | {:release_intercept, timeout()}
+          | {:block, [String.t()], timeout()}
 
   @doc false
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -109,12 +115,23 @@ defmodule CDPEx.Fetch do
           event,
         %__MODULE__{conn: conn, session_id: sid} = state
       ) do
-    if forward?(state, params) do
-      send(state.intercept.owner, event)
-      {:noreply, %{state | forwarded: track(state.forwarded, request_id)}}
-    else
-      _ = call(state, "Fetch.continueRequest", %{"requestId" => request_id})
-      {:noreply, state}
+    case decide(state, params) do
+      :block ->
+        _ =
+          call(state, "Fetch.failRequest", %{
+            "requestId" => request_id,
+            "errorReason" => "BlockedByClient"
+          })
+
+        {:noreply, state}
+
+      :forward ->
+        send(state.intercept.owner, event)
+        {:noreply, %{state | forwarded: track(state.forwarded, request_id)}}
+
+      :continue ->
+        _ = call(state, "Fetch.continueRequest", %{"requestId" => request_id})
+        {:noreply, state}
     end
   end
 
@@ -180,7 +197,7 @@ defmodule CDPEx.Fetch do
     # Best-effort: the connection may already be gone (Connection.call and
     # safe_unsubscribe both tolerate that), leaving nothing to disable.
     _ =
-      if not state.detached and (state.auth != nil or state.intercept != nil),
+      if not state.detached and any_mode?(state),
         do: call(state, "Fetch.disable", %{})
 
     _ = if state.subscribed, do: safe_unsubscribe(state)
@@ -225,6 +242,11 @@ defmodule CDPEx.Fetch do
     end
   end
 
+  defp apply_request({:block, types, timeout}, _tag, state) do
+    block = if types == [], do: nil, else: types
+    rearm(state, %{state | block: block}, timeout)
+  end
+
   defp apply_request({:release_intercept, _timeout}, _tag, %__MODULE__{intercept: nil} = state),
     do: {:ok, state}
 
@@ -233,12 +255,12 @@ defmodule CDPEx.Fetch do
     drop_intercept(state, timeout)
   end
 
-  # Interception ends (released or its owner died). With auth on, the pauses already
-  # forwarded would stay paused after the re-enable, so let them through first; a
-  # continueRequest for one the owner already resolved fails harmlessly. With auth off,
-  # Fetch.disable releases them.
+  # Interception ends (released or its owner died). With another mode still on (auth or
+  # block), the pauses already forwarded would stay paused after the re-enable, so let
+  # them through first; a continueRequest for one the owner already resolved fails
+  # harmlessly. With every other mode off, Fetch.disable releases them.
   defp drop_intercept(state, timeout) do
-    if state.auth do
+    if state.auth || state.block do
       Enum.each(state.forwarded, &call(state, "Fetch.continueRequest", %{"requestId" => &1}))
     end
 
@@ -251,14 +273,20 @@ defmodule CDPEx.Fetch do
 
   # Apply `next`'s modes to the page's Fetch domain. On success the state becomes
   # `next`; on failure it stays `prev`, whose enable is still in effect.
+  # A change that leaves the params as they are (block added while auth already pauses
+  # everything, the same block set again) needs no CDP call.
   defp rearm(prev, next, timeout) do
-    case enable_params(next.auth, next.intercept && next.intercept.patterns) do
-      nil -> disable(prev, next, timeout)
-      params -> enable(prev, next, params, timeout)
+    case {params_of(next), params_of(prev)} do
+      {nil, _} -> disable(prev, next, timeout)
+      {same, same} -> {:ok, next}
+      {params, _} -> enable(prev, next, params, timeout)
     end
   end
 
-  defp disable(%__MODULE__{auth: nil, intercept: nil}, next, _timeout), do: {:ok, next}
+  defp params_of(state),
+    do: enable_params(state.auth, state.intercept && state.intercept.patterns, state.block)
+
+  defp disable(%__MODULE__{auth: nil, intercept: nil, block: nil}, next, _timeout), do: {:ok, next}
 
   defp disable(_prev, next, timeout) do
     case call(next, "Fetch.disable", %{}, timeout) do
@@ -308,29 +336,85 @@ defmodule CDPEx.Fetch do
 
   # ── pure helpers ────────────────────────────────────────────────────────────
 
-  @doc false
-  # The Fetch.enable params for a page's modes, or nil when both are off.
-  @spec enable_params(map() | nil, [map()] | nil) :: map() | nil
-  def enable_params(nil, nil), do: nil
-  def enable_params(nil, patterns), do: %{"patterns" => patterns}
-  def enable_params(_auth, nil), do: %{"handleAuthRequests" => true}
+  @block_types %{
+    image: "Image",
+    font: "Font",
+    media: "Media",
+    stylesheet: "Stylesheet",
+    script: "Script",
+    xhr: "XHR",
+    fetch: "Fetch",
+    text_track: "TextTrack",
+    manifest: "Manifest",
+    prefetch: "Prefetch",
+    ping: "Ping",
+    event_source: "EventSource",
+    other: "Other"
+  }
 
-  def enable_params(_auth, patterns) do
+  @doc false
+  # The CDP resource types for a `:block` value, deduplicated in order. `:document`
+  # (it would fail the page's own navigation) and `:websocket` (the Fetch domain never
+  # pauses a WebSocket handshake) are not in the table, so they are invalid.
+  @spec resource_types(term()) :: {:ok, [String.t()]} | {:error, {:invalid_args, {:block, term()}}}
+  def resource_types(value) when is_list(value) do
+    if Enum.all?(value, &Map.has_key?(@block_types, &1)),
+      do: {:ok, value |> Enum.map(&Map.fetch!(@block_types, &1)) |> Enum.uniq()},
+      else: {:error, {:invalid_args, {:block, value}}}
+  end
+
+  def resource_types(value), do: {:error, {:invalid_args, {:block, value}}}
+
+  defp any_mode?(state), do: state.auth != nil or state.intercept != nil or state.block != nil
+
+  @doc false
+  # The Fetch.enable params for a page's modes, or nil when every mode is off. With auth
+  # on every request pauses anyway, so block changes nothing; with auth off, the blocked
+  # types pause at the Request stage, ahead of the caller's patterns.
+  @spec enable_params(map() | nil, [map()] | nil, [String.t()] | nil) :: map() | nil
+  def enable_params(nil, patterns, block) do
+    blocked = for type <- block || [], do: %{"resourceType" => type, "requestStage" => "Request"}
+
+    case blocked ++ (patterns || []) do
+      [] -> nil
+      all -> %{"patterns" => all}
+    end
+  end
+
+  def enable_params(_auth, nil, _block), do: %{"handleAuthRequests" => true}
+
+  def enable_params(_auth, patterns, _block) do
     response = Enum.filter(patterns, &response_stage?/1)
     %{"patterns" => [%{"urlPattern" => "*"} | response], "handleAuthRequests" => true}
   end
 
   @doc false
-  # Whether a paused request goes to the interception owner. With auth off, Chrome
-  # paused exactly the owner's patterns. With auth on, every request pauses at the
-  # Request stage, so match it here; the Response stage only has the owner's patterns.
-  @spec forward?(t(), map()) :: boolean()
-  def forward?(%__MODULE__{intercept: nil}, _params), do: false
-  def forward?(%__MODULE__{auth: nil}, _params), do: true
+  # What to do with a paused request: fail it (a blocked type at the Request stage),
+  # forward it to the interception owner, or let it through. A Request-stage pause is
+  # matched against the owner's patterns even when Chrome paused only those: with auth
+  # or block on, more requests pause than the owner asked for, and a pause made under
+  # the previous enable can arrive after a mode change (an image while the block set
+  # shrank). The Response stage only has the owner's patterns.
+  @spec decide(t(), map()) :: :block | :forward | :continue
+  def decide(state, params) do
+    cond do
+      state.block != nil and not response_pause?(params) and
+          params["resourceType"] in state.block ->
+        :block
 
-  def forward?(%__MODULE__{intercept: %{matchers: matchers}}, params) do
-    response_pause?(params) or matches?(matchers, params)
+      state.intercept == nil ->
+        :continue
+
+      owners?(state, params) ->
+        :forward
+
+      true ->
+        :continue
+    end
   end
+
+  defp owners?(%__MODULE__{intercept: %{matchers: matchers}}, params),
+    do: response_pause?(params) or matches?(matchers, params)
 
   @doc false
   # Compile the owner's Request-stage patterns into {url_regex, resource_type | nil}.

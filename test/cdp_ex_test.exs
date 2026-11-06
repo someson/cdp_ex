@@ -36,6 +36,7 @@ defmodule CDPExTest do
       {:timeout, :authenticate},
       {:timeout, :enable_request_interception},
       {:timeout, :disable_request_interception},
+      {:timeout, :block_resources},
       {:timeout, :subscribe},
       :deadline_exceeded,
       {:chrome_exited, 1, "stderr excerpt"},

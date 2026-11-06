@@ -26,9 +26,10 @@
 | `cookies/2` / `set_cookies/3` / `clear_cookies/2` | Read, set, or clear the cookies of the page's browser context (browser-wide for a page that isn't isolated) |
 | `observe_network/2` / `stop_observing_network/2` | Stream `Network` request/response events to the caller, or stop |
 | `response_body/3` | Fetch a response body by requestId (`Network.getResponseBody`) |
-| `enable_request_interception/2` / `disable_request_interception/2` | Pause matching requests for the caller to resolve, or stop |
+| `enable_request_interception/2` / `disable_request_interception/2` | Pause matching requests for the caller to resolve, or stop; combines with `authenticate/4` and a credentialed `:proxy` |
 | `continue_request/3` / `fulfill_request/3` / `fail_request/3` | Resolve a paused request (proceed / synthetic response / fail) |
 | `authenticate/4` | Answer a proxy / HTTP Basic auth challenge (call before `navigate/3`) |
+| `block_resources/3` | Fail requests of the given resource types (`:image`, `:font`, ...) before they reach the network; `[]` stops. Also `block:` on `new_page/2` |
 
 Every function is documented in full in `CDPEx.Page`; `mix docs` builds the docs.
 Recipes that combine them: [recipes.md](recipes.md).

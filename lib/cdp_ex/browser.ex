@@ -40,7 +40,8 @@ defmodule CDPEx.Browser do
 
   @create_timeout 10_000
   @bootstrap_timeout 10_000
-  # Ceiling for the synchronous proxy-auth arm during new_page (see reply_proxy_authed_page).
+  # Ceiling for the synchronous Fetch arm (proxy auth and/or block) during new_page, shared
+  # by every request it sends (see reply_armed_page).
   @arm_timeout 15_000
 
   defstruct [
@@ -124,6 +125,11 @@ defmodule CDPEx.Browser do
     * `:isolated` — `true` opens the page in a new browser context (its own cookies,
       storage and cache), disposed when the page closes. Default `false`. A value that
       isn't a boolean raises `ArgumentError`.
+    * `:block` — resource types to fail before they reach the network, e.g.
+      `[:image, :font, :media]`; armed before the page is returned, so the first
+      navigation is already filtered. See `CDPEx.Page.block_resources/3` for the types
+      and how blocking combines with login and interception. An invalid value returns
+      `{:error, {:invalid_args, {:block, value}}}` and opens no page.
 
   A `:session` page whose target goes away while it is being set up returns
   `{:error, {:session_closed, session_id}}` (`:transient`; open a new page).
@@ -138,8 +144,8 @@ defmodule CDPEx.Browser do
   # The call timeout covers the worst-case internal budget — Target.createBrowserContext
   # for an isolated page and Target.createTarget (@create_timeout each), the page
   # socket's WebSocket upgrade (15s, Connection's default) or Target.attachToTarget
-  # (@create_timeout), bootstrap (up to 4 × @bootstrap_timeout) and the proxy-auth arm
-  # (@arm_timeout): 90s on the slowest (dedicated, isolated, proxied) path, plus 5s of
+  # (@create_timeout), bootstrap (up to 4 × @bootstrap_timeout) and the Fetch arm for
+  # proxy auth and :block (@arm_timeout, shared): 90s on the slowest (dedicated, isolated, proxied) path, plus 5s of
   # slack — so a stalled stage can't make the caller give up while the Browser is
   # still working, which would orphan an armed page and its context. Normal new_page returns in well under
   # a second; this is only the pathological ceiling.
@@ -150,7 +156,9 @@ defmodule CDPEx.Browser do
       other -> raise ArgumentError, ":isolated must be a boolean, got: #{inspect(other)}"
     end
 
-    call(browser, {:new_page, opts}, 95_000, :new_page)
+    with {:ok, types} <- Fetch.resource_types(Keyword.get(opts, :block, [])) do
+      call(browser, {:new_page, Keyword.put(opts, :block, types)}, 95_000, :new_page)
+    end
   end
 
   @doc """
@@ -223,6 +231,13 @@ defmodule CDPEx.Browser do
       :enable_request_interception
     )
   end
+
+  # Internal hop for `CDPEx.Page.block_resources/3`, which validates and converts the
+  # types. Block mode has no owner process, so the caller isn't monitored.
+  @doc false
+  @spec block(GenServer.server(), Page.t(), [String.t()], timeout()) :: :ok | {:error, term()}
+  def block(browser, %Page{} = page, types, timeout),
+    do: call(browser, {:block, page, types, timeout}, timeout + 5_000, :block_resources)
 
   @doc false
   @spec release_interception(GenServer.server(), Page.t(), timeout()) :: :ok | {:error, term()}
@@ -560,6 +575,27 @@ defmodule CDPEx.Browser do
     end
   end
 
+  def handle_call(
+        {:block, %Page{conn: conn, target_id: tid, session_id: sid} = page, types, timeout},
+        from,
+        state
+      ) do
+    cond do
+      not own_page?(state, tid, conn, sid) ->
+        {:reply, {:error, :unknown_page}, state}
+
+      types == [] and not Map.has_key?(state.fetchers, tid) ->
+        # Nothing is blocked and nothing owns the page's Fetch domain: nothing to undo.
+        {:reply, :ok, state}
+
+      true ->
+        case fetch_request(state, page, from, nil, {:block, types, timeout}) do
+          {:ok, state} -> {:noreply, state}
+          {:error, reason} -> {:reply, {:error, reason}, state}
+        end
+    end
+  end
+
   def handle_call({:release_interception, %Page{target_id: tid}, timeout}, from, state) do
     case Map.get(state.fetchers, tid) do
       nil ->
@@ -767,65 +803,92 @@ defmodule CDPEx.Browser do
             contexts: put_context(state.contexts, page.target_id, context_id)
         }
 
-        case state.proxy_auth do
-          nil -> {:reply, {:ok, page}, state}
-          creds -> reply_proxy_authed_page(state, page, creds)
-        end
+        reply_armed_page(state, page, arm_requests(state, opts))
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}
     end
   end
 
-  # Browser launched with an authenticated `:proxy`: arm this page's proxy auth before
-  # returning it, so the caller navigates straight away (no manual authenticate/4). Done
-  # synchronously within new_page — which already blocks the Browser for target creation +
-  # bootstrap — so it awaits the owner's reply here instead of parking a caller in
-  # `pending`. The owner is recorded in `fetchers` like any other, so interception can
-  # join it later and the drop-on-EXIT teardown applies unchanged. On any arm failure the
-  # just-created page (never handed to the caller) is closed and the error surfaced.
-  defp reply_proxy_authed_page(state, page, creds) do
+  # What a new page's Fetch owner must arm before the page is returned: the proxy's
+  # login (browser launched with an authenticated `:proxy`), then the `:block` types
+  # (already converted to CDP types by new_page/2).
+  defp arm_requests(state, opts) do
+    auth = if state.proxy_auth, do: [{:auth, Map.put(state.proxy_auth, :source, :proxy)}], else: []
+
+    block =
+      case Keyword.get(opts, :block, []) do
+        [] -> []
+        types -> [{:block, types, @arm_timeout}]
+      end
+
+    auth ++ block
+  end
+
+  # Arm the new page's Fetch modes before returning it, so the caller navigates straight
+  # away (no manual authenticate/4 or block_resources/3). Done synchronously within
+  # new_page — which already blocks the Browser for target creation + bootstrap — so it
+  # awaits the owner's replies here instead of parking a caller in `pending`; all of
+  # them share one @arm_timeout. The owner is recorded in `fetchers` like any other, so
+  # interception can join it later and the drop-on-EXIT teardown applies unchanged. On
+  # any arm failure the just-created page (never handed to the caller) is closed and the
+  # error surfaced.
+  defp reply_armed_page(state, page, []), do: {:reply, {:ok, page}, state}
+
+  defp reply_armed_page(state, page, requests) do
     case ensure_fetcher(state, page) do
       {:ok, pid, state} ->
-        tag = make_ref()
-        Fetch.request(pid, tag, {:auth, Map.put(creds, :source, :proxy)})
+        deadline = System.monotonic_time(:millisecond) + @arm_timeout
 
-        case await_fetch_reply(pid, tag) do
+        case arm_each(pid, requests, deadline) do
           :ok -> {:reply, {:ok, page}, state}
-          {:error, reason} -> {:reply, {:error, reason}, close_failed_auth_page(state, page)}
+          {:error, reason} -> {:reply, {:error, reason}, close_failed_arm_page(state, page)}
         end
 
       {:error, reason} ->
-        {:reply, {:error, reason}, close_failed_auth_page(state, page)}
+        {:reply, {:error, reason}, close_failed_arm_page(state, page)}
     end
   end
 
-  # The proxy-auth arm failed; the just-created page was never handed to the caller, so
+  defp arm_each(_pid, [], _deadline), do: :ok
+
+  defp arm_each(pid, [request | rest], deadline) do
+    tag = make_ref()
+    Fetch.request(pid, tag, request)
+
+    case await_fetch_reply(pid, tag, max(deadline - System.monotonic_time(:millisecond), 0)) do
+      :ok -> arm_each(pid, rest, deadline)
+      {:error, _} = error -> error
+    end
+  end
+
+  # The new page's Fetch arm failed; the just-created page was never handed to the caller, so
   # close its target + connection and drop it from `pages` (best-effort — either may
   # already be gone). Ending the target also stops its Fetch owner. Returns the updated
   # state for the {:reply, …} tuple.
-  defp close_failed_auth_page(state, %Page{target_id: tid, session_id: nil, conn: conn}) do
+  defp close_failed_arm_page(state, %Page{target_id: tid, session_id: nil, conn: conn}) do
     safe_close(conn)
     state = end_target(state, tid)
     %{state | pages: Map.delete(state.pages, tid)}
   end
 
-  defp close_failed_auth_page(state, %Page{target_id: tid, session_id: sid}) do
+  defp close_failed_arm_page(state, %Page{target_id: tid, session_id: sid}) do
     detach_session(state.browser_conn, sid)
     state = end_target(state, tid)
     %{state | sessions: Map.delete(state.sessions, tid)}
   end
 
   # Block (inside the new_page call) until the Fetch owner replies. It is linked and we
-  # trap exits, so a crash arrives as {:EXIT, pid, _}. Bounded by @arm_timeout; the
-  # caller then closes the page, which stops the owner. A late reply or {:EXIT} for this
-  # pid arriving after we return is handled harmlessly by the handle_info clauses.
-  defp await_fetch_reply(pid, tag) do
+  # trap exits, so a crash arrives as {:EXIT, pid, _}. Bounded by `timeout` (what is left
+  # of @arm_timeout); the caller then closes the page, which stops the owner. A late reply
+  # or {:EXIT} for this pid arriving after we return is handled harmlessly by the
+  # handle_info clauses.
+  defp await_fetch_reply(pid, tag, timeout) do
     receive do
       {:fetch_reply, ^pid, ^tag, result} -> result
       {:EXIT, ^pid, reason} -> {:error, fetch_exit_reason(reason)}
     after
-      @arm_timeout -> {:error, :timeout}
+      timeout -> {:error, :timeout}
     end
   end
 
@@ -842,10 +905,7 @@ defmodule CDPEx.Browser do
         contexts = put_context(state.contexts, page.target_id, context_id)
         state = %{state | sessions: sessions, contexts: contexts}
 
-        case state.proxy_auth do
-          nil -> {:reply, {:ok, page}, state}
-          creds -> reply_proxy_authed_page(state, page, creds)
-        end
+        reply_armed_page(state, page, arm_requests(state, opts))
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}

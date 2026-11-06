@@ -106,8 +106,8 @@ defmodule CDPEx do
   Two timeout shapes, by layer: the low-level `CDPEx.Connection.call/5`,
   `await_event/4` and `subscribe/4` and the `CDPEx.Browser` requests return
   `{:timeout, context}` (a CDP method, `:await_event`, `:subscribe`, `:new_page`,
-  `:close_page`, `:authenticate`, `:enable_request_interception` or
-  `:disable_request_interception`), while the high-level `CDPEx.Page` `wait_for_*` functions and `CDPEx.Pool.checkout/2`
+  `:close_page`, `:authenticate`, `:enable_request_interception`,
+  `:disable_request_interception` or `:block_resources`), while the high-level `CDPEx.Page` `wait_for_*` functions and `CDPEx.Pool.checkout/2`
   return a bare `:timeout` ("the awaited condition didn't happen in time").
 
   A WebSocket frame that fails to decode is not a standalone reason: the connection
@@ -131,6 +131,7 @@ defmodule CDPEx do
              | :authenticate
              | :enable_request_interception
              | :disable_request_interception
+             | :block_resources
              | :subscribe}
           | {:navigate, String.t()}
           | {:no_document_response, String.t()}
@@ -346,8 +347,9 @@ defmodule CDPEx do
   passwords).
 
   Pages of both transports are armed, including the `:session` pages of a `pipe: true`
-  browser. An auto-armed page can't also use `enable_request_interception/2` (both
-  drive the `Fetch` domain). A malformed `:proxy` — or combining it with a full `:args` override —
+  browser. An auto-armed page still takes `CDPEx.Page.enable_request_interception/2`
+  and `block:` / `CDPEx.Page.block_resources/3`: one process per page drives the
+  `Fetch` domain for all of them. A malformed `:proxy` — or combining it with a full `:args` override —
   fails the launch with `{:error, {:invalid_proxy, _}}` (`:proxy` appends to `:extra_args`,
   which an `:args` override discards, so the two are mutually exclusive; use one). Don't
   set `--proxy-server` in `:extra_args` yourself when using `:proxy`.

@@ -58,14 +58,16 @@ defmodule CDPEx.FetchTest do
     end
   end
 
-  describe "enable_params/2" do
+  describe "enable_params/3" do
+    @img_req %{"resourceType" => "Image", "requestStage" => "Request"}
+
     test "auth only pauses everything and handles auth" do
-      assert Fetch.enable_params(%{}, nil) == %{"handleAuthRequests" => true}
+      assert Fetch.enable_params(%{}, nil, nil) == %{"handleAuthRequests" => true}
     end
 
     test "interception only sends the caller's patterns as they are" do
       patterns = [%{"urlPattern" => "*.png", "requestStage" => "Response"}]
-      assert Fetch.enable_params(nil, patterns) == %{"patterns" => patterns}
+      assert Fetch.enable_params(nil, patterns, nil) == %{"patterns" => patterns}
     end
 
     test "both pause every request and keep the caller's Response-stage patterns" do
@@ -74,7 +76,7 @@ defmodule CDPEx.FetchTest do
         %{"urlPattern" => "*/api/*", "requestStage" => "Response"}
       ]
 
-      assert Fetch.enable_params(%{}, patterns) == %{
+      assert Fetch.enable_params(%{}, patterns, nil) == %{
                "patterns" => [
                  %{"urlPattern" => "*"},
                  %{"urlPattern" => "*/api/*", "requestStage" => "Response"}
@@ -83,8 +85,69 @@ defmodule CDPEx.FetchTest do
              }
     end
 
-    test "neither means disabled" do
-      assert Fetch.enable_params(nil, nil) == nil
+    test "block only pauses just the blocked types at the Request stage" do
+      assert Fetch.enable_params(nil, nil, ["Image", "Font"]) == %{
+               "patterns" => [
+                 @img_req,
+                 %{"resourceType" => "Font", "requestStage" => "Request"}
+               ]
+             }
+    end
+
+    test "block and interception send the blocked types first, then the caller's" do
+      assert Fetch.enable_params(nil, [%{"urlPattern" => "*.css"}], ["Image"]) == %{
+               "patterns" => [@img_req, %{"urlPattern" => "*.css"}]
+             }
+    end
+
+    test "auth with block is the auth shape" do
+      assert Fetch.enable_params(%{}, nil, ["Image"]) == %{"handleAuthRequests" => true}
+
+      response = [%{"urlPattern" => "*/api/*", "requestStage" => "Response"}]
+
+      assert Fetch.enable_params(%{}, response, ["Image"]) ==
+               Fetch.enable_params(%{}, response, nil)
+    end
+
+    test "nothing on means disabled" do
+      assert Fetch.enable_params(nil, nil, nil) == nil
+    end
+  end
+
+  describe "resource_types/1" do
+    test "each block atom maps to its CDP resource type" do
+      table = [
+        image: "Image",
+        font: "Font",
+        media: "Media",
+        stylesheet: "Stylesheet",
+        script: "Script",
+        xhr: "XHR",
+        fetch: "Fetch",
+        text_track: "TextTrack",
+        manifest: "Manifest",
+        prefetch: "Prefetch",
+        ping: "Ping",
+        event_source: "EventSource",
+        other: "Other"
+      ]
+
+      for {atom, type} <- table, do: assert(Fetch.resource_types([atom]) == {:ok, [type]})
+      assert Fetch.resource_types(Keyword.keys(table)) == {:ok, Keyword.values(table)}
+    end
+
+    test "duplicates collapse" do
+      assert Fetch.resource_types([:image, :font, :image]) == {:ok, ["Image", "Font"]}
+    end
+
+    test "an empty list blocks nothing" do
+      assert Fetch.resource_types([]) == {:ok, []}
+    end
+
+    test "documents, websockets, unknown atoms and non-lists are invalid" do
+      for bad <- [[:document], [:websocket], [:nope], ["Image"], [:image, "Font"], :image, nil] do
+        assert Fetch.resource_types(bad) == {:error, {:invalid_args, {:block, bad}}}
+      end
     end
   end
 
@@ -134,32 +197,66 @@ defmodule CDPEx.FetchTest do
     end
   end
 
-  describe "forward?/2" do
-    defp with_modes(auth, patterns) do
+  describe "decide/2" do
+    defp with_modes(auth, patterns, block \\ nil) do
       intercept =
         patterns && %{owner: self(), patterns: patterns, matchers: Fetch.compile_matchers(patterns)}
 
-      %Fetch{auth: auth, intercept: intercept}
+      %Fetch{auth: auth, intercept: intercept, block: block}
     end
 
     test "nothing is forwarded without interception" do
-      refute Fetch.forward?(with_modes(%{}, nil), paused("https://a/"))
+      assert Fetch.decide(with_modes(%{}, nil), paused("https://a/")) == :continue
     end
 
-    test "without auth every pause is the owner's (Chrome applied its patterns)" do
-      assert Fetch.forward?(with_modes(nil, [%{"resourceType" => "Image"}]), paused("https://a/"))
+    test "with interception alone, the owner gets the pauses matching its patterns" do
+      state = with_modes(nil, [%{"resourceType" => "Image"}])
+      assert Fetch.decide(state, paused("https://a/x.png", "Image")) == :forward
+    end
+
+    test "with interception alone, a pause outside the owner's patterns continues" do
+      # A pause Chrome made under the previous enable (an image while the block set
+      # shrank to nothing) arrives after the state changed: it isn't the owner's.
+      state = with_modes(nil, [%{"resourceType" => "Stylesheet"}])
+      assert Fetch.decide(state, paused("https://a/x.png", "Image")) == :continue
     end
 
     test "with auth only matching Request-stage pauses and every Response-stage pause go" do
       state = with_modes(%{}, [%{"resourceType" => "Image"}])
-      assert Fetch.forward?(state, paused("https://a/x.png", "Image"))
-      refute Fetch.forward?(state, paused("https://a/", "Document"))
+      assert Fetch.decide(state, paused("https://a/x.png", "Image")) == :forward
+      assert Fetch.decide(state, paused("https://a/", "Document")) == :continue
 
       response = Map.put(paused("https://a/", "Document"), "responseStatusCode", 200)
-      assert Fetch.forward?(state, response)
+      assert Fetch.decide(state, response) == :forward
 
       failed = Map.put(paused("https://a/", "Document"), "responseErrorReason", "Failed")
-      assert Fetch.forward?(state, failed)
+      assert Fetch.decide(state, failed) == :forward
+    end
+
+    test "a blocked type at the Request stage is :block, whatever the other modes" do
+      for auth <- [nil, %{}], patterns <- [nil, [%{"urlPattern" => "*"}]] do
+        state = with_modes(auth, patterns, ["Image"])
+        assert Fetch.decide(state, paused("https://a/x.png", "Image")) == :block
+      end
+    end
+
+    test "Response-stage pauses are never blocked" do
+      state =
+        with_modes(nil, [%{"resourceType" => "Image", "requestStage" => "Response"}], ["Image"])
+
+      response = Map.put(paused("https://a/x.png", "Image"), "responseStatusCode", 200)
+      assert Fetch.decide(state, response) == :forward
+    end
+
+    test "with block on and auth off, Request-stage pauses are matched against the owner's patterns" do
+      state = with_modes(nil, [%{"urlPattern" => "*.css"}], ["Image"])
+      assert Fetch.decide(state, paused("https://a/x.css", "Stylesheet")) == :forward
+      assert Fetch.decide(state, paused("https://a/", "Document")) == :continue
+    end
+
+    test "block alone continues what it doesn't block" do
+      state = with_modes(nil, nil, ["Image"])
+      assert Fetch.decide(state, paused("https://a/", "Document")) == :continue
     end
   end
 
@@ -230,7 +327,7 @@ defmodule CDPEx.FetchTest do
       assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
     end
 
-    test "interception alone sends the caller's patterns and forwards every pause", %{
+    test "interception alone sends the caller's patterns and forwards its pauses", %{
       conn: conn,
       fake: fake
     } do
@@ -242,7 +339,7 @@ defmodule CDPEx.FetchTest do
       assert expect_call(fake, "Fetch.enable") == %{"patterns" => patterns}
       assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
 
-      pause(fake, "r1", "https://a.test/", "Document")
+      pause(fake, "r1", "https://a.test/x.png", "Image")
       assert_receive {:cdp_event, ^conn, "Fetch.requestPaused", %{"requestId" => "r1"}, nil}, 2_000
       refute_receive {:fake_cdp_recv, ^fake, %{"method" => "Fetch.continueRequest"}}, 100
 
@@ -428,6 +525,119 @@ defmodule CDPEx.FetchTest do
 
       assert_receive {:EXIT, ^pid, :normal}, 2_000
       refute_received {:fake_cdp_recv, ^fake, %{"params" => %{"requestId" => "r2"}}}
+    end
+
+    test "block alone enables the blocked types and fails their pauses with BlockedByClient", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+
+      tag = make_ref()
+      Fetch.request(pid, tag, {:block, ["Image"], 5_000})
+
+      assert expect_call(fake, "Fetch.enable") ==
+               Fetch.enable_params(nil, nil, ["Image"])
+
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+
+      pause(fake, "img", "https://a.test/x.png", "Image")
+
+      assert expect_call(fake, "Fetch.failRequest") == %{
+               "requestId" => "img",
+               "errorReason" => "BlockedByClient"
+             }
+
+      refute_received {:cdp_event, _, "Fetch.requestPaused", _, _}
+    end
+
+    test "block [] disables Fetch when it was the only mode", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      arm(pid, fake, {:block, ["Image"], 5_000})
+
+      tag = make_ref()
+      Fetch.request(pid, tag, {:block, [], 5_000})
+      expect_call(fake, "Fetch.disable")
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+    end
+
+    test "with block and interception, a blocked type is failed, never forwarded", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+      arm(pid, fake, {:intercept, self(), [%{"urlPattern" => "*"}], 5_000})
+      arm(pid, fake, {:block, ["Image"], 5_000})
+
+      pause(fake, "img", "https://a.test/x.png", "Image")
+      assert %{"requestId" => "img"} = expect_call(fake, "Fetch.failRequest")
+      refute_received {:cdp_event, _, "Fetch.requestPaused", %{"requestId" => "img"}, _}
+
+      pause(fake, "doc", "https://a.test/", "Document")
+      assert_receive {:cdp_event, ^conn, "Fetch.requestPaused", %{"requestId" => "doc"}, nil}, 2_000
+    end
+
+    test "with auth and block, blocked types fail and the rest continue", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+      arm(pid, fake, {:auth, @auth})
+
+      # Auth already pauses everything, so block changes no enable param: no CDP call.
+      tag = make_ref()
+      Fetch.request(pid, tag, {:block, ["Image"], 5_000})
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+      refute_received {:fake_cdp_recv, ^fake, %{"method" => "Fetch.enable"}}
+
+      pause(fake, "img", "https://a.test/x.png", "Image")
+      assert %{"requestId" => "img"} = expect_call(fake, "Fetch.failRequest")
+
+      pause(fake, "doc", "https://a.test/", "Document")
+      assert expect_call(fake, "Fetch.continueRequest") == %{"requestId" => "doc"}
+    end
+
+    test "an owner that dies with block on: its pauses are let through, block re-armed alone", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+      owner = relay_owner()
+      arm(pid, fake, {:intercept, owner, [%{"urlPattern" => "*.css"}], 5_000})
+      arm(pid, fake, {:block, ["Image"], 5_000})
+
+      pause(fake, "css", "https://a.test/x.css", "Stylesheet")
+      assert_receive {:owner_got, {:cdp_event, _, "Fetch.requestPaused", _, _}}, 2_000
+
+      Process.exit(owner, :kill)
+
+      assert expect_call(fake, "Fetch.continueRequest") == %{"requestId" => "css"}
+      assert expect_call(fake, "Fetch.enable") == Fetch.enable_params(nil, nil, ["Image"])
+    end
+
+    test "a mode change that leaves the enable params as they are sends no Fetch.enable", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+      arm(pid, fake, {:block, ["Image"], 5_000})
+
+      tag = make_ref()
+      Fetch.request(pid, tag, {:block, ["Image"], 5_000})
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+      refute_receive {:fake_cdp_recv, ^fake, %{"method" => "Fetch.enable"}}, 100
+
+      # A real change still re-enables.
+      arm(pid, fake, {:block, ["Image", "Font"], 5_000})
+    end
+
+    test "terminate disables Fetch when only block is on", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      arm(pid, fake, {:block, ["Image"], 5_000})
+
+      stopper = Task.async(fn -> GenServer.stop(pid) end)
+      expect_call(fake, "Fetch.disable")
+      Task.await(stopper)
     end
   end
 

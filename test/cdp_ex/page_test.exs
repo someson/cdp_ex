@@ -18,6 +18,11 @@ defmodule CDPEx.PageTest.StubBrowser do
     {:reply, reply, state}
   end
 
+  def handle_call({:block, page, types, timeout}, _from, {reply, notify} = state) do
+    if notify, do: send(notify, {:stub_block, page, types, timeout})
+    {:reply, reply, state}
+  end
+
   def handle_call({:release_interception, page, timeout}, _from, {_reply, notify} = state) do
     if notify, do: send(notify, {:stub_release, page, timeout})
     {:reply, :ok, state}
@@ -1568,6 +1573,27 @@ defmodule CDPEx.PageTest do
       for method <- @network_methods, do: refute(subscribed?(conn, observer, method))
 
       send(observer, :stop)
+    end
+  end
+
+  describe "block_resources/3" do
+    test "hands the CDP types and the timeout to the browser", %{page: page} do
+      assert :ok = Page.block_resources(page, [:image, :font, :image], timeout: 3_000)
+      assert_receive {:stub_block, ^page, ["Image", "Font"], 3_000}
+    end
+
+    test "defaults the timeout to 10s and passes [] through", %{page: page} do
+      assert :ok = Page.block_resources(page, [])
+      assert_receive {:stub_block, ^page, [], 10_000}
+    end
+
+    test "rejects an invalid list before calling the browser", %{page: page} do
+      dead = %{page | browser: spawn(fn -> :ok end)}
+
+      assert Page.block_resources(dead, [:document]) ==
+               {:error, {:invalid_args, {:block, [:document]}}}
+
+      refute_received {:stub_block, _, _, _}
     end
   end
 
