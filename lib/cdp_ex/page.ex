@@ -30,6 +30,7 @@ defmodule CDPEx.Page do
 
   alias CDPEx.Browser
   alias CDPEx.Connection
+  alias CDPEx.Fetch
   alias CDPEx.ProcessLabel
   alias CDPEx.Protocol
   alias CDPEx.Telemetry
@@ -2033,6 +2034,46 @@ defmodule CDPEx.Page do
   def disable_request_interception(%__MODULE__{} = page, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
     Browser.release_interception(page.browser, page, timeout)
+  end
+
+  @doc """
+  Blocks requests of the given resource types on the page: each one fails with
+  `net::ERR_BLOCKED_BY_CLIENT` before it reaches the network. A common scraping
+  speed-up: less proxy traffic and faster loads.
+
+      :ok = CDPEx.Page.block_resources(page, [:image, :font, :media])
+
+  The list replaces the page's previous one; `[]` turns blocking off. To block from
+  the first navigation, pass `block:` to `CDPEx.Browser.new_page/2` instead (also
+  accepted by `CDPEx.with_page/3` and `CDPEx.Pool.with_page/3`).
+
+  Types: `:image`, `:font`, `:media`, `:stylesheet`, `:script`, `:xhr`, `:fetch`,
+  `:text_track`, `:manifest`, `:prefetch`, `:ping`, `:event_source`, `:other`.
+  `:document` is not accepted (it would fail the page's own navigation; iframes share
+  the type, so block those by URL with `enable_request_interception/2`), nor is
+  `:websocket` (Chrome doesn't pause WebSocket handshakes, so it would do nothing). An
+  invalid value returns `{:error, {:invalid_args, {:block, value}}}`.
+
+  The library fails the requests itself, so no process has to handle them and the
+  calling process may exit; blocking lasts until changed or until the page closes.
+  It combines with `authenticate/4`, a credentialed `:proxy` and
+  `enable_request_interception/2`. A blocked type never reaches the interception
+  owner, even when its patterns match it. Without login on the page, only the
+  blocked types are paused, so the other requests cost nothing extra.
+
+  A `{:error, {:timeout, :block_resources}}` may still take effect later; call again
+  to settle the list.
+
+  Options:
+    * `:timeout` — ms for the CDP calls (default 10_000)
+  """
+  @spec block_resources(t(), [atom()], keyword()) :: :ok | {:error, term()}
+  def block_resources(%__MODULE__{} = page, types, opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, @command_timeout)
+
+    with {:ok, cdp_types} <- Fetch.resource_types(types) do
+      Browser.block(page.browser, page, cdp_types, timeout)
+    end
   end
 
   @pattern_keys %{

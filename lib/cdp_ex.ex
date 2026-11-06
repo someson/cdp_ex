@@ -131,6 +131,7 @@ defmodule CDPEx do
              | :authenticate
              | :enable_request_interception
              | :disable_request_interception
+             | :block_resources
              | :subscribe}
           | {:navigate, String.t()}
           | {:no_document_response, String.t()}

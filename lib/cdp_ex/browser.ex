@@ -224,6 +224,13 @@ defmodule CDPEx.Browser do
     )
   end
 
+  # Internal hop for `CDPEx.Page.block_resources/3`, which validates and converts the
+  # types. Block mode has no owner process, so the caller isn't monitored.
+  @doc false
+  @spec block(GenServer.server(), Page.t(), [String.t()], timeout()) :: :ok | {:error, term()}
+  def block(browser, %Page{} = page, types, timeout),
+    do: call(browser, {:block, page, types, timeout}, timeout + 5_000, :block_resources)
+
   @doc false
   @spec release_interception(GenServer.server(), Page.t(), timeout()) :: :ok | {:error, term()}
   def release_interception(browser, %Page{} = page, timeout) do
@@ -557,6 +564,27 @@ defmodule CDPEx.Browser do
       end
     else
       {:reply, {:error, :unknown_page}, state}
+    end
+  end
+
+  def handle_call(
+        {:block, %Page{conn: conn, target_id: tid, session_id: sid} = page, types, timeout},
+        from,
+        state
+      ) do
+    cond do
+      not own_page?(state, tid, conn, sid) ->
+        {:reply, {:error, :unknown_page}, state}
+
+      types == [] and not Map.has_key?(state.fetchers, tid) ->
+        # Nothing is blocked and nothing owns the page's Fetch domain: nothing to undo.
+        {:reply, :ok, state}
+
+      true ->
+        case fetch_request(state, page, from, nil, {:block, types, timeout}) do
+          {:ok, state} -> {:noreply, state}
+          {:error, reason} -> {:reply, {:error, reason}, state}
+        end
     end
   end
 

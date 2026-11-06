@@ -114,6 +114,43 @@ defmodule CDPEx.FetchTest do
     end
   end
 
+  describe "resource_types/1" do
+    test "each block atom maps to its CDP resource type" do
+      table = [
+        image: "Image",
+        font: "Font",
+        media: "Media",
+        stylesheet: "Stylesheet",
+        script: "Script",
+        xhr: "XHR",
+        fetch: "Fetch",
+        text_track: "TextTrack",
+        manifest: "Manifest",
+        prefetch: "Prefetch",
+        ping: "Ping",
+        event_source: "EventSource",
+        other: "Other"
+      ]
+
+      for {atom, type} <- table, do: assert(Fetch.resource_types([atom]) == {:ok, [type]})
+      assert Fetch.resource_types(Keyword.keys(table)) == {:ok, Keyword.values(table)}
+    end
+
+    test "duplicates collapse" do
+      assert Fetch.resource_types([:image, :font, :image]) == {:ok, ["Image", "Font"]}
+    end
+
+    test "an empty list blocks nothing" do
+      assert Fetch.resource_types([]) == {:ok, []}
+    end
+
+    test "documents, websockets, unknown atoms and non-lists are invalid" do
+      for bad <- [[:document], [:websocket], [:nope], ["Image"], [:image, "Font"], :image, nil] do
+        assert Fetch.resource_types(bad) == {:error, {:invalid_args, {:block, bad}}}
+      end
+    end
+  end
+
   describe "compile_matchers/1 + matches?/2" do
     defp paused(url, type \\ "Document"),
       do: %{"requestId" => "R", "request" => %{"url" => url}, "resourceType" => type}

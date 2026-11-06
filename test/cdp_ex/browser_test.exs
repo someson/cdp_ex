@@ -252,6 +252,37 @@ defmodule CDPEx.BrowserTest do
                Browser.handle_call({:intercept, page, [], 5_000}, {self(), make_ref()}, foreign)
     end
 
+    test "block parks the caller and sends the types to the page's owner", %{
+      conn: conn,
+      fetcher: fetcher
+    } do
+      page = %Page{browser: self(), conn: conn, target_id: "T1"}
+      state = %Browser{pages: %{"T1" => conn}, fetchers: %{"T1" => fetcher}}
+      from = {self(), make_ref()}
+
+      assert {:noreply, new_state} =
+               Browser.handle_call({:block, page, ["Image"], 5_000}, from, state)
+
+      assert_receive {:fetcher_got, {:fetch_request, tag, {:block, ["Image"], 5_000}}}
+      assert {^from, nil, ^fetcher} = new_state.pending[tag]
+    end
+
+    test "block on a page this browser doesn't own is :unknown_page" do
+      page = %Page{browser: self(), conn: self(), target_id: "T1", session_id: "S1"}
+      other = %Browser{browser_conn: self(), sessions: %{"T1" => "OTHER"}}
+
+      assert {:reply, {:error, :unknown_page}, ^other} =
+               Browser.handle_call({:block, page, ["Image"], 5_000}, {self(), make_ref()}, other)
+    end
+
+    test "block [] on a page with no Fetch owner replies :ok and starts none", %{conn: conn} do
+      page = %Page{browser: self(), conn: conn, target_id: "T1"}
+      state = %Browser{pages: %{"T1" => conn}}
+
+      assert {:reply, :ok, ^state} =
+               Browser.handle_call({:block, page, [], 5_000}, {self(), make_ref()}, state)
+    end
+
     test "release with no Fetch owner is an idempotent :ok" do
       page = %Page{browser: self(), conn: self(), target_id: "T_GONE"}
       state = %Browser{}

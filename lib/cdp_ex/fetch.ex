@@ -330,6 +330,35 @@ defmodule CDPEx.Fetch do
 
   # ── pure helpers ────────────────────────────────────────────────────────────
 
+  @block_types %{
+    image: "Image",
+    font: "Font",
+    media: "Media",
+    stylesheet: "Stylesheet",
+    script: "Script",
+    xhr: "XHR",
+    fetch: "Fetch",
+    text_track: "TextTrack",
+    manifest: "Manifest",
+    prefetch: "Prefetch",
+    ping: "Ping",
+    event_source: "EventSource",
+    other: "Other"
+  }
+
+  @doc false
+  # The CDP resource types for a `:block` value, deduplicated in order. `:document`
+  # (it would fail the page's own navigation) and `:websocket` (the Fetch domain never
+  # pauses a WebSocket handshake) are not in the table, so they are invalid.
+  @spec resource_types(term()) :: {:ok, [String.t()]} | {:error, {:invalid_args, {:block, term()}}}
+  def resource_types(value) when is_list(value) do
+    if Enum.all?(value, &Map.has_key?(@block_types, &1)),
+      do: {:ok, value |> Enum.map(&Map.fetch!(@block_types, &1)) |> Enum.uniq()},
+      else: {:error, {:invalid_args, {:block, value}}}
+  end
+
+  def resource_types(value), do: {:error, {:invalid_args, {:block, value}}}
+
   defp any_mode?(state), do: state.auth != nil or state.intercept != nil or state.block != nil
 
   @doc false
