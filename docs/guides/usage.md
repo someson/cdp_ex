@@ -148,3 +148,17 @@ Each `CDPEx.Pool.with_page/3` job runs in its own browser context: the cookies,
 `isolated: false` to share the browser's default context, for example to keep a
 login between calls. A browser borrowed with `with_browser/3` or `checkout/2` is
 reused as is: open its pages with `isolated: true` to keep jobs apart.
+
+By default a browser serves one job at a time. Where memory is shorter than CPU,
+let several jobs share one with `:pages_per_browser`:
+
+```elixir
+{CDPEx.Pool, name: MyPool, size: 2, pages_per_browser: 4}
+```
+
+This serves 8 parallel jobs on 2 Chromes. In the benchmark
+(`docs/design/2026-11-06-pool-pages-per-browser.md`) that took about 44% less memory than `size: 8` for about 20% fewer jobs per
+second. A job goes to the least-loaded warm browser with a free slot; the next
+browser launches only when every warm one is full. Share browsers through
+`with_page/3`: a job holding the whole browser (`with_browser/3`, `checkout/2`)
+can stop it or change browser-wide state under the others.

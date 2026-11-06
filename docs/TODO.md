@@ -14,6 +14,8 @@ headless, a local fixture server, 3 rounds, medians.
    `--disable-component-extensions-with-background-pages` added (#15): one Chrome
    process and about 13 MB less at cold start.
 5. Reproducible benchmark: `bench/` (see `bench/README.md`).
+8. Several pages per pooled browser: `pages_per_browser:` on `CDPEx.Pool`.
+   `docs/design/2026-11-06-pool-pages-per-browser.md`, with the measurements.
 9. Proxy login and request interception on one page (#24).
    `docs/design/2026-11-05-fetch-auth-and-interception.md`.
 10. Block resources by type: `block:` (#25).
@@ -50,37 +52,6 @@ moving Chrome off the application host, a farm of browser hosts behind one pool,
 or a cloud browser provider. The remote DevTools endpoint needs TLS and a token
 in front of it, since it gives full control of the browser.
 
-## 8. Several pages per pooled browser — measured, not built
-
-`CDPEx.Pool` hands a browser to one job at a time, so 8 parallel jobs run 8
-Chromes. A `pages_per_browser:` option would let `size: 2, pages_per_browser: 4`
-serve the same 8 jobs on 2 Chromes.
-
-Measured 2026-11-06 with `bench/` (`concurrent`, 8 workers, isolated pages as in
-`Pool.with_page/3`; Docker on an Apple Silicon host, Chrome for Testing 156
-arm64, 3 rounds of 20 s, medians):
-
-| Browsers × pages | CPUs | jobs/s | `new_page` p50 / p95 ms | peak PSS MB | procs | CPU s |
-|---|---|---|---|---|---|---|
-| 8 × 1 | 8 | 17.6 | 290 / 436 | 1712 | 86 | 116 |
-| 2 × 4 | 8 | 13.6 | 254 / 395 | 966 | 34 | 120 |
-| 1 × 8 | 8 | 8.6 | 419 / 604 | 831 | 24 | 77 |
-| 8 × 1 | 4 | 8.9 | 589 / 799 | 1716 | 86 | 63 |
-| 2 × 4 | 4 | 7.2 | 471 / 706 | 960 | 34 | 66 |
-| 1 × 8 | 4 | 7.8 | 451 / 664 | 799 | 23 | 67 |
-
-- 2 × 4 takes about 44% less memory than 8 × 1 (≈960 vs ≈1710 MB) for about 20%
-  fewer jobs/s, at 4 and at 8 CPUs.
-- One browser tops out near 8–9 jobs/s whatever the CPUs: at 8 CPUs 1 × 8 uses
-  under 4 of them and its `new_page` p50 rises to ~420 ms. That ceiling is either
-  `CDPEx.Browser` serving page setup one call at a time or Chrome's own browser
-  process; untested which.
-- With CPU to spare, a browser costs ~210 MB and lifts throughput; the option
-  pays off only where memory, not CPU, is short.
-
-Rerun: `CPUS=8 BROWSERS=2 CONCURRENCY=8 SCENARIOS=concurrent LIBS=cdp_ex
-CDP_EX_PAGE_OPTS="[isolated: true]" bench/docker.sh`.
-
 ## 13a. An iframe left paused if the Fetch owner dies — unverified
 
 Whether Chrome resumes a cross-site iframe left waiting if the page's
@@ -94,7 +65,6 @@ the click in a line gap, iframes, hover, file upload, JS dialogs, console
 messages, downloads (#42) and the lost first click into a just-loaded
 cross-site iframe (#43). Still open, roughly by how often a scraper needs it:
 
-- **Timezone, clock, tracing.** playwright_ex only (ChromicPDF: timezone).
 - **PDF extras.** Header/footer templates, PDF from an HTML string, PDF/A:
   ChromicPDF only.
 - **Firefox / WebKit.** playwright_ex (Playwright's builds); Wallaby Firefox only

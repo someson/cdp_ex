@@ -14,8 +14,11 @@ defmodule CDPEx.Pool do
         CDPEx.Page.html(page)
       end)
 
-  Browsers are launched **lazily** up to `:size` and reused thereafter.
-  `checkout/2` blocks (up to `:checkout_timeout`) when every browser is busy. The
+  Browsers are launched **lazily** up to `:size` and reused thereafter. Each
+  browser is lent to up to `:pages_per_browser` callers at once (one by default);
+  a checkout goes to the least-loaded warm browser with a free slot, and a new
+  browser is launched only when every warm one is full. `checkout/2` blocks (up
+  to `:checkout_timeout`) when every slot is taken. The
   pool is resilient: a caller that crashes while holding a browser has it returned
   automatically, and a browser that crashes is dropped and relaunched on demand —
   so `:size` self-heals. Put the pool under your supervision tree; its
@@ -29,6 +32,13 @@ defmodule CDPEx.Pool do
   ## Options
 
     * `:size` — maximum number of browsers (default `1`)
+    * `:pages_per_browser` — how many checkouts share one browser at a time (default
+      `1`). `size: 2, pages_per_browser: 4` serves 8 parallel jobs on 2 Chromes, for
+      less memory and fewer jobs per second than 8 × 1. Sharing jobs should use
+      `with_page/3`: its isolated context keeps their cookies and storage apart,
+      while a holder of the whole browser (`with_browser/3`, `checkout/2`) can stop
+      it or change browser-wide state under the others. Page setup on one browser
+      runs one at a time, so it queues behind the other holders'.
     * `:launch_opts` — options passed to each `CDPEx.Browser` (see `CDPEx.Chrome`); any
       `:owner` here is ignored — the pool owns its browsers and sets it itself
     * `:checkout_timeout` — ms to wait for a free browser (default `5_000`)
@@ -54,13 +64,15 @@ defmodule CDPEx.Pool do
     :launch_opts,
     :start_fun,
     :task_sup,
-    available: [],
-    busy: %{},
+    pages_per_browser: 1,
+    # browser => number of checkouts holding it, for every adopted browser.
+    loads: %{},
+    # owner monitor ref => {browser, owner}, one per checkout.
+    holders: %{},
     waiting: :queue.new(),
     # task_ref => true for each in-flight async launch; counts toward :size so
-    # count + map_size(launching) never exceeds it.
-    launching: %{},
-    count: 0
+    # map_size(loads) + map_size(launching) never exceeds it.
+    launching: %{}
   ]
 
   @type t :: %__MODULE__{}
@@ -74,6 +86,8 @@ defmodule CDPEx.Pool do
 
     if !Keyword.has_key?(pool_opts, :start_fun),
       do: Browser.validate_launch_opts!(Keyword.get(pool_opts, :launch_opts, []))
+
+    validate_pages_per_browser!(Keyword.get(pool_opts, :pages_per_browser, 1))
 
     GenServer.start_link(__MODULE__, pool_opts, gen_opts)
   end
@@ -90,6 +104,10 @@ defmodule CDPEx.Pool do
 
   @doc """
   Borrows a browser, blocking up to `timeout` ms when all are busy.
+
+  With `:pages_per_browser` above 1 the browser may be lent to other callers at
+  the same time, and one caller may get the same browser from several checkouts;
+  each checkout takes one slot and each `checkin/2` frees one.
 
   Returns `{:ok, browser}`, `{:error, :timeout}`, or `{:error, reason}` if a
   browser had to be launched and failed — a launch error is reported to a waiting
@@ -127,7 +145,7 @@ defmodule CDPEx.Pool do
   Only the process that checked the browser out can return it. A checkin from any
   other process is ignored with a warning, so it can't hand a browser still in use
   to the next caller; the browser stays with its holder until the holder checks it
-  in or exits.
+  in or exits. A caller holding several slots on the browser frees one per checkin.
   """
   @spec checkin(GenServer.server(), pid()) :: :ok
   def checkin(pool, browser), do: GenServer.cast(pool, {:checkin, browser, self()})
@@ -228,6 +246,7 @@ defmodule CDPEx.Pool do
      %__MODULE__{
        size: size,
        launch_opts: Keyword.get(opts, :launch_opts, []),
+       pages_per_browser: Keyword.get(opts, :pages_per_browser, 1),
        start_fun: Keyword.get(opts, :start_fun, &Browser.start_link/1),
        task_sup: task_sup
      }}
@@ -243,20 +262,23 @@ defmodule CDPEx.Pool do
 
   @impl true
   def handle_cast({:checkin, browser, caller}, state) do
-    case Map.fetch(state.busy, browser) do
-      {:ok, {^caller, _ref}} ->
-        {:noreply, state |> release(browser) |> dispatch()}
+    held = Enum.find(state.holders, fn {_ref, holder} -> holder == {browser, caller} end)
 
-      {:ok, {_owner, _ref}} ->
+    cond do
+      held != nil ->
+        {ref, _holder} = held
+        {:noreply, state |> release(ref) |> dispatch()}
+
+      # Not checked out (already returned, or dropped after a crash): nothing to do.
+      Map.get(state.loads, browser, 0) == 0 ->
+        {:noreply, state}
+
+      true ->
         Logger.warning(
           "[CDPEx.Pool] ignored checkin of #{inspect(browser)} from #{inspect(caller)}: " <>
             "it is checked out by another process"
         )
 
-        {:noreply, state}
-
-      # Not checked out (already returned, or dropped after a crash): nothing to do.
-      :error ->
         {:noreply, state}
     end
   end
@@ -303,12 +325,10 @@ defmodule CDPEx.Pool do
     {:noreply, launch_failed(state, {:launch_crashed, reason})}
   end
 
-  def handle_info({:DOWN, ref, :process, _owner, _reason}, state) do
-    # A checkout owner died without checking in — reclaim its browser.
-    case find_busy_by_ref(state.busy, ref) do
-      nil -> {:noreply, state}
-      browser -> {:noreply, state |> release(browser) |> dispatch()}
-    end
+  def handle_info({:DOWN, ref, :process, _owner, _reason}, state)
+      when is_map_key(state.holders, ref) do
+    # A checkout owner died without checking in — reclaim that checkout's slot.
+    {:noreply, state |> release(ref) |> dispatch()}
   end
 
   def handle_info({:EXIT, task_sup, reason}, %__MODULE__{task_sup: task_sup} = state) do
@@ -336,8 +356,7 @@ defmodule CDPEx.Pool do
       GenServer.reply(from, {:error, :noproc})
     end)
 
-    Enum.each(state.available, &safe_stop/1)
-    Enum.each(Map.keys(state.busy), &safe_stop/1)
+    Enum.each(Map.keys(state.loads), &safe_stop/1)
 
     # An in-flight launch may finish a browser we never adopted: once the task runs
     # Process.unlink/1, that browser is linked to nobody, so killing task_sup won't reap it.
@@ -373,38 +392,47 @@ defmodule CDPEx.Pool do
 
   # ── pool mechanics ──────────────────────────────────────────────────────────
 
-  # Serve queued waiters: hand out idle browsers, then start launches (concurrently, up to
-  # :size) for any still-waiting callers not already covered by an in-flight launch. Launches
-  # run in tasks, so the pool stays responsive while Chrome warms up.
+  # Serve queued waiters: hand out free slots on warm browsers, then start launches
+  # (concurrently, up to :size) for any still-waiting callers not already covered by an
+  # in-flight launch. Launches run in tasks, so the pool stays responsive while Chrome warms
+  # up. A free warm slot always wins over a launch: a cold start costs seconds.
   defp dispatch(state) do
     state |> serve_available() |> start_launches()
   end
 
-  # Assign idle browsers to the head of the queue, FIFO, until either runs out.
-  defp serve_available(%__MODULE__{available: [browser | rest_avail]} = state) do
-    case :queue.out(state.waiting) do
-      {{:value, waiter}, rest} ->
-        %{state | available: rest_avail, waiting: rest}
-        |> assign(browser, waiter)
-        |> serve_available()
-
-      {:empty, _} ->
-        state
+  # Assign free slots to the head of the queue, FIFO, least-loaded browser first, until
+  # either runs out.
+  defp serve_available(state) do
+    with browser when browser != nil <- least_loaded(state),
+         {{:value, waiter}, rest} <- :queue.out(state.waiting) do
+      %{state | waiting: rest} |> assign(browser, waiter) |> serve_available()
+    else
+      _ -> state
     end
   end
 
-  defp serve_available(state), do: state
+  defp least_loaded(%__MODULE__{loads: loads, pages_per_browser: per}) do
+    case Enum.filter(loads, fn {_browser, load} -> load < per end) do
+      [] -> nil
+      free -> free |> Enum.min_by(fn {_browser, load} -> load end) |> elem(0)
+    end
+  end
 
-  # Start one launch per still-uncovered waiter, bounded by free capacity so
-  # count + in-flight launches never exceeds :size. Launches are anonymous: each browser
-  # joins `available` on success and the next dispatch serves a waiter FIFO.
-  defp start_launches(%__MODULE__{count: count, size: size, launching: launching} = state) do
-    capacity = size - count - map_size(launching)
-    uncovered = :queue.len(state.waiting) - map_size(launching)
-    n = max(min(capacity, uncovered), 0)
+  # Start enough launches to cover the still-uncovered waiters (each covers
+  # :pages_per_browser of them), bounded by free capacity so adopted browsers + in-flight
+  # launches never exceed :size. Launches are anonymous: each browser joins `loads` on
+  # success and the next dispatch serves waiters FIFO.
+  defp start_launches(%__MODULE__{size: size, launching: launching} = state) do
+    capacity = size - map_size(state.loads) - map_size(launching)
+    uncovered = :queue.len(state.waiting) - covered(state)
+    needed = div(uncovered + state.pages_per_browser - 1, state.pages_per_browser)
+    n = max(min(capacity, needed), 0)
 
     if n > 0, do: Enum.reduce(1..n, state, fn _, acc -> start_one_launch(acc) end), else: state
   end
+
+  # Waiters the in-flight launches will serve once they land.
+  defp covered(state), do: map_size(state.launching) * state.pages_per_browser
 
   # Launch a browser in a monitored task. async_nolink keeps a launch crash from taking the
   # pool down (we get its {:DOWN}); the task start_links the browser then unlinks it so the
@@ -437,27 +465,27 @@ defmodule CDPEx.Pool do
   end
 
   # Adopt a freshly launched browser: link it to the pool (the task unlinked it), add it to
-  # the available set, and dispatch so a waiter is served. If it died in the unlink→adopt
+  # `loads` with no holders, and dispatch so a waiter is served. If it died in the unlink→adopt
   # gap, alive? routes it through launch_failed rather than handing a dead pid to a waiter;
   # a death right after link/1 surfaces as an {:EXIT, browser, _} the EXIT clause reconciles.
   defp browser_launched(state, browser) do
     if Process.alive?(browser) do
       Process.link(browser)
 
-      dispatch(%{state | count: state.count + 1, available: [browser | state.available]})
+      dispatch(%{state | loads: Map.put(state.loads, browser, 0)})
     else
       launch_failed(state, :noproc)
     end
   end
 
   # A launch failed (start error or task crash). Surface the reason to the head waiter ONLY
-  # when this failure leaves one uncovered — i.e. fewer in-flight launches remain than queued
-  # waiters. If every waiter is still covered by another in-flight launch (e.g. this failed
+  # when this failure leaves one uncovered — i.e. the in-flight launches left can serve fewer
+  # waiters than are queued. If every waiter is still covered by another in-flight launch (e.g. this failed
   # launch's waiter already timed out and left the queue), don't spuriously fail a live
   # waiter — let the other launches serve them. Replying on a genuine shortfall also bounds a
   # relaunch loop on persistent failure (each failure consumes one waiter).
   defp launch_failed(state, reason) do
-    if map_size(state.launching) < :queue.len(state.waiting) do
+    if covered(state) < :queue.len(state.waiting) do
       case :queue.out(state.waiting) do
         {{:value, {from, timer}}, rest} ->
           _ = cancel_timer(timer)
@@ -472,53 +500,45 @@ defmodule CDPEx.Pool do
     end
   end
 
-  # Mark `browser` busy for the waiter, monitor the owner (auto-checkin on its
-  # death), cancel the wait timer, and reply.
+  # Give the waiter a slot on `browser`, monitor the owner (auto-checkin on its death),
+  # cancel the wait timer, and reply.
   defp assign(state, browser, {from, timer}) do
     _ = cancel_timer(timer)
     owner = elem(from, 0)
     ref = Process.monitor(owner)
     GenServer.reply(from, {:ok, browser})
-    %{state | busy: Map.put(state.busy, browser, {owner, ref})}
+
+    %{
+      state
+      | loads: Map.update!(state.loads, browser, &(&1 + 1)),
+        holders: Map.put(state.holders, ref, {browser, owner})
+    }
   end
 
-  # Return a busy browser to the available set (a checkin, or an owner's death).
-  defp release(state, browser) do
-    case Map.pop(state.busy, browser) do
-      {nil, _busy} ->
+  # Free the slot of the checkout monitored by `ref` (a checkin, or an owner's death).
+  defp release(state, ref) do
+    case Map.pop(state.holders, ref) do
+      {nil, _holders} ->
         state
 
-      {{_owner, ref}, busy} ->
+      {{browser, _owner}, holders} ->
         Process.demonitor(ref, [:flush])
-        # Don't return an already-dead browser (its {:EXIT} may not be processed
-        # yet) to the available set, or dispatch could hand a dead pid to a waiter.
-        # Drop it instead; the {:EXIT} path reconciles anything this misses.
-        if Process.alive?(browser) do
-          %{state | busy: busy, available: [browser | state.available]}
-        else
-          %{state | busy: busy, count: state.count - 1}
-        end
+        state = %{state | holders: holders}
+
+        # Don't keep offering an already-dead browser (its {:EXIT} may not be processed
+        # yet), or dispatch could hand a dead pid to a waiter. Drop it instead; the {:EXIT}
+        # path reconciles anything this misses.
+        if Process.alive?(browser),
+          do: %{state | loads: Map.update!(state.loads, browser, &(&1 - 1))},
+          else: drop(state, browser)
     end
   end
 
-  # Remove a dead browser from wherever it is and shrink the count.
+  # Remove a dead browser and every checkout holding it.
   defp drop(state, browser) do
-    cond do
-      Map.has_key?(state.busy, browser) ->
-        {{_owner, ref}, busy} = Map.pop(state.busy, browser)
-        Process.demonitor(ref, [:flush])
-        %{state | busy: busy, count: state.count - 1}
-
-      browser in state.available ->
-        %{state | available: List.delete(state.available, browser), count: state.count - 1}
-
-      true ->
-        state
-    end
-  end
-
-  defp find_busy_by_ref(busy, ref) do
-    Enum.find_value(busy, fn {browser, {_owner, r}} -> if r == ref, do: browser end)
+    {gone, holders} = Map.split_with(state.holders, fn {_ref, {b, _owner}} -> b == browser end)
+    Enum.each(Map.keys(gone), &Process.demonitor(&1, [:flush]))
+    %{state | holders: holders, loads: Map.delete(state.loads, browser)}
   end
 
   defp remove_waiter(waiting, from) do
@@ -526,6 +546,13 @@ defmodule CDPEx.Pool do
       {{^from, timer}, rest} -> {:ok, timer, :queue.from_list(rest)}
       nil -> :error
     end
+  end
+
+  defp validate_pages_per_browser!(n) when is_integer(n) and n > 0, do: :ok
+
+  defp validate_pages_per_browser!(other) do
+    raise ArgumentError,
+          "invalid :pages_per_browser #{inspect(other)} (expected a positive integer)"
   end
 
   # The upper bound is Process.send_after/3's limit; past it the pool's timer would crash.

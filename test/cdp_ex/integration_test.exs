@@ -71,6 +71,42 @@ defmodule CDPEx.IntegrationTest do
     end
   end
 
+  describe "a pool with pages_per_browser: 2" do
+    test "runs two jobs side by side on one browser, isolated, and reaps it", %{fixture: fixture} do
+      {:ok, pool} = Pool.start_link(size: 1, pages_per_browser: 2)
+      on_exit(fn -> stop_pool_quietly(pool) end)
+      test = self()
+
+      job = fn tag ->
+        Task.async(fn ->
+          Pool.with_page(pool, fn page ->
+            {:ok, _} = Page.navigate(page, fixture)
+            {:ok, _} = Page.evaluate(page, "document.cookie = 'job=#{tag}'; 1")
+            send(test, {:running, tag, self()})
+            receive do: (:go -> :ok)
+            {page.browser, Page.evaluate(page, "document.cookie")}
+          end)
+        end)
+      end
+
+      jobs = [job.("a"), job.("b")]
+      # Both are inside their fun at once: the second didn't wait for the first.
+      assert_receive {:running, "a", pa}, 30_000
+      assert_receive {:running, "b", pb}, 30_000
+      send(pa, :go)
+      send(pb, :go)
+
+      assert [{browser, {:ok, "job=a"}}, {other, {:ok, "job=b"}}] =
+               Task.await_many(jobs, 30_000)
+
+      assert other == browser
+
+      os_pid = :sys.get_state(browser).chrome.os_pid
+      :ok = Pool.stop(pool)
+      assert eventually(fn -> not os_alive?(os_pid) end)
+    end
+  end
+
   describe "browser lifecycle" do
     test "launch/1 returns a live pid and stop/1 shuts it down" do
       assert {:ok, browser} = CDPEx.launch()
@@ -2964,7 +3000,7 @@ defmodule CDPEx.IntegrationTest do
       b2 = used.()
       assert is_pid(b1)
       assert b1 == b2, "expected the pooled browser to be reused across with_page calls"
-      assert :sys.get_state(pool).count == 1
+      assert map_size(:sys.get_state(pool).loads) == 1
     end
 
     test "with_page runs on a pooled browser and returns the fun's value", %{fixture: fixture} do
