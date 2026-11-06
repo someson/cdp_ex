@@ -1,0 +1,13 @@
+{
+  "name": "cdp_ex-bench-js-fixture",
+  "private": true,
+  "description": "Builds bench/compare/fixture/js/app.js (committed); not needed to run the benchmark",
+  "scripts": {
+    "build": "esbuild src/app.jsx --bundle --minify --define:process.env.NODE_ENV=\\\"production\\\" --outfile=app.js"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.10",
+    "react": "19.1.1",
+    "react-dom": "19.1.1"
+  }
+}
