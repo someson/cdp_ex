@@ -2061,6 +2061,9 @@ defmodule CDPEx.Page do
   owner, even when its patterns match it. Without login on the page, only the
   blocked types are paused, so the other requests cost nothing extra.
 
+  Unblocking doesn't reload what was already blocked, and navigating the page to the
+  same document again may reuse Chrome's in-memory result for it without a request.
+
   A `{:error, {:timeout, :block_resources}}` may still take effect later; call again
   to settle the list.
 

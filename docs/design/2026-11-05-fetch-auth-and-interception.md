@@ -1,6 +1,6 @@
 # Design: proxy login and request interception on one page
 
-**Status:** approved, in implementation
+**Status:** done (#24)
 **Tracks:** `docs/TODO.md` item 9
 
 ## Problem

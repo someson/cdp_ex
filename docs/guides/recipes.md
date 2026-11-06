@@ -112,6 +112,20 @@ browser. For a one-off HTTP Basic challenge on an *origin* (not a proxy), arm it
 page with `authenticate/4` before navigating:
 `CDPEx.Page.authenticate(page, "user", "pass", source: :server)`.
 
+To save proxy traffic, block the resource types you don't need. The library fails
+those requests before they reach the proxy and answers the proxy's login for the
+rest, so no process of yours has to handle them:
+
+```elixir
+{:ok, page} = CDPEx.new_page(browser, block: [:image, :font, :media])
+{:ok, _} = CDPEx.Page.navigate(page, "https://example.com")
+```
+
+`block:` is also accepted by `CDPEx.with_page/3` and `CDPEx.Pool.with_page/3`;
+`CDPEx.Page.block_resources/3` changes the list on an open page. For a rule by URL
+rather than by type, use `enable_request_interception/2` from a process that
+resolves each pause, since the caller is busy in `navigate/3` while they arrive.
+
 ## Keep jobs apart on a shared browser
 
 `isolated: true` opens a page in its own browser context: its own cookies,

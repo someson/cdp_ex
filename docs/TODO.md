@@ -133,15 +133,13 @@ the `Fetch` domain and forwards the caller only the pauses matching its
 patterns (#24). Design: `docs/design/2026-11-05-fetch-auth-and-interception.md`.
 ReqBot can drop the `Fetch.enable` workaround in its interceptor.
 
-## 10. Block resources by type
+## 10. Block resources by type — done
 
-`block: [:image, :font, :media, :stylesheet]` on a page: requests of those
-`resourceType`s fail with `net::ERR_BLOCKED_BY_CLIENT` before reaching the
-network. A common scraping speed-up (less proxy traffic, faster loads). ReqBot
-builds it from request interception plus a dedicated process that owns the
-paused requests, because the caller is blocked in a navigation wait and cannot
-answer them. Should be a library-owned handler on the `Fetch` domain, so it
-builds on item 9. Estimate: about half a day.
+`block: [...]` on `new_page/2` and `Page.block_resources/3`: requests of those
+resource types fail with `net::ERR_BLOCKED_BY_CLIENT`, resolved by the page's
+`CDPEx.Fetch` process as a third mode next to auth and interception. Design:
+`docs/design/2026-11-06-block-resources-by-type.md`. ReqBot can replace its
+image/font interceptor with `block:`.
 
 ## 11. Full document response from `navigate/3`
 
