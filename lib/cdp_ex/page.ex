@@ -1167,6 +1167,31 @@ defmodule CDPEx.Page do
   end
 
   @doc """
+  Moves the mouse over the first element matching `css` with a real
+  `Input.dispatchMouseEvent` `mouseMoved`, so the page sees `mouseover`,
+  `mouseenter` and `mousemove` with `event.isTrusted == true` and CSS `:hover`
+  applies: the way to open a menu that shows on hover.
+
+  The element is located, scrolled into view and hit-tested exactly as in
+  `click/3`, so the errors are the same: `{:error, {:selector_not_found, css}}`,
+  `{:error, {:not_clickable, css}}` when it has no box in the viewport, and
+  `{:error, {:obscured, css}}` when another element is on top of it. The pointer
+  stays there until the next mouse event, so a later `click/3` elsewhere moves it
+  away (and fires `mouseleave`).
+
+  Options:
+    * `:wait` — as in `click/3`: milliseconds to keep retrying while the element is
+      missing, has no box or is covered. Default `0`.
+    * `:timeout` — per-CDP-call timeout, default #{@evaluate_timeout}.
+  """
+  @spec hover(t(), String.t(), keyword()) :: :ok | {:error, term()}
+  def hover(%__MODULE__{} = page, css, opts \\ []) when is_binary(css) do
+    locator = "document.querySelector(#{Jason.encode!(css)})"
+    not_found = {:selector_not_found, css}
+    with_wait(opts, fn -> trusted_mouse(page, locator, not_found, css, :hover, opts) end)
+  end
+
+  @doc """
   Scrolls the window to `target`: `:top` or `:bottom` of the document (keeping the
   horizontal position), or `{x, y}` document coordinates.
 
@@ -1267,13 +1292,14 @@ defmodule CDPEx.Page do
   defp blank_text?(text), do: Regex.match?(~r/\A[ \t\r\n]*\z/, text)
 
   defp click_with_wait(page, locator, not_found, label, opts) do
-    attempt =
-      if Keyword.get(opts, :trusted, true) do
-        fn -> trusted_click(page, locator, not_found, label, opts) end
-      else
-        fn -> synthetic_click(page, locator, not_found, opts) end
-      end
+    if Keyword.get(opts, :trusted, true) do
+      with_wait(opts, fn -> trusted_mouse(page, locator, not_found, label, :click, opts) end)
+    else
+      with_wait(opts, fn -> synthetic_click(page, locator, not_found, opts) end)
+    end
+  end
 
+  defp with_wait(opts, attempt) do
     result =
       case Keyword.get(opts, :wait, 0) do
         0 ->
@@ -1405,7 +1431,7 @@ defmodule CDPEx.Page do
 
   defp synthetic_phase(_reason), do: :dispatch
 
-  defp trusted_click(page, locator, not_found, label, opts) do
+  defp trusted_mouse(page, locator, not_found, label, action, opts) do
     js = """
     (function () {
       var el = #{locator};
@@ -1446,10 +1472,8 @@ defmodule CDPEx.Page do
         {:locate, {:not_clickable, label}}
 
       {:ok, %{"clickable" => true, "x" => x, "y" => y}} ->
-        with :ok <- dispatch_mouse(page, "mousePressed", x, y, 1, timeout),
-             :ok <- dispatch_mouse(page, "mouseReleased", x, y, 0, timeout) do
-          :ok
-        else
+        case dispatch_action(page, action, x, y, timeout) do
+          :ok -> :ok
           {:error, reason} -> {:dispatch, reason}
         end
 
@@ -1458,14 +1482,23 @@ defmodule CDPEx.Page do
     end
   end
 
-  defp dispatch_mouse(page, type, x, y, buttons, timeout) do
+  defp dispatch_action(page, :click, x, y, timeout) do
+    with :ok <- dispatch_mouse(page, "mousePressed", x, y, "left", 1, timeout) do
+      dispatch_mouse(page, "mouseReleased", x, y, "left", 0, timeout)
+    end
+  end
+
+  defp dispatch_action(page, :hover, x, y, timeout),
+    do: dispatch_mouse(page, "mouseMoved", x, y, "none", 0, timeout)
+
+  defp dispatch_mouse(page, type, x, y, button, buttons, timeout) do
     params = %{
       "type" => type,
       "x" => x,
       "y" => y,
-      "button" => "left",
+      "button" => button,
       "buttons" => buttons,
-      "clickCount" => 1
+      "clickCount" => if(type == "mouseMoved", do: 0, else: 1)
     }
 
     case do_call(page, "Input.dispatchMouseEvent", params, timeout) do

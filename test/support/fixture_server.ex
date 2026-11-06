@@ -195,7 +195,8 @@ defmodule CDPEx.FixtureServer do
   # #wrapper is wider than its button, so its center hits the wrapper itself.
   # #split-link wraps from the end of one line to the start of the next, so its bounding-box
   # centre is on #split-wrap. #block-link is an inline <a> around blocks, whose client rects
-  # include the blocks' anonymous boxes. #cover sits on top of #covered-btn.
+  # include the blocks' anonymous boxes. #cover sits on top of #covered-btn. #hover-item
+  # shows only while #hover-menu is hovered; entering #hover-trigger lands in window.hovers.
   defp interact_page(smooth?) do
     style = if smooth?, do: "<style>html { scroll-behavior: smooth; }</style>", else: ""
 
@@ -222,6 +223,8 @@ defmodule CDPEx.FixtureServer do
         <div id="split-wrap" style="width:300px;font:16px/20px monospace">xxxxxxxxxxxxxxxxxxxxxxxxxxxx <a id="split-link" href="#">ab cd</a></div>
         <div id="block-wrap" style="width:600px"><a id="block-link" href="#"><div style="margin-bottom:40px">One</div><div>Two</div></a></div>
         <div style="position:relative;width:200px"><button id="covered-btn">Covered</button><div id="cover" style="position:absolute;inset:0;background:#fff"></div></div>
+        <style>#hover-item { display: none; } #hover-menu:hover #hover-item { display: inline; }</style>
+        <div id="hover-menu" style="width:200px"><span id="hover-trigger">Menu</span> <a id="hover-item" href="#">Item</a></div>
         <div style="height:5000px"></div>
         <p id="footer">end</p>
         <div id="late-slot"></div>
@@ -235,6 +238,10 @@ defmodule CDPEx.FixtureServer do
               tag: e.target.tagName.toLowerCase(),
               trusted: e.isTrusted
             });
+          });
+          window.hovers = [];
+          document.getElementById("hover-trigger").addEventListener("mouseenter", function (e) {
+            window.hovers.push({id: "hover-trigger", trusted: e.isTrusted});
           });
           window.armLate = function (ms) {
             setTimeout(function () {

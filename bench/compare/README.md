@@ -149,7 +149,7 @@ rounds of 20 samples (`cold`: 10; `concurrent`: 20 s, 8 workers).
 | File upload | ✗ | ✓ | ✗ | ✓ |
 | Download | ✗ | fail | ✗ | ✗ |
 | Answer a JS dialog | ✗ | ✓ | ✗ | ✓ |
-| Hover | ✗ | ✓ | ✗ | ✓ |
+| Hover | ✓¹ | ✓ | ✗ | ✓ |
 | Evaluate JS, get the value | ✓ | ✓ | partial | ✓ |
 | Console messages | ✗ | ✓ | ✗ | ✓ |
 | Read inside an iframe | ✗ | ✓ | ✗ | ✓ |
@@ -173,6 +173,8 @@ rounds of 20 samples (`cold`: 10; `concurrent`: 20 s, 8 workers).
 | Tracing | ✗ | ✓ | ✗ | ✗ |
 | Firefox | ✗ | ✓ | ✗ | partial |
 | WebKit | ✗ | ✓ | ✗ | ✗ |
+
+¹ Added after the reference run (`Page.hover/3`); the probe passes in the same image (`LIBS=cdp_ex TASKS= ROUNDS=0 bench/compare/run.sh`).
 
 Partial and failed results, with the probe's note:
 
