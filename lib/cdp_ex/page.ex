@@ -2091,6 +2091,10 @@ defmodule CDPEx.Page do
   > request paused with no resolver). While interception is enabled you must still
   > resolve every pause.
 
+  Interception covers the page's own frames. A cross-site iframe runs as its own
+  target in Chrome: its requests are let through (blocked types are still blocked,
+  and a login is still answered there), not sent to you.
+
   Works on `:dedicated` and `:session` pages. On a `:session` page the pauses carry
   its session id, so one process can intercept several pages of a browser and tell
   them apart; disabling one leaves the others. When the page closes, its
@@ -2171,8 +2175,8 @@ defmodule CDPEx.Page do
   owner, even when its patterns match it. Without login on the page, only the
   blocked types are paused, so the other requests cost nothing extra.
 
-  Only the page's own frames are covered: a cross-site iframe runs as a separate
-  target in Chrome, and its requests are not blocked (nor intercepted).
+  Cross-site iframes are covered too, nested ones included: Chrome runs each as its
+  own target, which the library attaches, filters and resumes before it loads.
 
   Unblocking doesn't reload what was already blocked, and navigating the page to the
   same document again may reuse Chrome's in-memory result for it without a request.

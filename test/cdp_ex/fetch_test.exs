@@ -8,6 +8,13 @@ defmodule CDPEx.FetchTest do
   alias CDPEx.Fetch
 
   # Credentials travel as a closure, so no crash report or :sys.get_status/1 prints them.
+  @auto_attach %{
+    "autoAttach" => true,
+    "waitForDebuggerOnStart" => true,
+    "flatten" => true,
+    "filter" => [%{"type" => "iframe"}]
+  }
+
   defp creds, do: fn -> {"u", "p"} end
   defp auth, do: %{credentials: creds(), source: :any}
 
@@ -671,6 +678,167 @@ defmodule CDPEx.FetchTest do
     end
   end
 
+  describe "cross-site iframes on FakeCDP" do
+    setup do
+      {:ok, server} = FakeCDP.start()
+      {:ok, conn} = Connection.start_link(server.url)
+      assert_receive {:fake_cdp_connected, fake}, 2_000
+
+      on_exit(fn ->
+        try do
+          if Process.alive?(conn), do: Connection.close(conn)
+        catch
+          :exit, _ -> :ok
+        end
+      end)
+
+      %{conn: conn, fake: fake}
+    end
+
+    test "arming turns on iframe auto-attach on the page's session before the first enable", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+      tag = make_ref()
+      Fetch.request(pid, tag, {:block, ["Image"], 5_000})
+
+      assert expect_call_on(fake, "Target.setAutoAttach", nil) == @auto_attach
+      expect_call_on(fake, "Fetch.enable", nil)
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+    end
+
+    test "an attached iframe is filtered, auto-attached and resumed on its own session", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+      arm(pid, fake, {:block, ["Image"], 5_000})
+
+      attach(fake, "C1")
+      assert expect_iframe_armed(fake, "C1") == Fetch.enable_params(nil, nil, ["Image"])
+
+      pause_on(fake, "C1", "img", "https://b.test/x.png", "Image")
+
+      assert expect_call_on(fake, "Fetch.failRequest", "C1") == %{
+               "requestId" => "img",
+               "errorReason" => "BlockedByClient"
+             }
+    end
+
+    test "an iframe is resumed even when its enable fails", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      arm(pid, fake, {:block, ["Image"], 5_000})
+
+      log =
+        capture_log(fn ->
+          attach(fake, "C1")
+          expect_call_on(fake, "Fetch.enable", "C1", :error)
+          expect_call_on(fake, "Runtime.runIfWaitingForDebugger", "C1")
+        end)
+
+      assert log =~ "iframe"
+    end
+
+    test "an attach while every mode is off is resumed, unfiltered", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      arm(pid, fake, {:block, ["Image"], 5_000})
+
+      tag = make_ref()
+      Fetch.request(pid, tag, {:block, [], 5_000})
+      assert expect_call_on(fake, "Target.setAutoAttach", nil)["autoAttach"] == false
+      expect_call_on(fake, "Fetch.disable", nil)
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+
+      attach(fake, "C1")
+      expect_call_on(fake, "Runtime.runIfWaitingForDebugger", "C1")
+      refute_received {:fake_cdp_recv, ^fake, %{"method" => "Fetch.enable"}}
+    end
+
+    test "a mode change reaches every iframe", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      arm(pid, fake, {:block, ["Image"], 5_000})
+      attach(fake, "C1")
+      expect_iframe_armed(fake, "C1")
+
+      tag = make_ref()
+      Fetch.request(pid, tag, {:block, ["Image", "Font"], 5_000})
+      expect_call_on(fake, "Fetch.enable", nil)
+
+      assert expect_call_on(fake, "Fetch.enable", "C1") ==
+               Fetch.enable_params(nil, nil, ["Image", "Font"])
+
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+    end
+
+    test "the last mode off disables every iframe and turns auto-attach off", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+      arm(pid, fake, {:block, ["Image"], 5_000})
+      attach(fake, "C1")
+      expect_iframe_armed(fake, "C1")
+
+      tag = make_ref()
+      Fetch.request(pid, tag, {:block, [], 5_000})
+      expect_call_on(fake, "Fetch.disable", "C1")
+      assert expect_call_on(fake, "Target.setAutoAttach", nil)["autoAttach"] == false
+      expect_call_on(fake, "Fetch.disable", nil)
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+    end
+
+    test "an iframe's pauses never reach the interception owner", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      arm(pid, fake, {:intercept, self(), [%{"urlPattern" => "*"}], 5_000})
+      attach(fake, "C1")
+      expect_iframe_armed(fake, "C1")
+
+      pause_on(fake, "C1", "doc", "https://b.test/", "Document")
+      assert expect_call_on(fake, "Fetch.continueRequest", "C1") == %{"requestId" => "doc"}
+      refute_received {:cdp_event, _, "Fetch.requestPaused", _, _}
+    end
+
+    test "a login challenge on an iframe's session is answered there", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      arm(pid, fake, {:auth, auth()})
+      attach(fake, "C1")
+      expect_iframe_armed(fake, "C1")
+
+      event(
+        fake,
+        "Fetch.authRequired",
+        %{"requestId" => "r", "authChallenge" => %{"source" => "Proxy"}},
+        "C1"
+      )
+
+      assert %{"authChallengeResponse" => %{"response" => "ProvideCredentials"}} =
+               expect_call_on(fake, "Fetch.continueWithAuth", "C1")
+    end
+
+    test "a nested iframe is armed from its parent iframe's session", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      arm(pid, fake, {:block, ["Image"], 5_000})
+      attach(fake, "C1")
+      expect_iframe_armed(fake, "C1")
+
+      attach(fake, "C2", "C1")
+      expect_iframe_armed(fake, "C2")
+    end
+
+    test "a detached iframe is forgotten", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      arm(pid, fake, {:block, ["Image"], 5_000})
+      attach(fake, "C1")
+      expect_iframe_armed(fake, "C1")
+
+      event(fake, "Target.detachedFromTarget", %{"sessionId" => "C1", "targetId" => "T-C1"})
+      pause_on(fake, "C1", "img", "https://b.test/x.png", "Image")
+      refute_receive {:fake_cdp_recv, ^fake, %{"method" => "Fetch.failRequest"}}, 200
+      assert Process.alive?(pid)
+    end
+  end
+
   defp start_owner(conn) do
     {:ok, pid} = Fetch.start_link(conn: conn, browser: self())
     pid
@@ -685,15 +853,83 @@ defmodule CDPEx.FetchTest do
   end
 
   # Wait for a CDP call to `method`, answer it (OK or an error), and return its params.
+  # Wait for a CDP call to `method` (on any session), answer it (OK or an error), and
+  # return its params. A Target.setAutoAttach the owner sends on the way (it turns
+  # iframe auto-attach on before the first enable and off before a disable) is
+  # answered OK, unless it is the call waited for.
   defp expect_call(fake, method, outcome \\ :ok) do
-    assert_receive {:fake_cdp_recv, ^fake, %{"id" => id, "method" => ^method} = frame}, 2_000
+    receive do
+      {:fake_cdp_recv, ^fake, %{"id" => id, "method" => ^method} = frame} ->
+        answer(fake, id, outcome)
+        frame["params"] || %{}
 
-    case outcome do
-      :ok -> FakeCDP.send_text(fake, ~s({"id":#{id},"result":{}}))
-      :error -> FakeCDP.send_text(fake, ~s({"id":#{id},"error":{"code":-32000,"message":"boom"}}))
+      {:fake_cdp_recv, ^fake, %{"id" => id, "method" => "Target.setAutoAttach"}}
+      when method != "Target.setAutoAttach" ->
+        answer(fake, id, :ok)
+        expect_call(fake, method, outcome)
+    after
+      2_000 -> flunk("no #{method} call")
     end
+  end
 
-    frame["params"] || %{}
+  # The same for a call on one session (`nil`: the page's own, no sessionId).
+  defp expect_call_on(fake, method, sid, outcome \\ :ok) do
+    receive do
+      {:fake_cdp_recv, ^fake, %{"id" => id, "method" => ^method, "sessionId" => ^sid} = frame}
+      when is_binary(sid) ->
+        answer(fake, id, outcome)
+        frame["params"] || %{}
+
+      {:fake_cdp_recv, ^fake, %{"id" => id, "method" => ^method} = frame}
+      when sid == nil and not is_map_key(frame, "sessionId") ->
+        answer(fake, id, outcome)
+        frame["params"] || %{}
+
+      {:fake_cdp_recv, ^fake, %{"id" => id, "method" => "Target.setAutoAttach"}}
+      when method != "Target.setAutoAttach" ->
+        answer(fake, id, :ok)
+        expect_call_on(fake, method, sid, outcome)
+    after
+      2_000 -> flunk("no #{method} call on #{inspect(sid)}")
+    end
+  end
+
+  defp answer(fake, id, :ok), do: FakeCDP.send_text(fake, ~s({"id":#{id},"result":{}}))
+
+  defp answer(fake, id, :error),
+    do: FakeCDP.send_text(fake, ~s({"id":#{id},"error":{"code":-32000,"message":"boom"}}))
+
+  defp event(fake, method, params, sid \\ nil) do
+    frame = %{"method" => method, "params" => params}
+    frame = if sid, do: Map.put(frame, "sessionId", sid), else: frame
+    FakeCDP.send_text(fake, Jason.encode!(frame))
+  end
+
+  defp attach(fake, child, parent \\ nil) do
+    event(
+      fake,
+      "Target.attachedToTarget",
+      %{
+        "sessionId" => child,
+        "targetInfo" => %{"targetId" => "T-" <> child, "type" => "iframe"},
+        "waitingForDebugger" => true
+      },
+      parent
+    )
+  end
+
+  # The owner's answer to an iframe attach: filter it, auto-attach its own iframes,
+  # resume it — on the iframe's session, in that order.
+  defp expect_iframe_armed(fake, child) do
+    params = expect_call_on(fake, "Fetch.enable", child)
+    assert expect_call_on(fake, "Target.setAutoAttach", child) == @auto_attach
+    expect_call_on(fake, "Runtime.runIfWaitingForDebugger", child)
+    params
+  end
+
+  defp pause_on(fake, sid, id, url, type) do
+    params = %{"requestId" => id, "request" => %{"url" => url}, "resourceType" => type}
+    event(fake, "Fetch.requestPaused", params, sid)
   end
 
   defp pause(fake, id, url, type) do
