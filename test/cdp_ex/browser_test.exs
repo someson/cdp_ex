@@ -192,14 +192,15 @@ defmodule CDPEx.BrowserTest do
 
       assert {:noreply, new_state} =
                Browser.handle_call(
-                 {:authenticate, page, [username: "u", password: "p", source: :proxy]},
+                 {:authenticate, page, [credentials: fn -> {"u", "p"} end, source: :proxy]},
                  from,
                  state
                )
 
       assert_receive {:fetcher_got,
-                      {:fetch_request, tag,
-                       {:auth, %{username: "u", password: "p", source: :proxy}}}}
+                      {:fetch_request, tag, {:auth, %{credentials: credentials, source: :proxy}}}}
+
+      assert credentials.() == {"u", "p"}
 
       assert {^from, caller_ref, ^fetcher} = new_state.pending[tag]
       assert is_reference(caller_ref)
@@ -241,7 +242,7 @@ defmodule CDPEx.BrowserTest do
 
       assert {:reply, {:error, :unknown_page}, ^other} =
                Browser.handle_call(
-                 {:authenticate, page, [username: "u", password: "p"]},
+                 {:authenticate, page, [credentials: fn -> {"u", "p"} end]},
                  {self(), make_ref()},
                  other
                )
@@ -428,7 +429,7 @@ defmodule CDPEx.BrowserTest do
         browser_conn: browser_conn,
         host: "127.0.0.1",
         port: server.port,
-        proxy_auth: %{username: "u", password: "p"}
+        proxy_auth: fn -> {"u", "p"} end
       }
 
       log =
@@ -482,6 +483,22 @@ defmodule CDPEx.BrowserTest do
     fake_chrome_failing_arm(test)
   end
 
+  describe "proxy credentials" do
+    test "a proxied page's Fetch owner holds them where its status doesn't show them" do
+      {state, conn} = fake_browser_state()
+      state = %{state | proxy_auth: fn -> {"proxy-u1", "proxy-pw1"} end}
+
+      assert {:reply, {:ok, _page}, new_state} = new_page_in_task(state, transport: :session)
+      [fetcher] = Map.values(new_state.fetchers)
+
+      status = inspect(:sys.get_status(fetcher), limit: :infinity)
+      refute status =~ "proxy-pw1"
+      refute status =~ "proxy-u1"
+      refute inspect(new_state, limit: :infinity) =~ "proxy-pw1"
+      Connection.close(conn)
+    end
+  end
+
   describe "new_page block:" do
     test "block: arms the page before new_page returns" do
       {state, conn} = fake_browser_state()
@@ -498,7 +515,7 @@ defmodule CDPEx.BrowserTest do
 
     test "a proxied page with block: arms auth, then block, on one owner" do
       {state, conn} = fake_browser_state()
-      state = %{state | proxy_auth: %{username: "u", password: "p"}}
+      state = %{state | proxy_auth: fn -> {"u", "p"} end}
 
       assert {:reply, {:ok, _page}, new_state} =
                new_page_in_task(state, transport: :dedicated, block: ["Image"])
@@ -716,7 +733,7 @@ defmodule CDPEx.BrowserTest do
 
     test "a failed proxy-auth arm disposes the context" do
       {state, conn} = fake_browser_state(%{"Fetch.enable" => :error})
-      state = %{state | proxy_auth: %{username: "u", password: "p"}}
+      state = %{state | proxy_auth: fn -> {"u", "p"} end}
 
       capture_log(fn ->
         assert {:reply, {:error, {:cdp_error, "Fetch.enable", _}}, new_state} =

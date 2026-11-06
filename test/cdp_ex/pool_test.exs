@@ -87,7 +87,12 @@ defmodule CDPEx.PoolTest do
     end
 
     assert Process.alive?(pool)
-    assert {:ok, _browser} = Pool.checkout(pool, 0)
+
+    # Warm the pool first: a cold pool launches in a task, and a 0 ms timer can fire
+    # before the launch lands. An available browser is served before the timer runs.
+    {:ok, browser} = Pool.checkout(pool)
+    :ok = Pool.checkin(pool, browser)
+    assert {:ok, ^browser} = Pool.checkout(pool, 0)
     assert {:error, :timeout} = Pool.checkout(pool, 0)
   end
 
@@ -444,6 +449,28 @@ defmodule CDPEx.PoolTest do
       true ->
         Process.sleep(10)
         eventually(fun, retries - 1)
+    end
+  end
+
+  describe "format_status/1" do
+    test "hides the :proxy credentials in launch_opts, URL and keyword forms" do
+      for proxy <- [
+            "http://pool-u1:pool-pw1@proxy.test:8080",
+            [server: "proxy.test:8080", username: "pool-u1", password: "pool-pw1"]
+          ] do
+        state = %Pool{launch_opts: [headless: true, proxy: proxy]}
+        formatted = Pool.format_status(%{state: state, message: :tick})
+
+        refute inspect(formatted, limit: :infinity) =~ "pool-pw1"
+        refute inspect(formatted, limit: :infinity) =~ "pool-u1"
+        assert formatted.state.launch_opts[:headless] == true
+        assert inspect(formatted.state.launch_opts[:proxy]) =~ "proxy.test:8080"
+      end
+    end
+
+    test "leaves a state without :proxy alone" do
+      status = %{state: %Pool{launch_opts: [headless: true]}, message: :tick}
+      assert Pool.format_status(status) == status
     end
   end
 end

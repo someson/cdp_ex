@@ -956,4 +956,21 @@ defmodule CDPEx.ConnectionTest do
         flunk("condition not met in time")
     end
   end
+
+  describe "format_status/1" do
+    test "hides a Fetch.continueWithAuth call's params, keeps any other call's" do
+      from = {self(), make_ref()}
+      params = %{"authChallengeResponse" => %{"username" => "u-x1", "password" => "pw-x1"}}
+
+      auth = %{message: {:"$gen_call", from, {:cdp_call, "Fetch.continueWithAuth", params, 1, nil}}}
+      refute inspect(Connection.format_status(auth)) =~ "pw-x1"
+      refute inspect(Connection.format_status(auth)) =~ "u-x1"
+
+      other = %{
+        message: {:"$gen_call", from, {:cdp_call, "Page.navigate", %{"url" => "x"}, 1, nil}}
+      }
+
+      assert Connection.format_status(other) == other
+    end
+  end
 end

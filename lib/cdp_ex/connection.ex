@@ -383,6 +383,21 @@ defmodule CDPEx.Connection do
     end
   end
 
+  # A Fetch.continueWithAuth call carries the login in its params: keep it out of the
+  # crash report if the connection dies handling it. GenServer declares
+  # format_status/1 from Elixir 1.17 on (OTP calls it either way), hence the guard.
+  if {:format_status, 1} in GenServer.behaviour_info(:callbacks), do: @impl(true)
+  @doc false
+  def format_status(
+        %{message: {:"$gen_call", from, {:cdp_call, "Fetch.continueWithAuth", _, t, s}}} = status
+      ),
+      do: %{
+        status
+        | message: {:"$gen_call", from, {:cdp_call, "Fetch.continueWithAuth", :redacted, t, s}}
+      }
+
+  def format_status(status), do: status
+
   @impl true
   def handle_call({:cdp_call, method, params, timeout, session_id}, from, state) do
     id = state.next_id

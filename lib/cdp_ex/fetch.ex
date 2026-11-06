@@ -43,7 +43,8 @@ defmodule CDPEx.Fetch do
     :conn,
     :session_id,
     :browser,
-    # nil | %{username, password, source, tag}
+    # nil | %{credentials, source, tag}; credentials is a zero-arity fun returning
+    # {username, password}, so crash reports and :sys.get_status/1 never print them.
     auth: nil,
     # nil | %{owner, ref, patterns, matchers}
     intercept: nil,
@@ -62,7 +63,7 @@ defmodule CDPEx.Fetch do
 
   @typedoc false
   @type request ::
-          {:auth, %{username: String.t(), password: String.t(), source: atom()}}
+          {:auth, %{credentials: (-> {String.t(), String.t()}), source: atom()}}
           | {:drop_auth, reference()}
           | {:intercept, pid(), [map()], timeout()}
           | {:release_intercept, timeout()}
@@ -140,9 +141,12 @@ defmodule CDPEx.Fetch do
         %__MODULE__{conn: conn, session_id: sid, auth: %{} = auth} = state
       ) do
     {response, attempts} =
-      auth_decision(auth.source, state.attempts, request_id, params["authChallenge"] || %{},
-        username: auth.username,
-        password: auth.password
+      auth_decision(
+        auth.source,
+        state.attempts,
+        request_id,
+        params["authChallenge"] || %{},
+        auth.credentials
       )
 
     _ =
@@ -461,8 +465,9 @@ defmodule CDPEx.Fetch do
   # Decide the authChallengeResponse and the next attempts map for a challenge.
   # Pure, so the source filter + bad-credentials loop guard are unit-testable
   # without Chrome.
-  @spec auth_decision(atom(), map(), String.t(), map(), keyword()) :: {map(), map()}
-  def auth_decision(source_filter, attempts, request_id, challenge, creds) do
+  @spec auth_decision(atom(), map(), String.t(), map(), (-> {String.t(), String.t()})) ::
+          {map(), map()}
+  def auth_decision(source_filter, attempts, request_id, challenge, credentials) do
     cond do
       not source_match?(source_filter, challenge["source"]) ->
         {%{"response" => "Default"}, attempts}
@@ -473,10 +478,12 @@ defmodule CDPEx.Fetch do
         {%{"response" => "CancelAuth"}, Map.delete(attempts, request_id)}
 
       true ->
+        {username, password} = credentials.()
+
         response = %{
           "response" => "ProvideCredentials",
-          "username" => Keyword.fetch!(creds, :username),
-          "password" => Keyword.fetch!(creds, :password)
+          "username" => username,
+          "password" => password
         }
 
         {response, track_attempt(attempts, request_id)}

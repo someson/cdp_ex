@@ -334,6 +334,11 @@ defmodule CDPEx.Browser do
     {:stop, reason}
   end
 
+  # Credentials are kept as a closure: a fun's captured values are never printed, so
+  # they stay out of crash reports, `:sys.get_status/1` and `inspect` of the state.
+  defp credentials_fun(nil), do: nil
+  defp credentials_fun(%{username: user, password: pass}), do: fn -> {user, pass} end
+
   defp endpoint(%{pipe: true, port: port}), do: {:pipe, port}
   defp endpoint(%{debug_url: debug_url}), do: debug_url
 
@@ -354,7 +359,7 @@ defmodule CDPEx.Browser do
         {:ok, parsed} ->
           arg = Proxy.to_arg(parsed)
           launch_opts = Keyword.update(launch_opts, :extra_args, [arg], &(&1 ++ [arg]))
-          {:ok, Proxy.credentials(parsed), launch_opts}
+          {:ok, credentials_fun(Proxy.credentials(parsed)), launch_opts}
 
         {:error, _reason} = error ->
           error
@@ -534,8 +539,7 @@ defmodule CDPEx.Browser do
       # no way to recover but closing the page. On the caller's :DOWN we ask the owner
       # to drop that auth, so the page becomes re-authenticatable (#40).
       creds = %{
-        username: Keyword.fetch!(opts, :username),
-        password: Keyword.fetch!(opts, :password),
+        credentials: Keyword.fetch!(opts, :credentials),
         source: Keyword.get(opts, :source, :any)
       }
 
@@ -814,7 +818,10 @@ defmodule CDPEx.Browser do
   # login (browser launched with an authenticated `:proxy`), then the `:block` types
   # (already converted to CDP types by new_page/2).
   defp arm_requests(state, opts) do
-    auth = if state.proxy_auth, do: [{:auth, Map.put(state.proxy_auth, :source, :proxy)}], else: []
+    auth =
+      if state.proxy_auth,
+        do: [{:auth, %{credentials: state.proxy_auth, source: :proxy}}],
+        else: []
 
     block =
       case Keyword.get(opts, :block, []) do

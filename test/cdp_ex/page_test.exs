@@ -18,6 +18,11 @@ defmodule CDPEx.PageTest.StubBrowser do
     {:reply, reply, state}
   end
 
+  def handle_call({:authenticate, page, opts}, _from, {_reply, notify} = state) do
+    if notify, do: send(notify, {:stub_authenticate, page, opts})
+    {:reply, :ok, state}
+  end
+
   def handle_call({:block, page, types, timeout}, _from, {reply, notify} = state) do
     if notify, do: send(notify, {:stub_block, page, types, timeout})
     {:reply, reply, state}
@@ -1446,6 +1451,17 @@ defmodule CDPEx.PageTest do
       statuses = for %{"response" => %{"status" => s}} <- buffered, do: s
       assert 204 in statuses, "observer lost its buffered sub-resource response"
       assert 200 in statuses, "observer lost its own copy of the document response"
+    end
+  end
+
+  describe "authenticate/4 credentials" do
+    test "reach the browser as a closure, never as plain values", %{page: page} do
+      assert :ok = Page.authenticate(page, "site-u1", "site-pw1", source: :server)
+      assert_receive {:stub_authenticate, ^page, opts}
+      refute inspect(opts, limit: :infinity) =~ "site-pw1"
+      refute inspect(opts, limit: :infinity) =~ "site-u1"
+      assert opts[:credentials].() == {"site-u1", "site-pw1"}
+      assert opts[:source] == :server
     end
   end
 
