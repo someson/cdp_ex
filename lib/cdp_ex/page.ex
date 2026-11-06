@@ -265,7 +265,7 @@ defmodule CDPEx.Page do
   # (HTTP status + final URL) for THIS navigation. Kept separate so the default path
   # stays untouched. Requires the Network domain; enables it lazily. The capture itself
   # runs in an isolated helper process (run_in_helper/4) so it never disturbs a
-  # same-process observe_network/2 subscription (#42).
+  # same-process observe_network/2 subscription.
   defp navigate_capturing_response(page, url, wait_until, timeout) do
     # Validate :wait_until up front (lifecycle_name/1 raises on a bad value) so an
     # invalid option never enables Network / spawns the helper first — matching the
@@ -288,7 +288,7 @@ defmodule CDPEx.Page do
   # Run a capture/wait body (`fun`) in its own short-lived, monitored process and return
   # its result. The body subscribes to its CDP events on *the helper's* pid and drains
   # *the helper's* mailbox, so a caller that is also running observe_network/2 on this page
-  # keeps its subscription and its buffered events intact (#42, #48). Connection monitors
+  # keeps its subscription and its buffered events intact. Connection monitors
   # every subscriber and drops it on :DOWN, so the helper's subscriptions are released when
   # it exits — no explicit unsubscribe. `fun` must bound every blocking op it makes against
   # `deadline` (subscribe_each + the CDP calls carry `remaining(deadline)`; the await loops
@@ -584,7 +584,7 @@ defmodule CDPEx.Page do
 
   # A `:session` page's connection is the shared browser socket, which outlives the
   # page, so a wait that ends on the connection's :DOWN also watches for the
-  # session's detach — the session-transport equivalent (#121). The helper-run waits
+  # session's detach — the session-transport equivalent. The helper-run waits
   # subscribe to it on their own pid.
   defp watched(%__MODULE__{session_id: nil}, methods), do: methods
   defp watched(_page, methods), do: [@target_detached | methods]

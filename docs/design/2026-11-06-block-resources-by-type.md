@@ -10,7 +10,7 @@ a paid proxy and faster loads. Today a caller builds this from
 `enable_request_interception/2` plus a process of its own that fails every pause
 (see the image-blocking example in `docs/guides/recipes.md`). That process is
 needed because the caller is blocked in `navigate/3` while the pauses arrive, and
-every caller that wants blocking writes the same loop. ReqBot does exactly this.
+every caller that wants blocking writes the same loop.
 
 Since #24 one `CDPEx.Fetch` process per page owns the `Fetch` domain and already
 resolves the pauses nobody else wants. Failing a pause by resource type is one
@@ -32,9 +32,9 @@ more decision in that process, so no caller-side process is needed.
 
 - Blocking by URL, domain or pattern. Request interception covers that.
 - A launch- or pool-wide default. `Pool.with_page(pool, fun, block: [...])`
-  covers the Pulse case; revisit if callers repeat it everywhere.
+  covers a pool whose jobs all block; revisit if callers repeat it everywhere.
 - Counting or reporting blocked requests (telemetry). Can be added later.
-- Anti-bot considerations. Blocking is a bandwidth feature, not stealth (#35).
+- Anti-bot considerations. Blocking is a bandwidth feature, not stealth.
 
 ## Design
 
@@ -149,7 +149,7 @@ owner semantics). An unknown page returns `{:error, :unknown_page}`.
   a "custom rule" note pointing at `enable_request_interception/2`.
 - `docs/guides/page-operations.md`: a row for `block_resources/3`.
 - `CDPEx.Browser.new_page/2` and `CDPEx.Fetch` moduledocs: the new mode.
-- `CHANGELOG.md` under `[Unreleased]`; `docs/TODO.md` item 10 marked done.
+- `docs/TODO.md` item 10 marked done.
 
 ## Tests
 

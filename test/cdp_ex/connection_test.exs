@@ -313,7 +313,7 @@ defmodule CDPEx.ConnectionTest do
     end
   end
 
-  test "subscribe/3 honours an explicit timeout and still registers (#49)", %{
+  test "subscribe/3 honours an explicit timeout and still registers", %{
     conn: conn,
     fake: fake
   } do
@@ -349,7 +349,7 @@ defmodule CDPEx.ConnectionTest do
     assert {:ok, %{"who" => "B"}} = Task.await(b)
   end
 
-  describe "a detached session (#121)" do
+  describe "a detached session" do
     test "Target.detachedFromTarget fails that session's in-flight calls and waiters only", %{
       conn: conn,
       fake: fake

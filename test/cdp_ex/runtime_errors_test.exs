@@ -4,7 +4,7 @@ defmodule CDPEx.RuntimeErrorsTest.Stub do
   #   :crash  — dies (not :normal, not :shutdown) on any call, before replying
   #   :ws_closed — stops the way a Connection does when its socket closes mid-call
   #   :hold   — never replies; tells `notify` who called, and whether that caller
-  #             later goes down (the Browser's #40 cleanup hook for authenticate)
+  #             later goes down (the Browser's cleanup hook for authenticate)
   use GenServer
 
   def start(mode, notify \\ nil), do: GenServer.start(__MODULE__, {mode, notify})
@@ -146,7 +146,7 @@ defmodule CDPEx.RuntimeErrorsTest do
       assert Page.authenticate(page(self(), dead_pid()), "u", "p") == {:error, :noproc}
     end
 
-    test "Page.authenticate/4 whose caller dies mid-call lets the browser see it go (#40)" do
+    test "Page.authenticate/4 whose caller dies mid-call lets the browser see it go" do
       {:ok, browser} = Stub.start(:hold, self())
       page = page(self(), browser)
       caller = spawn(fn -> Page.authenticate(page, "u", "p") end)
@@ -356,7 +356,7 @@ defmodule CDPEx.RuntimeErrorsTest.AuthenticateTimeout do
     assert Page.authenticate(page, "u", "p") == {:error, {:timeout, :authenticate}}
 
     # The Browser tears down a still-arming handler when the process that called it
-    # goes down (#40); returning the timeout must not take that signal away.
+    # goes down; returning the timeout must not take that signal away.
     assert_receive {:stub_called, {:authenticate, ^page, _opts}, caller}
     assert caller != self()
     assert_receive {:stub_caller_down, ^caller}, 1_000
@@ -410,7 +410,7 @@ defmodule CDPEx.RuntimeErrorsTest.OwnedProfileDir do
 end
 
 defmodule CDPEx.RuntimeErrorsTest.InvalidLaunchOpts do
-  # #125: a bad launch option used to raise inside Browser.init/1, where it exited down
+  # A bad launch option used to raise inside Browser.init/1, where it exited down
   # the link and killed a caller that wasn't trapping exits.
   @moduledoc false
   use ExUnit.Case, async: true

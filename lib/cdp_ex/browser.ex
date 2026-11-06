@@ -202,7 +202,7 @@ defmodule CDPEx.Browser do
   def authenticate(browser, %Page{} = page, opts) do
     # The call runs in a throwaway process because the Browser monitors whoever made
     # it: when that process goes down while the handler is still arming, the Browser
-    # tears the handler down (#40). A timeout caught in the caller would leave it alive
+    # tears the handler down. A timeout caught in the caller would leave it alive
     # and the page stuck on :already_authenticated. The relay is linked to the caller so
     # the caller's death takes it down too, which is the :DOWN the Browser acts on; it
     # unlinks before replying so a caller that traps exits gets no stray {:EXIT}.
@@ -633,7 +633,7 @@ defmodule CDPEx.Browser do
       # arm under scheduler starvation), the caller exits and the page would be left
       # armed with no waiting caller — a retry would hit :already_authenticated with
       # no way to recover but closing the page. On the caller's :DOWN we ask the owner
-      # to drop that auth, so the page becomes re-authenticatable (#40).
+      # to drop that auth, so the page becomes re-authenticatable.
       creds = %{
         credentials: Keyword.fetch!(opts, :credentials),
         source: Keyword.get(opts, :source, :any)
@@ -863,7 +863,7 @@ defmodule CDPEx.Browser do
     # arming — typically because its 15s call timed out on a slow arm. Ask the owner to
     # drop that auth (matched by its tag, so a later auth by someone else is safe), so
     # the page can be authenticated again instead of being stuck on
-    # :already_authenticated (#40). We do not reply — the caller is gone. The owner's
+    # :already_authenticated. We do not reply — the caller is gone. The owner's
     # reply to the original request then finds no pending entry and is ignored.
     #
     # No demonitor here: a monitor is one-shot, and the runtime already removed it when

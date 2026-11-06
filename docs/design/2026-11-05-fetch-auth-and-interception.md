@@ -13,8 +13,8 @@ independent drivers clobber each other: the last `Fetch.enable` wins, and two
 subscribers to `Fetch.requestPaused` both resolve every pause. Puppeteer allows
 the combination.
 
-ReqBot (blocks images and fonts behind an authenticated proxy) works around it
-by re-sending `Fetch.enable` with `handleAuthRequests: true` through
+A caller that blocks images and fonts behind an authenticated proxy has to work
+around it by re-sending `Fetch.enable` with `handleAuthRequests: true` through
 `CDPEx.Connection` and answering `Fetch.authRequired` itself.
 
 ## Goals
@@ -85,7 +85,7 @@ on it continues every pause it forwarded (ids kept in a capped set; a
 `continueRequest` for one already resolved fails harmlessly) and re-enables
 auth-only.
 
-`Fetch.authRequired` with auth off is ignored, not answered, so ReqBot's
+`Fetch.authRequired` with auth off is ignored, not answered, so such a
 workaround keeps working until it is removed.
 
 ### Browser bookkeeping

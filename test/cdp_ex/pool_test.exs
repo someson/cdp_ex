@@ -215,7 +215,7 @@ defmodule CDPEx.PoolTest do
     assert Process.alive?(pool)
   end
 
-  test "the pool stays responsive while a launch is in flight (#22)" do
+  test "the pool stays responsive while a launch is in flight" do
     # A launch that parks until the test releases it (deterministic, no wall-clock). In the
     # old synchronous pool the GenServer was blocked inside start_fun, so it couldn't process
     # any other message — the second checkout below would hang rather than time out.
@@ -241,7 +241,7 @@ defmodule CDPEx.PoolTest do
     assert {:ok, _b} = Task.await(slow, 2_000)
   end
 
-  test "launches browsers concurrently for simultaneous waiters (#22)" do
+  test "launches browsers concurrently for simultaneous waiters" do
     # Each launch announces itself then parks. If launches were serial, only one would be in
     # flight at a time; we assert all three are parked at once, proving concurrency.
     test = self()
@@ -288,7 +288,7 @@ defmodule CDPEx.PoolTest do
     Enum.each(holders, &send(&1, :release))
   end
 
-  test "the pool stops with an attributable reason if its launch supervisor dies (#22)" do
+  test "the pool stops with an attributable reason if its launch supervisor dies" do
     pool = start_pool(size: 1)
     ref = Process.monitor(pool)
     task_sup = :sys.get_state(pool).task_sup
@@ -303,7 +303,7 @@ defmodule CDPEx.PoolTest do
     end)
   end
 
-  test "a launch that outlives its timed-out waiter becomes a warm spare (#22)" do
+  test "a launch that outlives its timed-out waiter becomes a warm spare" do
     test = self()
 
     parked_start = fn opts ->
@@ -325,7 +325,7 @@ defmodule CDPEx.PoolTest do
     assert :sys.get_state(pool).count == 1
   end
 
-  test "a launch that fails after its waiter timed out is handled without crashing (#22)" do
+  test "a launch that fails after its waiter timed out is handled without crashing" do
     test = self()
 
     parked_fail = fn _opts ->
@@ -346,7 +346,7 @@ defmodule CDPEx.PoolTest do
     assert Process.alive?(pool)
   end
 
-  test "the pool passes itself as :owner so an adopted browser self-reaps against it (#22)" do
+  test "the pool passes itself as :owner so an adopted browser self-reaps against it" do
     test = self()
 
     capturing_start = fn opts ->
@@ -361,7 +361,7 @@ defmodule CDPEx.PoolTest do
     assert opts[:owner] == pool
   end
 
-  test "a launch failure doesn't fail a waiter still covered by another in-flight launch (#22)" do
+  test "a launch failure doesn't fail a waiter still covered by another in-flight launch" do
     test = self()
 
     controlled = fn opts ->

@@ -26,9 +26,6 @@ session. Every Chrome CDPEx launches is reaped on every exit path: a normal
 return, a raise, the caller's death, and the VM itself going away (`System.halt/1`,
 `kill -9`, the OOM killer).
 
-It's production-tested: it runs as the sole browser engine for a JavaScript-heavy
-scraper, where it replaced a Wallaby/ChromeDriver setup.
-
 | | CDPEx | playwright_ex | ChromicPDF | Wallaby |
 |---|---|---|---|---|
 | Scope | general automation | general automation, testing | PDF / screenshots | feature tests |
@@ -135,6 +132,7 @@ box on a constrained host (e.g. 2 vCPU / 2 GB).
 - [Recipes](docs/guides/recipes.md)
   - [Block or rewrite requests (interception)](docs/guides/recipes.md#block-or-rewrite-requests-interception)
   - [Grab an API response triggered by a click (SPA)](docs/guides/recipes.md#grab-an-api-response-triggered-by-a-click-spa)
+  - [Download a file](docs/guides/recipes.md#download-a-file)
   - [Detect a 403 wall, a 404 or a login redirect](docs/guides/recipes.md#detect-a-403-wall-a-404-or-a-login-redirect)
   - [Authenticated proxy](docs/guides/recipes.md#authenticated-proxy), with resource blocking to save its traffic
   - [Keep jobs apart on a shared browser](docs/guides/recipes.md#keep-jobs-apart-on-a-shared-browser)

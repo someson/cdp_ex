@@ -2,7 +2,7 @@ defmodule CDPEx.MixProject do
   use Mix.Project
 
   @version "0.14.0"
-  @source_url "https://github.com/patrols/cdp_ex"
+  @source_url "https://github.com/someson/cdp_ex"
 
   def project do
     [
@@ -14,9 +14,6 @@ defmodule CDPEx.MixProject do
       deps: deps(),
       aliases: aliases(),
       dialyzer: dialyzer(),
-      # Hex
-      description: description(),
-      package: package(),
       # Docs
       name: "CDPEx",
       source_url: @source_url,
@@ -69,9 +66,9 @@ defmodule CDPEx.MixProject do
 
   defp aliases do
     [
-      # Mirrors the parent project's `mix ci`. `test --exclude integration` keeps
-      # the default CI lane Chrome-free; the real-browser tests are tagged
-      # `:integration` and run in a separate job that installs Chrome.
+      # `test --exclude integration` keeps the default CI lane Chrome-free; the
+      # real-browser tests are tagged `:integration` and run in a separate job
+      # that installs Chrome.
       ci: [
         "format --check-formatted",
         "deps.unlock --check-unused",
@@ -105,29 +102,11 @@ defmodule CDPEx.MixProject do
     ]
   end
 
-  defp description do
-    "OTP-native Chrome DevTools Protocol (CDP) browser automation for Elixir. " <>
-      "Launch headless Chrome and drive it over a Mint.WebSocket connection — " <>
-      "no ChromeDriver, no Node.js."
-  end
-
-  defp package do
-    [
-      name: "cdp_ex",
-      licenses: ["MIT"],
-      maintainers: ["Patrick Olsen"],
-      links: %{
-        "GitHub" => @source_url,
-        "Changelog" => @source_url <> "/blob/main/CHANGELOG.md"
-      },
-      files: ~w(lib mix.exs README.md CHANGELOG.md LICENSE .formatter.exs docs/guides)
-    ]
-  end
-
   defp docs do
     [
       main: "readme",
-      source_ref: "v#{@version}",
+      # The fork has no release tags, so source links point at main.
+      source_ref: "main",
       source_url: @source_url,
       extras: [
         "README.md",
@@ -137,7 +116,6 @@ defmodule CDPEx.MixProject do
         "docs/guides/error-handling.md",
         "docs/guides/telemetry.md",
         "docs/guides/process-labels.md",
-        "CHANGELOG.md",
         "LICENSE"
       ]
     ]
