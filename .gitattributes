@@ -1,0 +1,5 @@
+# Benchmark fixtures: a saved Wikipedia article, its stylesheets and stand-in
+# app bundles. Kept out of GitHub's language stats.
+bench/compare/fixture/html/** linguist-vendored
+bench/compare/fixture/heavy/** linguist-vendored
+bench/compare/fixture/js/** linguist-vendored
