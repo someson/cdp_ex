@@ -25,6 +25,9 @@ headless, a local fixture server, 3 rounds, medians.
     `wait_for_response/3` (#28).
 13. Block and login inside cross-site iframes (#30).
     `docs/design/2026-11-06-cross-site-iframes.md`.
+13a. A cross-site iframe left paused when the page's `CDPEx.Fetch` stops before
+     handling its attach: it now resumes it from `terminate/2`. See "A stuck
+     iframe" in the same design doc.
 
 ## 2. Empty profile dir left by a launch cut short — parked
 
@@ -51,11 +54,6 @@ works with `launch_opts: [connect: url]` is unchecked. Worth revisiting for
 moving Chrome off the application host, a farm of browser hosts behind one pool,
 or a cloud browser provider. The remote DevTools endpoint needs TLS and a token
 in front of it, since it gives full control of the browser.
-
-## 13a. An iframe left paused if the Fetch owner dies — unverified
-
-Whether Chrome resumes a cross-site iframe left waiting if the page's
-`CDPEx.Fetch` process crashes between the iframe's attach and its resume.
 
 ## 14. Gaps found by the competitor comparison
 
