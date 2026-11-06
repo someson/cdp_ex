@@ -76,9 +76,9 @@ process per browser.
 They also turn off Chrome's own background calls to Google (sync, metrics, network
 time, optimization hints, Safe Browsing real-time lookups, the search preconnect),
 and `accounts.google.com` and `update.googleapis.com` never reach the network
-(`:block_background_hosts`, on by default). Behind a paid proxy that is 1 request
-to Google instead of 14 in the first 20 seconds (Google Chrome 157, Linux); the one
-left is the AI Mode eligibility check. See `CDPEx.Chrome`.
+(`:block_background_hosts`, on by default). Behind a paid proxy that is no request
+to Google instead of 14 in the first 20 seconds (Google Chrome 157, Linux). See
+`CDPEx.Chrome`.
 
 ### Running on a server or in a container
 

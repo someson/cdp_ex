@@ -62,16 +62,18 @@ defmodule CDPEx.Chrome do
   Google at startup and after a navigation, through the `:proxy` when one is set:
   sync, metrics upload, client-side phishing detection, domain reliability
   reporting, default apps, network time queries, optimization hints and their model
-  downloads, Safe Browsing's real-time hash lookups and the preconnect to the search
-  engine (`--disable-features=OptimizationHints,OptimizationGuideModelDownloading,`
-  `NetworkTimeServiceQuerying,SafeBrowsingHashPrefixRealTimeLookups,PreconnectToSearch`).
+  downloads, Safe Browsing's real-time hash lookups, the preconnect to the search
+  engine and the AI Mode eligibility check
+  (`--disable-features=OptimizationHints,OptimizationGuideModelDownloading,`
+  `NetworkTimeServiceQuerying,SafeBrowsingHashPrefixRealTimeLookups,PreconnectToSearch,`
+  `AimServerRequestOnStartupEnabled`).
   A `--disable-features`, `--proxy-bypass-list` or `--host-resolver-rules` in
   `:extra_args` is merged into the default one instead of replacing it (Chrome
   keeps only the last occurrence of a switch), and a feature named in
   `--enable-features` is left out of the default disable list. Measured with a
-  logging proxy over 20 s (Google Chrome 157, Linux): 14 requests to Google hosts
-  without these defaults, 1 with them (the AI Mode eligibility check on
-  `www.google.com`, which no flag found so far turns off).
+  logging proxy over 20 s with one navigation (Google Chrome 157, Linux; Google
+  Chrome 156, macOS): 14 and 16 requests to Google hosts without these defaults,
+  none with them.
   Anti-bot flags (spoofed user-agent, `--disable-web-security`,
   `--disable-blink-features=AutomationControlled`, …) are **not** included — add
   them via `:extra_args` if you need them.
@@ -385,7 +387,9 @@ defmodule CDPEx.Chrome do
     "OptimizationGuideModelDownloading",
     "NetworkTimeServiceQuerying",
     "SafeBrowsingHashPrefixRealTimeLookups",
-    "PreconnectToSearch"
+    "PreconnectToSearch",
+    # The AI Mode eligibility check (www.google.com/async/folae) at startup.
+    "AimServerRequestOnStartupEnabled"
   ]
 
   # Hosts the browser itself calls that a scraper never needs: the Google sign-in

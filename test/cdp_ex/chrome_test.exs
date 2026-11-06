@@ -101,7 +101,7 @@ defmodule CDPEx.ChromeTest do
       end
 
       assert ("--disable-features=OptimizationHints,OptimizationGuideModelDownloading," <>
-                "NetworkTimeServiceQuerying,SafeBrowsingHashPrefixRealTimeLookups,PreconnectToSearch") in args
+                "NetworkTimeServiceQuerying,SafeBrowsingHashPrefixRealTimeLookups,PreconnectToSearch,AimServerRequestOnStartupEnabled") in args
     end
 
     test "keeps Google's sign-in and updater hosts off the network by default" do
@@ -186,7 +186,9 @@ defmodule CDPEx.ChromeTest do
     test "a --disable-features in :extra_args joins the default list" do
       args = Chrome.build_args("/tmp/p", extra_args: ["--disable-features=Translate"])
       [flag] = Enum.filter(args, &String.starts_with?(&1, "--disable-features="))
-      assert flag =~ ~r/^--disable-features=OptimizationHints,.*,PreconnectToSearch,Translate$/
+
+      assert flag =~
+               ~r/^--disable-features=OptimizationHints,.*,AimServerRequestOnStartupEnabled,Translate$/
     end
 
     test "a feature in --enable-features is dropped from the default disable list" do
