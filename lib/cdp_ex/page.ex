@@ -50,6 +50,7 @@ defmodule CDPEx.Page do
   @screenshot_timeout 30_000
   @command_timeout 10_000
   @click_poll_interval 100
+  @files_object_group "cdp_ex-set-input-files"
   @probe_timeout 2_000
   @retryable_locate [:selector_not_found, :text_not_found, :not_clickable, :obscured]
   # All -32000: a context that never existed (the script didn't run) vs one torn down mid-call.
@@ -1259,6 +1260,114 @@ defmodule CDPEx.Page do
 
       {:error, _} = error ->
         error
+    end
+  end
+
+  @doc """
+  Sets the files of the first `<input type="file">` matching `css`
+  (`DOM.setFileInputFiles`), as if the user picked them: the input's `files` change
+  and it fires `input` and `change`. An empty list clears the selection
+  (`DOM.setFileInputFiles` can't) by setting the input's `value` to `""` and
+  dispatching `input` and `change` from script, so those two are not trusted.
+
+  `paths` is a path or a list of paths, expanded with `Path.expand/1`. Chrome reads
+  the files itself, from its own filesystem, and takes a missing one without
+  complaint: the page sees a 0-byte file that fails when read. So each path is
+  first checked to be a regular file here. For a browser attached with
+  `CDPEx.connect/2` that runs on another host or in a container, the paths are on
+  its filesystem, not the caller's: pass `check: false`.
+
+  More than one path for an input without the `multiple` attribute is refused
+  (Chrome would keep one and fire no event).
+
+  Returns `:ok`, `{:error, {:file_not_found, path}}` (the expanded path),
+  `{:error, {:selector_not_found, css}}`, `{:error, {:not_file_input, css}}` when
+  the element is not an `<input type="file">`,
+  `{:error, {:invalid_args, {:multiple_files, css}}}`,
+  `{:error, {:evaluate_exception, _}}` for an invalid selector, or a CDP error.
+  A `paths` that is not a string or a list of strings raises `ArgumentError`.
+
+  Options:
+    * `:check` — `false` skips the local file check. Default `true`.
+    * `:timeout` — per-CDP-call timeout, default #{@evaluate_timeout}.
+  """
+  @spec set_input_files(t(), String.t(), Path.t() | [Path.t()], keyword()) ::
+          :ok | {:error, term()}
+  def set_input_files(%__MODULE__{} = page, css, paths, opts \\ []) when is_binary(css) do
+    files = paths |> input_paths!() |> Enum.map(&Path.expand/1)
+
+    case Keyword.get(opts, :check, true) && Enum.find(files, &(not File.regular?(&1))) do
+      missing when is_binary(missing) -> {:error, {:file_not_found, missing}}
+      _ -> do_set_input_files(page, css, files, Keyword.get(opts, :timeout, @evaluate_timeout))
+    end
+  end
+
+  defp do_set_input_files(page, css, files, timeout) do
+    js = """
+    (function () {
+      var el = document.querySelector(#{Jason.encode!(css)});
+      if (!el) { return "not_found"; }
+      if (!(el instanceof HTMLInputElement) || el.type !== "file") { return "not_file_input"; }
+      if (#{length(files)} > 1 && !el.multiple) { return "not_multiple"; }
+      if (#{length(files)} === 0) {
+        el.value = "";
+        el.dispatchEvent(new Event("input", {bubbles: true, composed: true}));
+        el.dispatchEvent(new Event("change", {bubbles: true}));
+        return "cleared";
+      }
+      return el;
+    })()
+    """
+
+    params = %{"expression" => js, "objectGroup" => @files_object_group}
+
+    case do_call(page, "Runtime.evaluate", params, timeout) do
+      {:ok, %{"result" => %{"objectId" => object_id}} = result}
+      when not is_map_key(result, "exceptionDetails") ->
+        set_files(page, object_id, files, timeout)
+
+      {:ok, %{"result" => %{"value" => "cleared"}}} ->
+        :ok
+
+      {:ok, %{"result" => %{"value" => "not_found"}}} ->
+        {:error, {:selector_not_found, css}}
+
+      {:ok, %{"result" => %{"value" => "not_file_input"}}} ->
+        {:error, {:not_file_input, css}}
+
+      {:ok, %{"result" => %{"value" => "not_multiple"}}} ->
+        {:error, {:invalid_args, {:multiple_files, css}}}
+
+      {:ok, %{"exceptionDetails" => details}} ->
+        {:error, {:evaluate_exception, details}}
+
+      {:ok, other} ->
+        {:error, {:unexpected_evaluate, other}}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp set_files(page, object_id, files, timeout) do
+    result =
+      do_call(page, "DOM.setFileInputFiles", %{"files" => files, "objectId" => object_id}, timeout)
+
+    _ =
+      do_call(page, "Runtime.releaseObjectGroup", %{"objectGroup" => @files_object_group}, timeout)
+
+    case result do
+      {:ok, _} -> :ok
+      {:error, _} = error -> error
+    end
+  end
+
+  defp input_paths!(paths) do
+    if (is_binary(paths) or is_list(paths)) and Enum.all?(List.wrap(paths), &is_binary/1) do
+      List.wrap(paths)
+    else
+      raise ArgumentError,
+            "invalid set_input_files/4 paths #{inspect(paths)} (expected a path or a list of paths)"
     end
   end
 

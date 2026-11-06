@@ -44,7 +44,8 @@ scraper, where it replaced a Wallaby/ChromeDriver setup.
 | Waits | selector, JS predicate, network idle, a response with its body | selector, JS predicate, network idle; responses without a body | partial (an element via an `:evaluate` Promise) | element queries |
 | Read text, click, fill a form | ✓ | ✓ | ✗ | ✓ |
 | Hover | ✓ `hover/3` | ✓ | ✗ | ✓ |
-| File upload, JS dialogs | ✗ | ✓ | ✗ | ✓ |
+| File upload | ✓ `set_input_files/4` | ✓ | ✗ | ✓ |
+| JS dialogs | ✗ | ✓ | ✗ | ✓ |
 | Downloads | ✗ | fails in 0.16.0 (the documented flow raises) | ✗ | ✗ |
 | Inside an iframe | ✗ | ✓ | ✗ | ✓ |
 | Console messages | ✗ | ✓ | ✗ | ✓ |

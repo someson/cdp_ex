@@ -58,6 +58,8 @@ defmodule CDPExTest do
       {:text_not_found, "Load more"},
       {:not_clickable, ".hidden"},
       {:obscured, "#under-banner"},
+      {:not_file_input, "#name"},
+      {:file_not_found, "/tmp/missing.pdf"},
       {:unknown_key, "F13"},
       {:evaluate_exception, %{"text" => "ReferenceError"}},
       {:unserializable_value, "NaN"},

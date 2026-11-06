@@ -270,7 +270,14 @@ defmodule Compare.CDPEx do
       html_string_pdf: fn ->
         {:unsupported, "no API to load an HTML string; navigate/3 takes a URL (a data: URL works)"}
       end,
-      file_upload: fn -> {:unsupported, @raw <> " (DOM.setFileInputFiles)"} end,
+      file_upload:
+        probe.(fn page ->
+          open(page, url, :load)
+          path = Path.join(System.tmp_dir!(), "upload.txt")
+          File.write!(path, "x")
+          :ok = Page.set_input_files(page, "#file", path)
+          ok!(Page.text(page, "#fileName"))
+        end),
       download: fn -> {:unsupported, @raw <> " (Browser.setDownloadBehavior)"} end,
       dialog: fn ->
         {:unsupported, @raw <> " (Page.handleJavaScriptDialog); a dialog blocks the page"}

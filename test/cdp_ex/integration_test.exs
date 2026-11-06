@@ -685,6 +685,51 @@ defmodule CDPEx.IntegrationTest do
       assert {:error, {:obscured, "#covered-btn"}} = Page.hover(page, "#covered-btn")
     end
 
+    test "set_input_files/4 sets files the page can read and fires input and change", %{
+      page: page,
+      fixture: fixture
+    } do
+      dir = Path.join(System.tmp_dir!(), "cdp_ex_upload_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+      [a, b] = for name <- ["a.txt", "b.txt"], do: Path.join(dir, name)
+      File.write!(a, "alpha")
+      File.write!(b, "beta!")
+
+      {:ok, _} = Page.navigate(page, fixture <> "interact", wait_until: :load)
+      assert :ok = Page.set_input_files(page, "#upload-one", a)
+      assert :ok = Page.set_input_files(page, "#upload-many", [a, b])
+
+      read = """
+      Promise.all([...document.querySelectorAll("#upload-one, #upload-many")]
+        .flatMap(i => [...i.files]).map(f => f.text().then(t => f.name + "=" + t)))
+      """
+
+      assert {:ok, ["a.txt=alpha", "a.txt=alpha", "b.txt=beta!"]} =
+               Page.evaluate(page, read, await_promise: true)
+
+      assert {:error, {:invalid_args, {:multiple_files, "#upload-one"}}} =
+               Page.set_input_files(page, "#upload-one", [a, b])
+
+      assert :ok = Page.set_input_files(page, "#upload-many", [])
+      assert {:ok, 0} = Page.evaluate(page, ~s|document.querySelector("#upload-many").files.length|)
+
+      assert {:ok,
+              [
+                "upload-one input 1",
+                "upload-one change 1",
+                "upload-many input 2",
+                "upload-many change 2",
+                "upload-many input 0",
+                "upload-many change 0"
+              ]} = Page.evaluate(page, "window.uploads")
+
+      assert {:error, {:not_file_input, "#covered-btn"}} =
+               Page.set_input_files(page, "#covered-btn", a)
+
+      assert {:error, {:selector_not_found, "#nope"}} = Page.set_input_files(page, "#nope", a)
+    end
+
     test "click/3 returns :selector_not_found for no match", %{page: page, fixture: fixture} do
       {:ok, _} = Page.navigate(page, fixture)
       assert {:error, {:selector_not_found, "#nope"}} = Page.click(page, "#nope")
