@@ -40,6 +40,7 @@ defmodule CDPEx.Pool do
   alias CDPEx.Browser
   alias CDPEx.Exits
   alias CDPEx.ProcessLabel
+  alias CDPEx.Proxy
 
   require Logger
 
@@ -192,6 +193,22 @@ defmodule CDPEx.Pool do
   end
 
   # ── GenServer callbacks ─────────────────────────────────────────────────────
+
+  # launch_opts may carry the :proxy credentials: mask them in crash reports and
+  # :sys.get_status/1. GenServer declares format_status/1 from Elixir 1.17 on (OTP
+  # calls it either way), hence the guard.
+  if {:format_status, 1} in GenServer.behaviour_info(:callbacks), do: @impl(true)
+  @doc false
+  def format_status(%{state: %__MODULE__{launch_opts: opts} = state} = status) when is_list(opts) do
+    if Keyword.has_key?(opts, :proxy),
+      do: %{
+        status
+        | state: %{state | launch_opts: Keyword.update!(opts, :proxy, &Proxy.redact_option/1)}
+      },
+      else: status
+  end
+
+  def format_status(status), do: status
 
   @impl true
   def init(opts) do

@@ -80,6 +80,26 @@ defmodule CDPEx.Proxy do
   # term (these surface from launch/1 and callers routinely log them).
   defp redact(url) when is_binary(url), do: String.replace(url, ~r{//[^/@]*@}, "//***@")
 
+  @doc false
+  # A `:proxy` option value with its credentials masked, for crash reports and
+  # process status: the URL loses its userinfo, the keyword form its username and
+  # password. Anything else comes back unchanged.
+  @spec redact_option(term()) :: term()
+  def redact_option(url) when is_binary(url), do: redact(url)
+
+  def redact_option(opts) when is_list(opts) do
+    if Keyword.keyword?(opts) do
+      Enum.map(opts, fn
+        {key, value} when key in [:username, :password] and value != nil -> {key, "***"}
+        pair -> pair
+      end)
+    else
+      opts
+    end
+  end
+
+  def redact_option(other), do: other
+
   # URI strips the brackets from an IPv6 literal (host: "::1"); re-wrap so the rebuilt
   # `host:port` stays unambiguous for Chrome (`[::1]:8080`, not `::1:8080`).
   defp host_for_server(host) do

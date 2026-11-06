@@ -7,12 +7,13 @@ defmodule CDPEx.FetchTest do
   alias CDPEx.FakeCDP
   alias CDPEx.Fetch
 
-  @creds [username: "u", password: "p"]
-  @auth %{username: "u", password: "p", source: :any}
+  # Credentials travel as a closure, so no crash report or :sys.get_status/1 prints them.
+  defp creds, do: fn -> {"u", "p"} end
+  defp auth, do: %{credentials: creds(), source: :any}
 
   describe "auth_decision/5" do
     test "provides credentials for a matching challenge and records the attempt" do
-      {response, attempts} = Fetch.auth_decision(:any, %{}, "R1", %{"source" => "Server"}, @creds)
+      {response, attempts} = Fetch.auth_decision(:any, %{}, "R1", %{"source" => "Server"}, creds())
 
       assert response == %{
                "response" => "ProvideCredentials",
@@ -25,7 +26,7 @@ defmodule CDPEx.FetchTest do
 
     test "cancels on the second challenge for the same request (rejected credentials)" do
       {response, attempts} =
-        Fetch.auth_decision(:any, %{"R1" => 1}, "R1", %{"source" => "Server"}, @creds)
+        Fetch.auth_decision(:any, %{"R1" => 1}, "R1", %{"source" => "Server"}, creds())
 
       assert response == %{"response" => "CancelAuth"}
       refute Map.has_key?(attempts, "R1")
@@ -33,18 +34,18 @@ defmodule CDPEx.FetchTest do
 
     test "the :proxy filter answers only Proxy challenges" do
       assert {%{"response" => "Default"}, %{}} =
-               Fetch.auth_decision(:proxy, %{}, "R1", %{"source" => "Server"}, @creds)
+               Fetch.auth_decision(:proxy, %{}, "R1", %{"source" => "Server"}, creds())
 
       assert {%{"response" => "ProvideCredentials"}, %{"R1" => 1}} =
-               Fetch.auth_decision(:proxy, %{}, "R1", %{"source" => "Proxy"}, @creds)
+               Fetch.auth_decision(:proxy, %{}, "R1", %{"source" => "Proxy"}, creds())
     end
 
     test "the :server filter answers only Server challenges" do
       assert {%{"response" => "ProvideCredentials"}, %{"R1" => 1}} =
-               Fetch.auth_decision(:server, %{}, "R1", %{"source" => "Server"}, @creds)
+               Fetch.auth_decision(:server, %{}, "R1", %{"source" => "Server"}, creds())
 
       assert {%{"response" => "Default"}, %{}} =
-               Fetch.auth_decision(:server, %{}, "R1", %{"source" => "Proxy"}, @creds)
+               Fetch.auth_decision(:server, %{}, "R1", %{"source" => "Proxy"}, creds())
     end
 
     test "caps the attempts map so answered-but-unpruned challenges can't grow it unbounded" do
@@ -54,7 +55,7 @@ defmodule CDPEx.FetchTest do
       assert map_size(full) == 1024
 
       assert {%{"response" => "ProvideCredentials"}, %{"NEW" => 1}} =
-               Fetch.auth_decision(:any, full, "NEW", %{"source" => "Server"}, @creds)
+               Fetch.auth_decision(:any, full, "NEW", %{"source" => "Server"}, creds())
     end
   end
 
@@ -297,12 +298,12 @@ defmodule CDPEx.FetchTest do
       pid = start_owner(conn)
 
       tag = make_ref()
-      Fetch.request(pid, tag, {:auth, @auth})
+      Fetch.request(pid, tag, {:auth, auth()})
       assert expect_call(fake, "Fetch.enable") == %{"handleAuthRequests" => true}
       assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
 
       tag2 = make_ref()
-      Fetch.request(pid, tag2, {:auth, @auth})
+      Fetch.request(pid, tag2, {:auth, auth()})
       assert_receive {:fetch_reply, ^pid, ^tag2, {:error, :already_authenticated}}, 2_000
     end
 
@@ -312,7 +313,7 @@ defmodule CDPEx.FetchTest do
       log =
         capture_log(fn ->
           tag = make_ref()
-          Fetch.request(pid, tag, {:auth, @auth})
+          Fetch.request(pid, tag, {:auth, auth()})
           expect_call(fake, "Fetch.enable", :error)
 
           assert_receive {:fetch_reply, ^pid, ^tag, {:error, {:cdp_error, "Fetch.enable", _}}},
@@ -322,7 +323,7 @@ defmodule CDPEx.FetchTest do
       assert log =~ "arming failed"
 
       tag = make_ref()
-      Fetch.request(pid, tag, {:auth, @auth})
+      Fetch.request(pid, tag, {:auth, auth()})
       expect_call(fake, "Fetch.enable")
       assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
     end
@@ -353,7 +354,7 @@ defmodule CDPEx.FetchTest do
       fake: fake
     } do
       pid = start_owner(conn)
-      arm(pid, fake, {:auth, @auth})
+      arm(pid, fake, {:auth, auth()})
 
       tag = make_ref()
       Fetch.request(pid, tag, {:intercept, self(), [%{"resourceType" => "Image"}], 5_000})
@@ -387,7 +388,7 @@ defmodule CDPEx.FetchTest do
       arm(pid, fake, {:intercept, self(), [%{"urlPattern" => "*.png"}], 5_000})
 
       tag = make_ref()
-      Fetch.request(pid, tag, {:auth, @auth})
+      Fetch.request(pid, tag, {:auth, auth()})
 
       assert %{"handleAuthRequests" => true, "patterns" => [%{"urlPattern" => "*"}]} =
                expect_call(fake, "Fetch.enable")
@@ -400,7 +401,7 @@ defmodule CDPEx.FetchTest do
       fake: fake
     } do
       pid = start_owner(conn)
-      arm(pid, fake, {:auth, @auth})
+      arm(pid, fake, {:auth, auth()})
       owner = relay_owner()
       arm(pid, fake, {:intercept, owner, [%{"resourceType" => "Image"}], 5_000})
 
@@ -429,7 +430,7 @@ defmodule CDPEx.FetchTest do
 
     test "release keeps auth working and replies the CDP result", %{conn: conn, fake: fake} do
       pid = start_owner(conn)
-      arm(pid, fake, {:auth, @auth})
+      arm(pid, fake, {:auth, auth()})
       arm(pid, fake, {:intercept, self(), [%{"resourceType" => "Image"}], 5_000})
 
       tag = make_ref()
@@ -459,7 +460,7 @@ defmodule CDPEx.FetchTest do
     test "drop_auth drops only the auth it names", %{conn: conn, fake: fake} do
       pid = start_owner(conn)
       tag = make_ref()
-      Fetch.request(pid, tag, {:auth, @auth})
+      Fetch.request(pid, tag, {:auth, auth()})
       expect_call(fake, "Fetch.enable")
       assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
 
@@ -476,7 +477,7 @@ defmodule CDPEx.FetchTest do
     } do
       Process.flag(:trap_exit, true)
       pid = start_owner(conn)
-      arm(pid, fake, {:auth, @auth})
+      arm(pid, fake, {:auth, auth()})
 
       :ok = Fetch.stop(pid)
       assert_receive {:EXIT, ^pid, :normal}, 2_000
@@ -489,7 +490,7 @@ defmodule CDPEx.FetchTest do
     } do
       Process.flag(:trap_exit, true)
       {:ok, pid} = Fetch.start_link(conn: conn, session_id: "S1", browser: self())
-      arm(pid, fake, {:auth, @auth})
+      arm(pid, fake, {:auth, auth()})
 
       # Another session's pause isn't ours to continue.
       FakeCDP.send_text(
@@ -582,7 +583,7 @@ defmodule CDPEx.FetchTest do
       fake: fake
     } do
       pid = start_owner(conn)
-      arm(pid, fake, {:auth, @auth})
+      arm(pid, fake, {:auth, auth()})
 
       # Auth already pauses everything, so block changes no enable param: no CDP call.
       tag = make_ref()
@@ -638,6 +639,35 @@ defmodule CDPEx.FetchTest do
       stopper = Task.async(fn -> GenServer.stop(pid) end)
       expect_call(fake, "Fetch.disable")
       Task.await(stopper)
+    end
+
+    test "its status shows no proxy credentials", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      arm(pid, fake, {:auth, %{credentials: fn -> {"puser-x1", "s3cr3t-pw"} end, source: :proxy}})
+
+      status = inspect(:sys.get_status(pid), limit: :infinity)
+      refute status =~ "s3cr3t-pw"
+      refute status =~ "puser-x1"
+    end
+
+    test "a crash report carries no proxy credentials", %{conn: conn, fake: fake} do
+      Process.flag(:trap_exit, true)
+      pid = start_owner(conn)
+      arm(pid, fake, {:auth, %{credentials: fn -> {"puser-x1", "s3cr3t-pw"} end, source: :proxy}})
+
+      log =
+        capture_log(fn ->
+          # An unknown request crashes the owner with its state in the reason.
+          send(pid, {:fetch_request, make_ref(), {:bogus, :request}})
+          # terminate/2 still disables the page's Fetch domain.
+          expect_call(fake, "Fetch.disable")
+          assert_receive {:EXIT, ^pid, {:function_clause, _}}, 2_000
+          Process.sleep(200)
+        end)
+
+      assert log =~ "CDPEx.Fetch"
+      refute log =~ "s3cr3t-pw"
+      refute log =~ "puser-x1"
     end
   end
 

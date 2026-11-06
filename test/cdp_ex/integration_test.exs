@@ -1300,7 +1300,7 @@ defmodule CDPEx.IntegrationTest do
       # Arming B's page through A must refuse (mirrors close_page) rather than link a
       # handler to a connection A doesn't own.
       assert {:error, :unknown_page} =
-               Browser.authenticate(browser_a, page_b, username: "u", password: "p")
+               Browser.authenticate(browser_a, page_b, credentials: fn -> {"u", "p"} end)
 
       # B's page is unharmed and still authenticates on its own browser.
       assert :ok = Page.authenticate(page_b, "cdpex", "secret")

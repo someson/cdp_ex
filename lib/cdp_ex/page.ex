@@ -741,7 +741,9 @@ defmodule CDPEx.Page do
       when is_binary(username) and is_binary(password) do
     case validate_source(Keyword.get(opts, :source, :any)) do
       :ok ->
-        Browser.authenticate(page.browser, page, [username: username, password: password] ++ opts)
+        # As a closure, so no crash report or process status prints the credentials.
+        credentials = fn -> {username, password} end
+        Browser.authenticate(page.browser, page, [credentials: credentials] ++ opts)
 
       {:error, _} = error ->
         error
