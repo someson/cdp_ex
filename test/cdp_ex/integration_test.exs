@@ -2179,6 +2179,192 @@ defmodule CDPEx.IntegrationTest do
     end
   end
 
+  describe "downloads" do
+    @download_sites ["--host-resolver-rules=MAP *.test 127.0.0.1"]
+
+    defp download_browser(launch_opts \\ []) do
+      {:ok, browser} = CDPEx.launch([extra_args: @download_sites] ++ launch_opts)
+      on_exit(fn -> stop_quietly(browser) end)
+      browser
+    end
+
+    defp download_page(browser, url, page_opts \\ []) do
+      {:ok, page} = CDPEx.new_page(browser, page_opts)
+      {:ok, _} = Page.navigate(page, url, wait_until: :load)
+      page
+    end
+
+    defp downloads_dir(browser),
+      do: Path.join(:sys.get_state(browser).chrome.user_data_dir, "cdp_ex-downloads")
+
+    defp tmp_target(name) do
+      dir = Path.join(System.tmp_dir!(), "cdp_ex_download_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+      Path.join(dir, name)
+    end
+
+    for {kind, launch_opts, page_opts} <- [
+          {"dedicated", [], []},
+          {"session", [], [transport: :session]},
+          {"isolated", [], [isolated: true]},
+          {"pipe", [pipe: true], []}
+        ] do
+      test "#{kind}: a clicked link's file lands in the profile dir, whole" do
+        {:ok, %{port: port}} = FixtureServer.start()
+        browser = download_browser(unquote(launch_opts))
+        page = download_page(browser, "http://a.test:#{port}/download-page", unquote(page_opts))
+
+        assert {:ok, download} =
+                 Page.wait_for_download(page, trigger: fn -> Page.click(page, "#download") end)
+
+        assert %{suggested_filename: "report.csv", size: 4096, url: url} = download
+        assert url == "http://a.test:#{port}/download?name=report.csv&size=4096"
+        assert Path.dirname(download.path) == downloads_dir(browser)
+        assert File.read!(download.path) == FixtureServer.download_body(4096)
+      end
+    end
+
+    test ":path moves the finished file there" do
+      {:ok, %{port: port}} = FixtureServer.start()
+      browser = download_browser()
+      page = download_page(browser, "http://a.test:#{port}/download-page")
+      target = tmp_target("saved.csv")
+
+      assert {:ok, %{path: ^target, size: 4096}} =
+               Page.wait_for_download(page,
+                 trigger: fn -> Page.click(page, "#download") end,
+                 path: target
+               )
+
+      assert File.read!(target) == FixtureServer.download_body(4096)
+      assert File.ls!(downloads_dir(browser)) == []
+    end
+
+    test "a :path in a missing dir is {:write_failed, :enoent} and keeps the file" do
+      {:ok, %{port: port}} = FixtureServer.start()
+      browser = download_browser()
+      page = download_page(browser, "http://a.test:#{port}/download-page")
+      target = Path.join([System.tmp_dir!(), "cdp_ex_no_such_dir_#{System.unique_integer()}", "x"])
+
+      assert {:error, {:write_failed, :enoent}} =
+               Page.wait_for_download(page,
+                 trigger: fn -> Page.click(page, "#download") end,
+                 path: target
+               )
+
+      assert [_file] = File.ls!(downloads_dir(browser))
+    end
+
+    test "a file the page builds (blob + download attribute)" do
+      {:ok, %{port: port}} = FixtureServer.start()
+      browser = download_browser()
+      page = download_page(browser, "http://a.test:#{port}/download-page")
+
+      assert {:ok, %{suggested_filename: "built.txt", url: "blob:" <> _, path: path}} =
+               Page.wait_for_download(page,
+                 trigger: fn -> Page.click(page, "#blob-download") end
+               )
+
+      assert File.read!(path) == "built in page"
+    end
+
+    test "navigating to a file's URL, the aborted navigation ignored" do
+      {:ok, %{port: port}} = FixtureServer.start()
+      browser = download_browser()
+      page = download_page(browser, "http://a.test:#{port}/download-page")
+      file_url = "http://a.test:#{port}/download?name=direct.bin&size=10"
+
+      assert {:ok, %{suggested_filename: "direct.bin", size: 10}} =
+               Page.wait_for_download(page,
+                 trigger: fn ->
+                   _ = Page.navigate(page, file_url)
+                   :ok
+                 end
+               )
+    end
+
+    for {kind, inner_host} <- [{"same-site", "a.test"}, {"cross-site", "b.test"}] do
+      test "a download from a #{kind} iframe is the page's" do
+        {:ok, %{port: port}} = FixtureServer.start()
+        browser = download_browser()
+
+        url =
+          "http://a.test:#{port}/frame?src=" <>
+            URI.encode_www_form("http://#{unquote(inner_host)}:#{port}/download-page")
+
+        page = download_page(browser, url)
+        {:ok, frame} = Page.frame(page, "iframe", wait: 5_000)
+
+        # Chrome drops input to an out-of-process frame until it has painted, so the
+        # click runs through the page's script instead.
+        assert {:ok, %{suggested_filename: "report.csv", size: 4096}} =
+                 Page.wait_for_download(page,
+                   trigger: fn ->
+                     Page.evaluate(frame, ~s|document.getElementById("download").click()|)
+                   end
+                 )
+      end
+    end
+
+    test "another page's download is not this page's" do
+      {:ok, %{port: port}} = FixtureServer.start()
+      browser = download_browser()
+      waiting = download_page(browser, "http://a.test:#{port}/download-page")
+      other = download_page(browser, "http://a.test:#{port}/download-page")
+
+      assert {:error, :timeout} =
+               Page.wait_for_download(waiting,
+                 trigger: fn -> Page.click(other, "#download") end,
+                 timeout: 2_000
+               )
+    end
+
+    test "a timeout cancels the download in progress and leaves no partial file" do
+      {:ok, %{port: port}} = FixtureServer.start()
+      browser = download_browser()
+      page = download_page(browser, "http://a.test:#{port}/download-page")
+
+      assert {:error, :timeout} =
+               Page.wait_for_download(page,
+                 trigger: fn -> Page.click(page, "#partial") end,
+                 timeout: 2_000
+               )
+
+      assert eventually(fn -> File.ls!(downloads_dir(browser)) == [] end)
+    end
+
+    test "a connection cut mid-file is {:download_canceled, url}" do
+      {:ok, %{port: port}} = FixtureServer.start()
+      browser = download_browser()
+      page = download_page(browser, "http://a.test:#{port}/download-page")
+
+      assert {:error, {:download_canceled, url}} =
+               Page.wait_for_download(page, trigger: fn -> Page.click(page, "#partial-cut") end)
+
+      assert url == "http://a.test:#{port}/download-partial?cut"
+    end
+
+    test "a trigger's error with no download started is returned" do
+      {:ok, %{port: port}} = FixtureServer.start()
+      browser = download_browser()
+      page = download_page(browser, "http://a.test:#{port}/download-page")
+
+      assert {:error, {:selector_not_found, "#nope"}} =
+               Page.wait_for_download(page, trigger: fn -> Page.click(page, "#nope") end)
+    end
+
+    test "a page in a connected browser gets {:unsupported_with_connect, :downloads}" do
+      browser = download_browser()
+      %{host: host, port: port} = :sys.get_state(browser)
+      {:ok, connected} = CDPEx.connect("http://#{host}:#{port}")
+      on_exit(fn -> stop_quietly(connected) end)
+      {:ok, page} = CDPEx.new_page(connected)
+
+      assert {:error, {:unsupported_with_connect, :downloads}} = Page.wait_for_download(page)
+    end
+  end
+
   describe "request interception" do
     test "fulfill_request serves a synthetic response for an intercepted navigation", %{
       fixture: fixture

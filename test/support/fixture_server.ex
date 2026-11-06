@@ -50,9 +50,48 @@ defmodule CDPEx.FixtureServer do
     # Read the full request headers (they may arrive across TCP segments) so the
     # header reflection and auth check are deterministic, then respond.
     request = HttpFixture.recv_request(socket)
-    if report, do: send(report, {:fixture_served, request_path(request)})
-    _ = :gen_tcp.send(socket, respond(request, json_version))
+    path = request_path(request)
+    if report, do: send(report, {:fixture_served, path})
+
+    _ =
+      case path do
+        "/download-partial" <> rest -> serve_partial_download(socket, rest)
+        "/download?" <> query -> :gen_tcp.send(socket, download_response(query))
+        _ -> :gen_tcp.send(socket, respond(request, json_version))
+      end
+
     :gen_tcp.close(socket)
+  end
+
+  defp download_response(query) do
+    params = URI.decode_query(query)
+    body = download_body(String.to_integer(Map.get(params, "size", "1000")))
+    name = Map.get(params, "name", "report.csv")
+
+    HttpFixture.http_response("200 OK", body, [
+      "Content-Disposition: attachment; filename=\"#{name}\""
+    ])
+  end
+
+  # A download that never completes: the headers promise more than is sent. `?cut` closes
+  # the socket after the first chunk (Chrome cancels the download); otherwise the socket
+  # is held open for a while, so the download stays in progress.
+  defp serve_partial_download(socket, query) do
+    head =
+      Enum.join(
+        [
+          "HTTP/1.1 200 OK",
+          "Content-Type: application/octet-stream",
+          "Content-Disposition: attachment; filename=\"partial.bin\"",
+          "Content-Length: 10000000",
+          "Connection: close"
+        ],
+        "\r\n"
+      )
+
+    _ = :gen_tcp.send(socket, head <> "\r\n\r\n" <> String.duplicate("p", 65_536))
+    if !(query =~ "cut"), do: Process.sleep(15_000)
+    :ok
   end
 
   @basic_auth "Basic " <> Base.encode64("cdpex:secret")
@@ -76,6 +115,10 @@ defmodule CDPEx.FixtureServer do
   #     cross-site and nested iframes; /covered-frame?src=URL lays #frame-cover over it.
   #   /with-assets — a page that loads /pixel.png, /style.css and the font
   #     /font.woff2, for resource blocking (the assets themselves get the default page).
+  #   /download?name=NAME&size=N — an attachment of N bytes (default 1000) named NAME
+  #     (default report.csv); /download-page links to it (#download) and builds a blob
+  #     download (#blob-download). /download-partial never completes (see
+  #     serve_partial_download/2).
   #   anything else serves the page.
   defp respond(request, json_version) do
     path = request_path(request)
@@ -124,6 +167,26 @@ defmodule CDPEx.FixtureServer do
     ~s(<!doctype html><html><body><h1 id="greeting">Frame</h1><iframe src="#{URI.decode_www_form(src)}"></iframe></body></html>)
   end
 
+  defp page_body("/download-page", _request) do
+    """
+    <!doctype html><html><body><h1 id="greeting">Downloads</h1>
+    <a id="download" href="/download?name=report.csv&size=4096">report</a>
+    <button id="blob-download" onclick="buildDownload()">blob</button>
+    <a id="partial" href="/download-partial">partial</a>
+    <a id="partial-cut" href="/download-partial?cut">cut</a>
+    <script>
+    function buildDownload() {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob(["built in page"]));
+      a.download = "built.txt";
+      document.body.appendChild(a);
+      a.click();
+    }
+    </script>
+    </body></html>
+    """
+  end
+
   defp page_body("/console", _request) do
     ~s[<!doctype html><html><body><h1 id="greeting">Console</h1><script>] <>
       ~s[console.log("console:" + location.hostname);] <>
@@ -138,6 +201,12 @@ defmodule CDPEx.FixtureServer do
   end
 
   defp page_body(_path, request), do: render(request)
+
+  @doc false
+  # The bytes /download?size=N serves, so a test can compare a saved file against them.
+  @spec download_body(non_neg_integer()) :: String.t()
+  def download_body(size),
+    do: binary_part(String.duplicate("0123456789", div(size, 10) + 1), 0, size)
 
   @json_ct ["Content-Type: application/json"]
 

@@ -46,7 +46,7 @@ scraper, where it replaced a Wallaby/ChromeDriver setup.
 | Hover | ✓ `hover/3` | ✓ | ✗ | ✓ |
 | File upload | ✓ `set_input_files/4` | ✓ | ✗ | ✓ |
 | JS dialogs | ✓ `dialogs:`, `set_dialogs/3` | ✓ | ✗ | ✓ |
-| Downloads | ✗ | fails in 0.16.0 (the documented flow raises) | ✗ | ✗ |
+| Downloads | ✓ `wait_for_download/2` | fails in 0.16.0 (the documented flow raises) | ✗ | ✗ |
 | Inside an iframe | ✓ `frame/3`, cross-site included | ✓ | ✗ | ✓ |
 | Console messages | ✓ `observe_console/2` | ✓ | ✗ | ✓ |
 | Timezone / clock / tracing | ✗ / ✗ / ✗ | ✓ / ✓ / ✓ | partial / ✗ / ✗ | ✗ / ✗ / ✗ |

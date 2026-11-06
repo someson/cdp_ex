@@ -137,13 +137,16 @@ defmodule CDPEx do
              | :set_dialogs
              | :frame_context
              | :frame
-             | :observe_console}
+             | :observe_console
+             | :wait_for_download}
           | {:navigate, String.t()}
           | {:loading_failed, String.t()}
           | {:no_document_response, String.t()}
           | {:connect_discovery_failed, term()}
           | {:capture_failed, term()}
           | {:idle_wait_failed, term()}
+          | {:download_wait_failed, term()}
+          | {:download_canceled, String.t()}
           | {:launch_crashed, term()}
           | {:selector_not_found, String.t()}
           | {:text_not_found, String.t()}
@@ -204,9 +207,9 @@ defmodule CDPEx do
       the session-transport counterpart of a dedicated page's `:noproc`), a wait or call
       timed out (`:timeout`, `{:timeout, _}`, `:deadline_exceeded`), Chrome died
       or was slow to start (`{:chrome_exited, _, _}`, `{:debug_url_not_found, _}`,
-      `{:devtools_file_malformed, _}`), an internal capture/idle helper crashed
-      (`{:capture_failed, _}`, `{:idle_wait_failed, _}`), a `CDPEx.Pool` launch task
-      crashed or its start function returned something unexpected (`{:launch_crashed, _}`),
+      `{:devtools_file_malformed, _}`), an internal capture/idle/download helper crashed
+      (`{:capture_failed, _}`, `{:idle_wait_failed, _}`, `{:download_wait_failed, _}`), a
+      `CDPEx.Pool` launch task crashed or its start function returned something unexpected (`{:launch_crashed, _}`),
       or a navigation hit a
       connection/network-layer `net::ERR_*` (e.g. `{:navigate, "net::ERR_CONNECTION_REFUSED"}`).
     * `:terminal` — deterministic outcomes: a selector or text didn't match, JS threw, a
@@ -222,7 +225,8 @@ defmodule CDPEx do
       (`{:write_failed, _}`), why Chrome couldn't be started at all
       (`{:launch_failed, _}` — an unwritable profile dir or a refused spawn: `:emfile`
       may clear, `:eacces` won't), whether a `{:no_document_response, _}` was a
-      same-document hop or a slow miss, or a `connect/2` endpoint-discovery failure
+      same-document hop or a slow miss, why Chrome canceled a download
+      (`{:download_canceled, _}`: it gives no reason), or a `connect/2` endpoint-discovery failure
       (`{:connect_discovery_failed, _}` — a transient network blip and a permanently
       bad endpoint are indistinguishable here). Also covers any term `CDPEx` doesn't
       produce. Decide the retry policy yourself.
@@ -252,6 +256,7 @@ defmodule CDPEx do
   def classify_error({:devtools_file_malformed, _}), do: :transient
   def classify_error({:capture_failed, _}), do: :transient
   def classify_error({:idle_wait_failed, _}), do: :transient
+  def classify_error({:download_wait_failed, _}), do: :transient
   def classify_error({:launch_crashed, _}), do: :transient
   def classify_error({:frame_unavailable, _}), do: :transient
   # Terminal — deterministic; retrying the same call yields the same error.
@@ -304,6 +309,9 @@ defmodule CDPEx do
   def classify_error({:write_failed, _}), do: :unknown
   def classify_error({:launch_failed, _}), do: :unknown
   def classify_error({:no_document_response, _}), do: :unknown
+  # Chrome gives no reason for a canceled download: a dropped connection may clear, a
+  # full disk won't.
+  def classify_error({:download_canceled, _}), do: :unknown
   def classify_error({:connect_discovery_failed, _}), do: :unknown
   # Anything else — a reason CDPEx doesn't produce, or a future shape.
   def classify_error(_other), do: :unknown

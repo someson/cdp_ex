@@ -278,7 +278,15 @@ defmodule Compare.CDPEx do
           :ok = Page.set_input_files(page, "#file", path)
           ok!(Page.text(page, "#fileName"))
         end),
-      download: fn -> {:unsupported, @raw <> " (Browser.setDownloadBehavior)"} end,
+      download:
+        probe.(fn page ->
+          open(page, url, :load)
+
+          {:ok, %{path: path}} =
+            Page.wait_for_download(page, trigger: fn -> Page.click(page, "#download") end)
+
+          File.read!(path)
+        end),
       dialog:
         probe.(fn page ->
           open(page, url, :load)

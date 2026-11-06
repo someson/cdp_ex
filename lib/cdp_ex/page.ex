@@ -24,6 +24,7 @@ defmodule CDPEx.Page do
     * **Emulation** — `set_viewport/4`, `set_user_agent/3`
     * **Cookies & headers** — `cookies/2`, `set_cookies/3`, `clear_cookies/2`, `set_extra_headers/3`
     * **Network** — `observe_network/2`, `stop_observing_network/2`, `response_body/3`
+    * **Downloads** — `wait_for_download/2`
     * **Console** — `observe_console/2`, `stop_observing_console/2`
     * **Interception** — `enable_request_interception/2`, `disable_request_interception/2`, `continue_request/3`, `fulfill_request/3`, `fail_request/3`
     * **Auth** — `authenticate/4` (proxy / HTTP Basic challenges)
@@ -93,6 +94,11 @@ defmodule CDPEx.Page do
   # In-flight accounting for wait_for_network_idle/2: requestWillBeSent (+1),
   # loadingFinished / loadingFailed (−1). responseReceived is deliberately excluded.
   @idle_events [@request_will_be_sent, @loading_finished, @loading_failed]
+  @download_will_begin "Browser.downloadWillBegin"
+  @download_progress "Browser.downloadProgress"
+  @download_events [@download_will_begin, @download_progress]
+  # How many cross-site iframes deep download_owner?/4 follows a frame back to its page.
+  @max_iframe_depth 8
 
   @enforce_keys [:browser, :conn, :target_id]
   defstruct [:browser, :conn, :target_id, :session_id, :frame]
@@ -113,6 +119,14 @@ defmodule CDPEx.Page do
   # id: the frame's id (an out-of-process frame's target id too); label: the css
   # that found it, for errors; owner: the backendNodeId of its <iframe> in `parent`.
   @typep frame :: %{id: String.t(), label: String.t(), parent: t(), owner: integer()}
+
+  @typedoc "A finished download, from `wait_for_download/2`."
+  @type download :: %{
+          path: String.t(),
+          suggested_filename: String.t() | nil,
+          url: String.t() | nil,
+          size: non_neg_integer() | nil
+        }
 
   @doc """
   Navigates to `url` and (by default) waits until the network is almost idle.
@@ -2174,7 +2188,7 @@ defmodule CDPEx.Page do
   @spec wait_for_response(t(), (String.t() -> boolean()) | Regex.t() | String.t(), keyword()) ::
           {:ok, map()} | {:error, term()}
   def wait_for_response(%__MODULE__{frame: nil} = page, matcher, opts \\ []) do
-    trigger = response_trigger(Keyword.get(opts, :trigger))
+    trigger = trigger_opt(Keyword.get(opts, :trigger))
     body? = response_body_opt(Keyword.get(opts, :body, false))
     deadline = System.monotonic_time(:millisecond) + Keyword.get(opts, :timeout, @navigate_timeout)
     predicate = response_url_predicate(matcher)
@@ -2262,10 +2276,10 @@ defmodule CDPEx.Page do
     end
   end
 
-  defp response_trigger(nil), do: nil
-  defp response_trigger(fun) when is_function(fun, 0), do: fun
+  defp trigger_opt(nil), do: nil
+  defp trigger_opt(fun) when is_function(fun, 0), do: fun
 
-  defp response_trigger(other) do
+  defp trigger_opt(other) do
     raise ArgumentError, "invalid :trigger #{inspect(other)} (expected a 0-arity function)"
   end
 
@@ -2366,6 +2380,317 @@ defmodule CDPEx.Page do
 
   defp match_response_url(%{"response" => %{"url" => url}}, fun) when is_binary(url), do: fun.(url)
   defp match_response_url(_params, _fun), do: false
+
+  @doc """
+  Waits for a download started by the page or one of its iframes, and returns it once
+  Chrome has written the whole file.
+
+      {:ok, %{path: path, suggested_filename: "report.csv"}} =
+        Page.wait_for_download(page,
+          trigger: fn -> Page.click(page, "#export") end,
+          path: "/data/report.csv"
+        )
+
+  A launched browser saves downloads in its profile dir, not in the user's Downloads
+  folder (Chrome's default), each file named by Chrome's id for the download. With
+  `:path` the file is moved there once complete; its parent dir must exist. Without it,
+  `path` is the file in the profile dir, which stays until the browser stops: move or
+  delete it when done, or a long-lived pooled browser accumulates them. Downloads nobody
+  waits for are saved there too.
+
+  Returns `{:ok, %{path, suggested_filename, url, size}}`: `suggested_filename` is the
+  name from the server's `Content-Disposition` or the link's `download` attribute, `url`
+  the download's URL (a `blob:` or `data:` one for a file the page built), `size` the
+  bytes written. Errors:
+
+    * `{:error, :timeout}` — no download of this page completed in time. One still in
+      progress is canceled.
+    * `{:error, {:download_canceled, url}}` — Chrome canceled it, e.g. the connection
+      dropped mid-file. Chrome gives no reason.
+    * `{:error, {:write_failed, posix}}` — moving it to `:path` failed. The file stays in
+      the profile dir.
+    * `{:error, {:unsupported_with_connect, :downloads}}` — a browser from
+      `CDPEx.connect/2`, whose Chrome writes files on its own host under its own settings.
+
+  The first download of the page that starts after the wait is registered is the one
+  returned. One started by a frame nested inside a cross-site iframe isn't seen as the
+  page's.
+
+  ## Triggering the download
+
+  `:trigger` works as in `wait_for_response/3`: the wait is registered first, then
+  `trigger` runs in the calling process, so a download that starts at once is caught. A
+  `{:error, _}` from `trigger` is returned without waiting, unless the download has
+  already started; a raise, throw or exit propagates, and the wait is cancelled first.
+
+  Navigating to a file's URL returns `{:error, {:navigate, "net::ERR_ABORTED"}}`, often
+  before Chrome reports the download: it ends the navigation as it turns into a download.
+  Ignore that result in the trigger:
+
+      Page.wait_for_download(page,
+        trigger: fn ->
+          _ = Page.navigate(page, file_url)
+          :ok
+        end
+      )
+
+  Without `:trigger` the download has to start from another process, and one that starts
+  before the wait is registered is missed.
+
+  Options:
+    * `:trigger` — a 0-arity function that starts the download (see above)
+    * `:path` — where to move the finished file (default: leave it in the profile dir)
+    * `:timeout` — ceiling in ms for the whole download; a running `trigger` is not
+      interrupted (default 30_000)
+  """
+  @spec wait_for_download(t(), keyword()) :: {:ok, download()} | {:error, term()}
+  def wait_for_download(%__MODULE__{frame: nil} = page, opts \\ []) do
+    trigger = trigger_opt(Keyword.get(opts, :trigger))
+    path = download_path_opt(Keyword.get(opts, :path))
+    deadline = System.monotonic_time(:millisecond) + Keyword.get(opts, :timeout, @navigate_timeout)
+
+    with {:ok, downloads} <- Browser.downloads(page.browser, page, max(remaining(deadline), 1)),
+         {:ok, download} <- await_download(page, downloads, trigger, deadline) do
+      place_download(download, path)
+    end
+  end
+
+  defp download_path_opt(path) when is_nil(path) or is_binary(path), do: path
+
+  defp download_path_opt(other),
+    do: raise(ArgumentError, "invalid :path #{inspect(other)} (expected a string)")
+
+  # The Browser.download* events arrive on the browser connection, for every page, so a
+  # helper process subscribes there and picks out this page's download (download_owner?/4).
+  # It owns the download until it replies: it cancels one in progress when the wait ends
+  # without it (timeout, a failed or raising trigger, the caller's death).
+  defp await_download(page, downloads, trigger, deadline) do
+    caller = self()
+    tag = make_ref()
+
+    {helper, mon} =
+      spawn_monitor(fn ->
+        ProcessLabel.set({:cdp_download_wait, page.target_id})
+        download_helper(caller, tag, page, downloads, deadline)
+      end)
+
+    try do
+      case receive_download(tag, mon, deadline) do
+        :ready -> trigger_download(trigger, tag, mon, deadline)
+        {:error, _} = error -> error
+      end
+    after
+      send(helper, {tag, :stop})
+      Process.demonitor(mon, [:flush])
+      flush_tagged(tag)
+    end
+  end
+
+  defp trigger_download(trigger, tag, mon, deadline) do
+    case run_download_trigger(trigger, tag, deadline) do
+      :ok -> receive_download(tag, mon, deadline)
+      {:error, _} = error -> error
+    end
+  end
+
+  # As in trigger_and_wait/4: no budget left, no trigger (it has side effects).
+  defp run_download_trigger(nil, _tag, _deadline), do: :ok
+
+  defp run_download_trigger(trigger, tag, deadline) do
+    if remaining(deadline) == 0,
+      do: :ok,
+      else: trigger |> run_trigger() |> started_already(tag)
+  end
+
+  # A trigger's error doesn't end the wait for a download that has already started.
+  defp started_already(:ok, _tag), do: :ok
+
+  defp started_already({:error, _} = error, tag) do
+    receive do
+      {^tag, :started} -> :ok
+    after
+      0 -> error
+    end
+  end
+
+  # :ready once the helper is subscribed, then its result. The helper bounds its own wait
+  # by the deadline; the grace only catches one that never replies.
+  defp receive_download(tag, mon, deadline) do
+    receive do
+      {^tag, :ready} -> :ready
+      {^tag, {:done, result}} -> result
+      {:DOWN, ^mon, :process, _helper, reason} -> {:error, {:download_wait_failed, reason}}
+    after
+      remaining(deadline) + @helper_grace -> {:error, {:download_wait_failed, :timeout}}
+    end
+  end
+
+  defp flush_tagged(tag) do
+    receive do
+      {^tag, _} -> flush_tagged(tag)
+    after
+      0 -> :ok
+    end
+  end
+
+  defp download_helper(caller, tag, page, downloads, deadline) do
+    caller_mon = Process.monitor(caller)
+    conn_mon = Process.monitor(downloads.conn)
+    mons = {caller_mon, conn_mon}
+
+    case subscribe_each(downloads.conn, @download_events, max(remaining(deadline), 1), nil) do
+      :ok ->
+        send(caller, {tag, :ready})
+
+        reply_download(
+          caller,
+          tag,
+          await_download_start(caller, tag, page, downloads, mons, deadline)
+        )
+
+      {:error, _} = error ->
+        reply_download(caller, tag, error)
+    end
+  end
+
+  defp reply_download(_caller, _tag, :stopped), do: :ok
+  defp reply_download(caller, tag, result), do: send(caller, {tag, {:done, result}})
+
+  defp await_download_start(caller, tag, page, downloads, {caller_mon, conn_mon} = mons, deadline) do
+    receive do
+      {:cdp_event, _conn, @download_will_begin, %{"guid" => guid, "frameId" => frame_id} = params,
+       _sid} ->
+        if download_owner?(page, downloads.conn, frame_id, deadline) do
+          send(caller, {tag, :started})
+          await_download_end(tag, downloads, guid, params, mons, deadline)
+        else
+          await_download_start(caller, tag, page, downloads, mons, deadline)
+        end
+
+      {^tag, :stop} ->
+        :stopped
+
+      {:DOWN, ^caller_mon, :process, _, _} ->
+        :stopped
+
+      {:DOWN, ^conn_mon, :process, _, reason} ->
+        {:error, down_reason(reason)}
+
+      {:cdp_event, _conn, _method, _params, _sid} ->
+        await_download_start(caller, tag, page, downloads, mons, deadline)
+    after
+      remaining(deadline) -> {:error, :timeout}
+    end
+  end
+
+  defp await_download_end(tag, downloads, guid, began, {caller_mon, conn_mon} = mons, deadline) do
+    receive do
+      {:cdp_event, _conn, @download_progress, %{"guid" => ^guid, "state" => "completed"} = params,
+       _sid} ->
+        {:ok,
+         %{
+           path: Map.get(params, "filePath") || Path.join(downloads.dir, guid),
+           suggested_filename: began["suggestedFilename"],
+           url: began["url"],
+           size: params["receivedBytes"]
+         }}
+
+      {:cdp_event, _conn, @download_progress, %{"guid" => ^guid, "state" => "canceled"}, _sid} ->
+        {:error, {:download_canceled, began["url"]}}
+
+      {^tag, :stop} ->
+        cancel_download(downloads, guid)
+        :stopped
+
+      {:DOWN, ^caller_mon, :process, _, _} ->
+        cancel_download(downloads, guid)
+        :stopped
+
+      {:DOWN, ^conn_mon, :process, _, reason} ->
+        {:error, down_reason(reason)}
+
+      {:cdp_event, _conn, _method, _params, _sid} ->
+        await_download_end(tag, downloads, guid, began, mons, deadline)
+    after
+      remaining(deadline) ->
+        cancel_download(downloads, guid)
+        {:error, :timeout}
+    end
+  end
+
+  # Chrome deletes the partial file of a canceled download.
+  defp cancel_download(%{conn: conn, context_id: context_id}, guid) do
+    params = put_present(%{"guid" => guid}, "browserContextId", context_id)
+    _ = Connection.call(conn, "Browser.cancelDownload", params, @probe_timeout)
+    :ok
+  end
+
+  # The event names the frame that started the download: the page's main frame (its
+  # target id), a same-process iframe (in the page's frame tree), or a cross-site iframe,
+  # whose own target leads back to the page through parentId. A frame inside a cross-site
+  # iframe is in that iframe's frame tree only, which isn't searched.
+  defp download_owner?(%__MODULE__{target_id: frame_id}, _conn, frame_id, _deadline), do: true
+
+  defp download_owner?(page, conn, frame_id, deadline) do
+    in_frame_tree?(page, frame_id, deadline) or
+      iframe_of?(page.target_id, conn, frame_id, deadline, @max_iframe_depth)
+  end
+
+  defp in_frame_tree?(page, frame_id, deadline) do
+    case do_call(page, "Page.getFrameTree", %{}, max(remaining(deadline), 1)) do
+      {:ok, %{"frameTree" => tree}} -> frame_id in frame_ids(tree)
+      {:error, _} -> false
+    end
+  end
+
+  defp frame_ids(%{"frame" => %{"id" => id}} = tree),
+    do: [id | Enum.flat_map(Map.get(tree, "childFrames", []), &frame_ids/1)]
+
+  defp frame_ids(_tree), do: []
+
+  defp iframe_of?(_target_id, _conn, _frame_id, _deadline, 0), do: false
+
+  defp iframe_of?(target_id, conn, frame_id, deadline, depth) do
+    case Connection.call(
+           conn,
+           "Target.getTargetInfo",
+           %{"targetId" => frame_id},
+           max(remaining(deadline), 1)
+         ) do
+      {:ok, %{"targetInfo" => %{"type" => "iframe", "parentId" => ^target_id}}} ->
+        true
+
+      {:ok, %{"targetInfo" => %{"type" => "iframe", "parentId" => parent}}}
+      when is_binary(parent) ->
+        iframe_of?(target_id, conn, parent, deadline, depth - 1)
+
+      _other ->
+        false
+    end
+  end
+
+  defp place_download(download, nil), do: {:ok, download}
+
+  defp place_download(%{path: from} = download, to) do
+    case move_file(from, to) do
+      :ok -> {:ok, %{download | path: to}}
+      {:error, reason} -> {:error, {:write_failed, reason}}
+    end
+  end
+
+  # A rename can't cross file systems (the profile dir is in the temp dir): copy instead.
+  defp move_file(from, to) do
+    case File.rename(from, to) do
+      :ok ->
+        :ok
+
+      {:error, :exdev} ->
+        with :ok <- File.cp(from, to), do: File.rm(from)
+
+      {:error, _} = error ->
+        error
+    end
+  end
 
   @doc """
   Blocks until the network has been idle — at most `:max_inflight` in-flight requests —
