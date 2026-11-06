@@ -8,7 +8,7 @@ body{margin:0;font-family:"Liberation Sans",Arial,sans-serif;color:#373a3c;line-
 .author{color:#5cb85c;font-weight:500}.date{color:#bbb;font-size:.8rem}
 .btn{border-radius:.2rem;padding:.25rem .5rem;font-size:.875rem;cursor:pointer;border:1px solid #5cb85c}
 .btn-outline-primary{color:#5cb85c;background:none}.btn-primary{color:#fff;background:#5cb85c}
-.preview-link{color:inherit;text-decoration:none}.preview-link h2{font-weight:600;font-size:1.5rem;margin:.5rem 0 0}
+.preview-link{display:block;color:inherit;text-decoration:none}.preview-link h2{font-weight:600;font-size:1.5rem;margin:.5rem 0 0}
 .preview-link p{color:#999;margin:0 0 1rem}.preview-link span{font-size:.8rem;color:#bbb}
 .tag-list{list-style:none;padding:0;display:flex;flex-wrap:wrap;gap:3px}.tag-pill{padding:.1rem .6rem;border-radius:10rem;border:1px solid #ddd;color:#aaa;font-size:.8rem}
 .sidebar{background:#f3f3f3;padding:5px 10px 10px;border-radius:4px}.card{border:1px solid #e5e5e5;margin:1rem 0;padding:1.25rem}
