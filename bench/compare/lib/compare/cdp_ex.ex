@@ -291,7 +291,19 @@ defmodule Compare.CDPEx do
           :ok = Page.hover(page, "#hover")
           ok!(Page.text(page, "#hover"))
         end),
-      console: fn -> {:unsupported, @raw <> " (Runtime.consoleAPICalled)"} end,
+      console:
+        probe.(fn page ->
+          :ok = Page.observe_console(page)
+          open(page, url, :load)
+
+          receive do
+            {:cdp_event, _, "Runtime.consoleAPICalled",
+             %{"args" => [%{"value" => "probe-console"}]}, _} ->
+              "console event: probe-console"
+          after
+            5_000 -> raise "no probe-console event"
+          end
+        end),
       iframe_content:
         probe.(fn page ->
           open(page, url, :load)

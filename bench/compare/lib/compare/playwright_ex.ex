@@ -252,7 +252,9 @@ defmodule Compare.PlaywrightEx do
                 "**/probe/file.txt",
                 fn route, _request ->
                   {:ok, _} = Route.fulfill(route, body: "rewritten", content_type: "text/plain")
-                end, timeout: @t)
+                end,
+                timeout: @t
+              )
             )
 
           {:ok, _} = Frame.goto(pg.frame, url: fx.base <> "/probe/file.txt", timeout: @t)
@@ -424,7 +426,9 @@ defmodule Compare.PlaywrightEx do
               if request.resource_type == "image",
                 do: {:ok, _} = Route.abort(route),
                 else: {:ok, _} = Route.continue(route)
-            end, timeout: @t)
+            end,
+            timeout: @t
+          )
         )
 
       open(pg, url, :load)

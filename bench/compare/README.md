@@ -151,7 +151,7 @@ rounds of 20 samples (`cold`: 10; `concurrent`: 20 s, 8 workers).
 | Answer a JS dialog | ✓† | ✓ | ✗ | ✓ |
 | Hover | ✓† | ✓ | ✗ | ✓ |
 | Evaluate JS, get the value | ✓ | ✓ | partial | ✓ |
-| Console messages | ✗ | ✓ | ✗ | ✓ |
+| Console messages | ✓† | ✓ | ✗ | ✓ |
 | Read inside an iframe | ✓† | ✓ | ✗ | ✓ |
 | Wait for a selector | ✓ | ✓ | partial | ✓ |
 | Wait for a JS predicate | ✓ | ✓ | ✗ | ✗ |
@@ -174,7 +174,7 @@ rounds of 20 samples (`cold`: 10; `concurrent`: 20 s, 8 workers).
 | Firefox | ✗ | ✓ | ✗ | partial |
 | WebKit | ✗ | ✓ | ✗ | ✗ |
 
-† Added after the reference run (`Page.hover/3`, `Page.set_input_files/4`, `dialogs:`, `Page.frame/3`); the probes pass in the same image (`LIBS=cdp_ex TASKS= ROUNDS=0 bench/compare/run.sh`).
+† Added after the reference run (`Page.hover/3`, `Page.set_input_files/4`, `dialogs:`, `Page.frame/3`, `Page.observe_console/2`); the probes pass in the same image (`LIBS=cdp_ex TASKS= ROUNDS=0 bench/compare/run.sh`).
 
 Partial and failed results, with the probe's note:
 

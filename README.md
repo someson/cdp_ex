@@ -48,7 +48,7 @@ scraper, where it replaced a Wallaby/ChromeDriver setup.
 | JS dialogs | ✓ `dialogs:`, `set_dialogs/3` | ✓ | ✗ | ✓ |
 | Downloads | ✗ | fails in 0.16.0 (the documented flow raises) | ✗ | ✗ |
 | Inside an iframe | ✓ `frame/3`, cross-site included | ✓ | ✗ | ✓ |
-| Console messages | ✗ | ✓ | ✗ | ✓ |
+| Console messages | ✓ `observe_console/2` | ✓ | ✗ | ✓ |
 | Timezone / clock / tracing | ✗ / ✗ / ✗ | ✓ / ✓ / ✓ | partial / ✗ / ✗ | ✗ / ✗ / ✗ |
 | Screenshots / PDF | ✓ / ✓ | ✓ / partial (raw protocol) | ✓ / ✓ | ✓ / ✗ |
 | PDF/A, header/footer, PDF from an HTML string | ✗ | ✗ | ✓ | ✗ |

@@ -207,8 +207,8 @@ the others do and CDPEx doesn't, roughly by how often a scraper needs it:
   input to an out-of-process iframe until it has painted, a moment after
   `load`; `click/3` hit-tests the `<iframe>` element and returns `:ok`. Seen in
   the dialogs integration test.
-- **Console messages.** playwright_ex (context `console` events) and Wallaby
-  (`js_logger`).
+- ~~**Console messages.**~~ Done: `Page.observe_console/2`. A cross-site
+  iframe's console is not delivered.
 - **Timezone, clock, tracing.** playwright_ex only (ChromicPDF: timezone).
 - **PDF extras.** Header/footer templates, PDF from an HTML string, PDF/A:
   ChromicPDF only.

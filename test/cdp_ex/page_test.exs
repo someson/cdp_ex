@@ -43,6 +43,7 @@ defmodule CDPEx.PageTest do
   alias CDPEx.PageTest.StubBrowser
 
   @network_methods ["Network.requestWillBeSent", "Network.responseReceived"]
+  @console_methods ["Runtime.consoleAPICalled", "Runtime.exceptionThrown"]
   @idle_methods ["Network.requestWillBeSent", "Network.loadingFinished", "Network.loadingFailed"]
 
   setup do
@@ -773,6 +774,7 @@ defmodule CDPEx.PageTest do
       assert_raise FunctionClauseError, fn -> apply(Page, :navigate, [frame, "about:blank"]) end
       assert_raise FunctionClauseError, fn -> apply(Page, :screenshot, [frame]) end
       assert_raise FunctionClauseError, fn -> apply(Page, :set_dialogs, [frame, :dismiss]) end
+      assert_raise FunctionClauseError, fn -> apply(Page, :observe_console, [frame]) end
       assert_raise FunctionClauseError, fn -> apply(CDPEx, :close_page, [page.browser, frame]) end
     end
   end
@@ -1800,6 +1802,42 @@ defmodule CDPEx.PageTest do
       for method <- @network_methods, do: refute(subscribed?(conn, observer, method))
 
       send(observer, :stop)
+    end
+  end
+
+  describe "observe_console/2" do
+    test "subscribes the caller to both console methods without a CDP call", %{
+      page: page,
+      conn: conn,
+      fake: fake
+    } do
+      assert :ok = Page.observe_console(page)
+
+      for method <- @console_methods, do: assert(subscribed?(conn, self(), method))
+      refute_receive {:fake_cdp_recv, ^fake, _}, 100
+    end
+
+    test "honours a custom :events list", %{page: page, conn: conn} do
+      assert :ok = Page.observe_console(page, events: ["Runtime.exceptionThrown"])
+
+      assert subscribed?(conn, self(), "Runtime.exceptionThrown")
+      refute subscribed?(conn, self(), "Runtime.consoleAPICalled")
+    end
+
+    test "returns {:error, :noproc} when the connection is dead", %{page: page, conn: conn} do
+      ref = Process.monitor(conn)
+      Connection.close(conn)
+      assert_receive {:DOWN, ^ref, :process, ^conn, _}, 2_000
+
+      assert {:error, :noproc} = Page.observe_console(page)
+    end
+
+    test "stop_observing_console removes the caller's subscriptions", %{page: page, conn: conn} do
+      :ok = Page.observe_console(page)
+
+      assert :ok = Page.stop_observing_console(page)
+
+      for method <- @console_methods, do: refute(subscribed?(conn, self(), method))
     end
   end
 

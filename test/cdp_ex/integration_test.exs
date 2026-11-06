@@ -568,6 +568,36 @@ defmodule CDPEx.IntegrationTest do
                Page.navigate(page, missing, response: true)
     end
 
+    test "observe_console delivers console calls and uncaught exceptions", %{
+      page: page,
+      fixture: fixture
+    } do
+      {:ok, _} = Page.navigate(page, fixture)
+      assert :ok = Page.observe_console(page)
+
+      {:ok, _} =
+        Page.evaluate(
+          page,
+          "console.warn('hello', 42); setTimeout(() => { throw new Error('boom') }); 1"
+        )
+
+      assert_receive {:cdp_event, _, "Runtime.consoleAPICalled", %{"type" => "warning"} = params,
+                      _},
+                     2_000
+
+      assert [%{"value" => "hello"}, %{"value" => 42}] = params["args"]
+
+      assert_receive {:cdp_event, _, "Runtime.exceptionThrown", %{"exceptionDetails" => details},
+                      _},
+                     2_000
+
+      assert details["exception"]["description"] =~ "boom"
+
+      :ok = Page.stop_observing_console(page)
+      {:ok, _} = Page.evaluate(page, "console.log('after'); 1")
+      refute_receive {:cdp_event, _, "Runtime.consoleAPICalled", _, _}, 300
+    end
+
     test "evaluate returns a JS value", %{page: page, fixture: fixture} do
       {:ok, _} = Page.navigate(page, fixture)
       assert {:ok, "CDPEx Fixture"} = Page.evaluate(page, "document.title")
