@@ -37,6 +37,10 @@ defmodule CDPEx.Chrome do
       WebSocket (default `false`). Pages on such a browser are `:session` pages only.
       Unix only: `true` raises `ArgumentError` on Windows. With a full `:args` list,
       include `--remote-debugging-pipe` yourself.
+    * `:block_background_hosts` — keep `accounts.google.com` (the browser's Google
+      sign-in check) and `update.googleapis.com` (its updater) off the network
+      (default `true`): they bypass any proxy and don't resolve, so they cost no proxy
+      traffic. Pass `false` to sign in to a Google account in this browser.
     * `:launch_timeout` — ms to wait for the DevTools endpoint (default
       `15_000`). A *ceiling*, not a fixed wait: readiness is polled and returns
       as soon as Chrome is reachable, so a generous value is free. Raise it for
@@ -53,6 +57,21 @@ defmodule CDPEx.Chrome do
   config would otherwise turn on (the same default Puppeteer and Playwright use),
   and `--disable-component-extensions-with-background-pages`, so built-in
   extensions don't keep an extension process alive (Playwright's default too).
+
+  They also turn off the browser's own background services, which otherwise call
+  Google at startup and after a navigation, through the `:proxy` when one is set:
+  sync, metrics upload, client-side phishing detection, domain reliability
+  reporting, default apps, network time queries, optimization hints and their model
+  downloads, Safe Browsing's real-time hash lookups and the preconnect to the search
+  engine (`--disable-features=OptimizationHints,OptimizationGuideModelDownloading,`
+  `NetworkTimeServiceQuerying,SafeBrowsingHashPrefixRealTimeLookups,PreconnectToSearch`).
+  A `--disable-features`, `--proxy-bypass-list` or `--host-resolver-rules` in
+  `:extra_args` is merged into the default one instead of replacing it (Chrome
+  keeps only the last occurrence of a switch), and a feature named in
+  `--enable-features` is left out of the default disable list. Measured with a
+  logging proxy over 20 s (Google Chrome 157, Linux): 14 requests to Google hosts
+  without these defaults, 1 with them (the AI Mode eligibility check on
+  `www.google.com`, which no flag found so far turns off).
   Anti-bot flags (spoofed user-agent, `--disable-web-security`,
   `--disable-blink-features=AutomationControlled`, …) are **not** included — add
   them via `:extra_args` if you need them.
@@ -169,7 +188,9 @@ defmodule CDPEx.Chrome do
   def validate_opts!(opts, os_type \\ :os.type()) do
     # A full :args override means build_args/2 never reads these, so they launched fine.
     ignored =
-      if is_list(Keyword.get(opts, :args)), do: [:headless, :window_size, :extra_args], else: []
+      if is_list(Keyword.get(opts, :args)),
+        do: [:headless, :window_size, :extra_args, :block_background_hosts],
+        else: []
 
     # Keyword.get/3 reads only a key's first occurrence, so a shadowed duplicate never mattered.
     opts
@@ -186,6 +207,7 @@ defmodule CDPEx.Chrome do
   defp valid_opt?(key, value, _os_type), do: valid_opt?(key, value)
 
   defp valid_opt?(:headless, value), do: is_boolean(value)
+  defp valid_opt?(:block_background_hosts, value), do: is_boolean(value)
   defp valid_opt?(:pipe, value), do: value == false
   defp valid_opt?(:chrome_binary, value), do: value in [nil, false] or string?(value)
   defp valid_opt?(:user_data_dir, value), do: is_nil(value) or string?(value)
@@ -204,7 +226,7 @@ defmodule CDPEx.Chrome do
   # File, Path and Port.open/2 all take a charlist as readily as a binary.
   defp string?(value), do: is_binary(value) or (is_list(value) and :io_lib.char_list(value))
 
-  defp expected(:headless), do: "a boolean"
+  defp expected(key) when key in [:headless, :block_background_hosts], do: "a boolean"
   defp expected(:pipe), do: "a boolean; true needs /bin/sh, so not on Windows"
   defp expected(key) when key in [:chrome_binary, :user_data_dir], do: "a string"
   defp expected(:launch_timeout), do: "a non-negative integer"
@@ -352,10 +374,31 @@ defmodule CDPEx.Chrome do
   @spec build_args(String.t(), keyword()) :: [String.t()]
   def build_args(user_data_dir, opts \\ []) do
     case Keyword.get(opts, :args) do
-      nil -> default_args(user_data_dir, opts) ++ Keyword.get(opts, :extra_args, [])
+      nil -> merge_args(default_args(user_data_dir, opts), Keyword.get(opts, :extra_args, []))
       args when is_list(args) -> args
     end
   end
+
+  # Browser features that call Google in the background (see "Default flags").
+  @disabled_features [
+    "OptimizationHints",
+    "OptimizationGuideModelDownloading",
+    "NetworkTimeServiceQuerying",
+    "SafeBrowsingHashPrefixRealTimeLookups",
+    "PreconnectToSearch"
+  ]
+
+  # Hosts the browser itself calls that a scraper never needs: the Google sign-in
+  # check (ListAccounts) and the updater.
+  @background_hosts ["accounts.google.com", "update.googleapis.com"]
+
+  # Switches Chrome reads once (the last occurrence wins), so a user's value is joined
+  # to the default one, with the switch's separator.
+  @merged_switches [
+    {"--disable-features=", ","},
+    {"--proxy-bypass-list=", ";"},
+    {"--host-resolver-rules=", ", "}
+  ]
 
   @doc """
   The neutral default flag list (stability + headless), with `--user-data-dir`,
@@ -387,12 +430,80 @@ defmodule CDPEx.Chrome do
       # saved one Chrome process and ~13 MB at cold start; throughput under load was
       # unchanged (bench/, docs/TODO.md item 4).
       "--disable-component-extensions-with-background-pages",
+      # The browser's own background services: each calls Google at startup or after
+      # a navigation, through the :proxy when one is set (see "Default flags").
+      "--disable-sync",
+      "--metrics-recording-only",
+      "--no-service-autorun",
+      "--disable-client-side-phishing-detection",
+      "--disable-domain-reliability",
+      "--disable-default-apps",
+      "--password-store=basic",
+      "--use-mock-keychain",
+      "--disable-features=" <> Enum.join(@disabled_features, ","),
       "--window-size=#{width},#{height}",
       "--user-data-dir=#{user_data_dir}",
       debugging_flag(Keyword.get(opts, :pipe, false))
     ]
 
-    headless_flag(headless?) ++ base ++ ["about:blank"]
+    headless_flag(headless?) ++
+      base ++
+      background_hosts_flags(Keyword.get(opts, :block_background_hosts, true)) ++ ["about:blank"]
+  end
+
+  # Bypassing the proxy makes Chrome resolve the hosts itself, and the resolver rule
+  # then fails them locally: nothing reaches the network or the proxy.
+  defp background_hosts_flags(false), do: []
+
+  defp background_hosts_flags(true) do
+    [
+      "--proxy-bypass-list=" <> Enum.join(@background_hosts, ";"),
+      "--host-resolver-rules=" <> Enum.map_join(@background_hosts, ", ", &"MAP #{&1} ~NOTFOUND")
+    ]
+  end
+
+  # Append `extra` to `defaults`, joining a switch both define (see @merged_switches)
+  # into the default's place, and leaving the features `extra` enables out of the
+  # default disable list.
+  defp merge_args(defaults, extra) do
+    extra = Enum.map(extra, &to_string/1)
+    enabled = enabled_features(extra)
+
+    defaults =
+      defaults
+      |> Enum.map(&drop_enabled(&1, enabled))
+      |> Enum.reject(&(&1 == "--disable-features="))
+
+    {defaults, rest} =
+      Enum.reduce(extra, {defaults, []}, fn arg, {acc, rest} ->
+        case merge_into(acc, arg) do
+          {:ok, acc} -> {acc, rest}
+          :error -> {acc, [arg | rest]}
+        end
+      end)
+
+    defaults ++ Enum.reverse(rest)
+  end
+
+  defp enabled_features(args) do
+    for "--enable-features=" <> list <- args, feature <- String.split(list, ","), do: feature
+  end
+
+  defp drop_enabled("--disable-features=" <> list, enabled) do
+    kept = list |> String.split(",") |> Enum.reject(&(&1 in enabled))
+    "--disable-features=" <> Enum.join(kept, ",")
+  end
+
+  defp drop_enabled(arg, _enabled), do: arg
+
+  defp merge_into(defaults, arg) do
+    with {prefix, sep} <- Enum.find(@merged_switches, fn {p, _} -> String.starts_with?(arg, p) end),
+         index when is_integer(index) <- Enum.find_index(defaults, &String.starts_with?(&1, prefix)) do
+      value = String.replace_prefix(arg, prefix, "")
+      {:ok, List.update_at(defaults, index, &(&1 <> sep <> value))}
+    else
+      _ -> :error
+    end
   end
 
   defp headless_flag(true), do: ["--headless"]
