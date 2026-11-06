@@ -2,7 +2,8 @@
 
 Runs the same scenarios through CDPEx and Playwright against a local fixture
 server, so a change can be checked against a fixed baseline. Not part of the Hex
-package (`mix.exs` lists the packaged files).
+package (`mix.exs` lists the packaged files). For CDPEx against the other Elixir
+libraries (playwright_ex, ChromicPDF, Wallaby), see `compare/README.md`.
 
 ```bash
 bench/docker.sh                    # Linux container, 4 CPUs, Chromium: the reference setup

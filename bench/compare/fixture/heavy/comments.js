@@ -1,0 +1,1 @@
+(function(){document.querySelectorAll('.card').forEach(function(c,i){var b=document.createElement('button');b.textContent='Comments ('+(i*13%40)+')';b.onclick=function(){b.textContent='Loading'};c.appendChild(b)});document.getElementById('headline').setAttribute('data-ready','1');})();

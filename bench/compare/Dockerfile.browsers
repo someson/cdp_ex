@@ -1,0 +1,10 @@
+# Probe-only image: the comparison image plus Playwright's own Firefox and
+# WebKit builds, so playwright_ex's Firefox and WebKit support can be probed.
+# Never used for timings (bench/compare/README.md).
+FROM cdp_ex-compare
+USER root
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
+RUN node /opt/playwright/node_modules/playwright-core/cli.js install --with-deps firefox webkit \
+ && chmod -R a+rX /opt/pw-browsers \
+ && rm -rf /var/lib/apt/lists/*
+USER app

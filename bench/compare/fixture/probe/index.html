@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Probe page</title></head>
+<body>
+<h1 id="title">Probe page</h1>
+<form id="form" onsubmit="event.preventDefault()">
+  <input id="name" name="name">
+  <select id="color"><option value="red">Red</option><option value="green">Green</option></select>
+  <input id="agree" type="checkbox">
+  <input id="file" type="file">
+</form>
+<p id="fileName"></p>
+<button id="alert" onclick="document.getElementById('dialog').textContent = confirm('ok?') ? 'accepted' : 'dismissed'">Dialog</button>
+<p id="dialog"></p>
+<a id="download" href="/probe/file.txt" download="file.txt">Download</a>
+<div id="hover" onmouseover="this.textContent = 'hovered'" style="width:200px;height:50px;background:#ddd">hover me</div>
+<p id="time"></p>
+<iframe id="embed" src="http://embed.test:8080/probe/embed.html" width="300" height="100"></iframe>
+<script>
+document.getElementById('file').addEventListener('change', function (e) {
+  document.getElementById('fileName').textContent = e.target.files[0] ? e.target.files[0].name : '';
+});
+document.getElementById('time').textContent = new Date().toISOString();
+console.log('probe-console');
+</script>
+</body>
+</html>

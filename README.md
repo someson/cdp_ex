@@ -34,19 +34,30 @@ scraper, where it replaced a Wallaby/ChromeDriver setup.
 | Scope | general automation | general automation, testing | PDF / screenshots | feature tests |
 | Talks to the browser over | CDP (WebSocket, or a pipe) | the Playwright Node.js driver | CDP (pipes) | WebDriver |
 | Extra process at runtime | none | Node.js (Playwright) | none | ChromeDriver, or Selenium |
-| Browsers | Chrome / Chromium | Chromium, Firefox, Safari (WebKit), Edge | Chrome / Chromium | Chrome; Firefox via Selenium |
-| Pool of warm sessions | browsers (`CDPEx.Pool`) | — | tabs (`session_pool`) | — |
-| Per-job isolation | a browser context per job, the pool's default | browser contexts (`new_context`) | — | — |
-| Attach to a running browser | `connect/2` (`ws://`, `wss://`, discovery) | a remote Playwright server | experimental (`chrome_address`) | — |
-| Request interception | ✓ | ✓ (`route`) | — | — |
-| Block resources by type | ✓ (`block:`, cross-site iframes included, no handler process) | by hand, with `route` | — | — |
-| Proxy with credentials | ✓ (`:proxy`, any page and its cross-site iframes; kept out of crash reports) | — | — | — |
-| Waits | selector, JS predicate (in the page), response (with its body), network idle | load state, events | a selector before printing | queries block until satisfied |
-| Screenshots / PDF | ✓ / ✓ | — | ✓ / ✓ (and PDF/A) | ✓ / — |
-| `:telemetry` events | ✓ | — | ✓ | — |
+| Browsers | Chrome / Chromium | Chromium, Firefox, WebKit | Chrome / Chromium | Chrome; Firefox only through a Selenium 3 server |
+| Pool of warm sessions | ✓ browsers (`CDPEx.Pool`) | ✗ | ✓ tabs (`session_pool`) | ✗ |
+| Per-job isolation | ✓ a browser context per job | ✓ `new_context` | ✗ | ✓ a session (a Chrome) per job |
+| Attach to a running Chrome | ✓ `connect/2` | ✗ (a remote Playwright server only) | ✓ `chrome_address` (experimental) | partial (ChromeDriver's `debuggerAddress`) |
+| Request interception | ✓ | ✓ `route` | ✗ | ✗ |
+| Block resources by type | ✓ `block:`, cross-site iframes included | partial (a `route` handler) | ✗ | ✗ |
+| Site login / proxy with credentials | ✓ / ✓ (cross-site iframes included) | ✓ / ✓ | ✗ / ✗ | ✗ / ✗ |
+| Waits | selector, JS predicate, network idle, a response with its body | selector, JS predicate, network idle; responses without a body | partial (an element via an `:evaluate` Promise) | element queries |
+| Read text, click, fill a form | ✓ | ✓ | ✗ | ✓ |
+| Hover, file upload, JS dialogs | ✗ | ✓ | ✗ | ✓ |
+| Downloads | ✗ | fails in 0.16.0 (the documented flow raises) | ✗ | ✗ |
+| Inside an iframe | ✗ | ✓ | ✗ | ✓ |
+| Console messages | ✗ | ✓ | ✗ | ✓ |
+| Timezone / clock / tracing | ✗ / ✗ / ✗ | ✓ / ✓ / ✓ | partial / ✗ / ✗ | ✗ / ✗ / ✗ |
+| Screenshots / PDF | ✓ / ✓ | ✓ / partial (raw protocol) | ✓ / ✓ | ✓ / ✗ |
+| PDF/A, header/footer, PDF from an HTML string | ✗ | ✗ | ✓ | ✗ |
+| `:telemetry` events | ✓ | ✗ | ✓ | ✗ |
 
-— means the library's README and docs don't mention it (checked November 2026:
-playwright_ex 0.16, ChromicPDF 1.17, Wallaby 0.31). CDPEx's only runtime
+Every capability cell is a probe result, not a reading of the docs: `bench/compare`
+runs each one against a fixture page and checks the output (November 2026:
+playwright_ex 0.16.0, ChromicPDF 1.17.2, Wallaby 0.31.0, Chromium 156). ✓ means
+done through the library's API, partial only by a workaround, ✗ no way in its
+API. The same harness times the four on the same tasks and pages; the numbers
+are in `bench/compare/README.md` in the repository. CDPEx's only runtime
 dependencies are `mint_web_socket`, `jason` and `telemetry`. More in
 [Usage](#usage) and [Guides](#guides).
 
