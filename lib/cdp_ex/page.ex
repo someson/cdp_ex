@@ -52,6 +52,10 @@ defmodule CDPEx.Page do
   @screenshot_timeout 30_000
   @command_timeout 10_000
   @click_poll_interval 100
+  # How long pointer_into_frame/5 moves the pointer for an out-of-process frame to see it,
+  # and how often.
+  @pointer_timeout 2_000
+  @pointer_poll_interval 20
   @files_object_group "cdp_ex-set-input-files"
   @probe_timeout 2_000
   @retryable_locate [:selector_not_found, :text_not_found, :not_clickable, :obscured]
@@ -1424,8 +1428,13 @@ defmodule CDPEx.Page do
   a page. `click/3`, `click_text/3` and `hover/3` dispatch trusted mouse events on
   the page, at the element's point shifted by each enclosing `<iframe>`: every
   `<iframe>` on the way is scrolled into view and must be what its parent has at
-  that point, else `{:error, {:obscured, label}}`. `type/4` and `press/4` focus the
-  element in the frame and send the keys to the page, which routes them there.
+  that point, else `{:error, {:obscured, label}}`. Before the press they move the
+  pointer to that point until the frame sees the move: Chrome sends input at a
+  cross-site frame that has just loaded to the parent document, onto the `<iframe>`,
+  for a moment after load. If the frame sees none within 2 s, nothing is pressed and
+  the call returns `{:error, {:obscured, label}}`, which `:wait` retries. `type/4`
+  and `press/4` focus the element in the frame and send the keys to the page, which
+  routes them there.
   The functions that act on the whole page (navigation and its waits, screenshots,
   PDF, cookies, network observation and interception, emulation, dialogs, login)
   take a page only: a frame handle raises `FunctionClauseError` there.
@@ -1840,12 +1849,61 @@ defmodule CDPEx.Page do
 
       {:ok, %{"clickable" => true, "x" => x, "y" => y}} ->
         with {:ok, x, y} <- to_top(page, x, y, label, timeout),
+             :ok <- pointer_into_frame(page, x, y, label, timeout),
              {:error, reason} <- dispatch_action(page, action, x, y, timeout) do
           {:dispatch, reason}
         end
 
       {:error, reason} ->
         {:locate, reason}
+    end
+  end
+
+  # Until an out-of-process frame is in Chrome's hit-test data, a moment after its load,
+  # Chrome routes input at it to the parent document, onto the <iframe> element: a click
+  # there is lost and the call returns :ok. So the pointer is moved to the point until the
+  # frame itself sees the move, before the press. Moves only, so a frame that never sees
+  # one is reported before anything is pressed. In-process frames see the first move.
+  defp pointer_into_frame(%__MODULE__{frame: nil}, _x, _y, _label, _timeout), do: :ok
+
+  defp pointer_into_frame(page, x, y, label, timeout) do
+    key = "__cdpExPointer" <> Integer.to_string(System.unique_integer([:positive]))
+    deadline = System.monotonic_time(:millisecond) + min(timeout, @pointer_timeout)
+
+    arm =
+      "(function (k) { window[k] = false; window.addEventListener('mousemove', " <>
+        "function (e) { if (e.isTrusted) { window[k] = true; } }, {capture: true, once: true}); " <>
+        "return true; })(#{Jason.encode!(key)})"
+
+    case evaluate(page, arm, timeout: timeout) do
+      {:ok, true} -> await_pointer(page, x, y, key, label, deadline)
+      {:ok, other} -> {:locate, {:unexpected_evaluate, other}}
+      {:error, reason} -> {:locate, reason}
+    end
+  end
+
+  defp await_pointer(page, x, y, key, label, deadline) do
+    seen =
+      "(function (k) { var seen = window[k]; if (seen) { delete window[k]; } return seen; })" <>
+        "(#{Jason.encode!(key)})"
+
+    timeout = max(remaining(deadline), 1)
+
+    with :ok <- dispatch_mouse(page, "mouseMoved", x, y, "none", 0, timeout),
+         {:ok, seen?} <- evaluate(page, seen, timeout: timeout) do
+      cond do
+        seen? == true ->
+          :ok
+
+        remaining(deadline) > 0 ->
+          Process.sleep(min(@pointer_poll_interval, remaining(deadline)))
+          await_pointer(page, x, y, key, label, deadline)
+
+        true ->
+          {:locate, {:obscured, label}}
+      end
+    else
+      {:error, reason} -> {:locate, reason}
     end
   end
 

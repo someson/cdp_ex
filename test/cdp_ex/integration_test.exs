@@ -2038,10 +2038,12 @@ defmodule CDPEx.IntegrationTest do
 
         inner = "http://b.test:#{port}/dialogs-frame"
         {:ok, _} = Page.navigate(page, frame_url("a.test", port, inner), wait_until: :load)
-        # Chrome drops input to an out-of-process iframe until it has painted, which can
-        # be a moment after load, so the click is repeated until the dialog shows.
-        assert %{type: "confirm", message: "From frame?", url: ^inner, action: :dismiss} =
-                 click_until_dialog(page, "iframe", ref, 10)
+        {:ok, frame} = Page.frame(page, "iframe", wait: 5_000)
+        assert :ok = Page.click(frame, "#confirm")
+
+        assert_receive {[:cdp_ex, :dialog], ^ref, _,
+                        %{type: "confirm", message: "From frame?", url: ^inner, action: :dismiss}},
+                       2_000
       end
     end
   end
@@ -2065,6 +2067,37 @@ defmodule CDPEx.IntegrationTest do
       page
     end
 
+    # Chrome routes input to the parent document, onto the <iframe> element, until an
+    # out-of-process frame is in its hit-test data, a moment after load. Fresh pages, so
+    # each first input meets a just-loaded frame.
+    for {kind, launch_opts} <- [{"dedicated", []}, {"pipe", [pipe: true]}] do
+      test "cross-site (#{kind}): the first click and hover after load land in the frame" do
+        {:ok, %{port: port}} = FixtureServer.start()
+        url = frame_page(port, "a.test", "b.test", "/interact")
+        {:ok, browser} = CDPEx.launch([extra_args: @frame_sites] ++ unquote(launch_opts))
+        on_exit(fn -> stop_quietly(browser) end)
+
+        for _ <- 1..5 do
+          {:ok, page} = CDPEx.new_page(browser)
+          {:ok, _} = Page.navigate(page, url, wait_until: :load)
+          {:ok, frame} = Page.frame(page, "iframe", wait: 5_000)
+          assert :ok = Page.click(frame, "#subscribe-btn")
+
+          assert {:ok, [%{"id" => "subscribe-btn", "trusted" => true}]} =
+                   Page.evaluate(frame, "window.clicks")
+
+          :ok = CDPEx.close_page(browser, page)
+
+          {:ok, page} = CDPEx.new_page(browser)
+          {:ok, _} = Page.navigate(page, url, wait_until: :load)
+          {:ok, frame} = Page.frame(page, "iframe", wait: 5_000)
+          assert :ok = Page.hover(frame, "#hover-trigger")
+          assert {:ok, [_ | _]} = Page.evaluate(frame, "window.hovers")
+          :ok = CDPEx.close_page(browser, page)
+        end
+      end
+    end
+
     for {kind, inner_host, launch_opts} <- [
           {"same-site", "a.test", []},
           {"cross-site", "b.test", []},
@@ -2080,11 +2113,8 @@ defmodule CDPEx.IntegrationTest do
         assert {:ok, "end"} = Page.text(frame, "#footer")
         assert {:ok, "Frame"} = Page.text(page, "#greeting")
 
-        # Chrome drops input to an out-of-process frame until it has painted.
-        assert eventually(fn ->
-                 :ok = Page.hover(frame, "#hover-trigger")
-                 match?({:ok, [_ | _]}, Page.evaluate(frame, "window.hovers"))
-               end)
+        assert :ok = Page.hover(frame, "#hover-trigger")
+        assert {:ok, [_ | _]} = Page.evaluate(frame, "window.hovers")
 
         assert :ok = Page.click(frame, "#subscribe-btn")
         assert :ok = Page.click(frame, "#footer")
@@ -2296,14 +2326,8 @@ defmodule CDPEx.IntegrationTest do
         page = download_page(browser, url)
         {:ok, frame} = Page.frame(page, "iframe", wait: 5_000)
 
-        # Chrome drops input to an out-of-process frame until it has painted, so the
-        # click runs through the page's script instead.
         assert {:ok, %{suggested_filename: "report.csv", size: 4096}} =
-                 Page.wait_for_download(page,
-                   trigger: fn ->
-                     Page.evaluate(frame, ~s|document.getElementById("download").click()|)
-                   end
-                 )
+                 Page.wait_for_download(page, trigger: fn -> Page.click(frame, "#download") end)
       end
     end
 
@@ -3404,16 +3428,6 @@ defmodule CDPEx.IntegrationTest do
 
   # Poll until `fun` is true or the deadline passes — for event-driven state (e.g.
   # a CDP event pruning a map) that settles asynchronously after the triggering call.
-  defp click_until_dialog(page, css, ref, attempts) do
-    :ok = Page.click(page, css)
-
-    receive do
-      {[:cdp_ex, :dialog], ^ref, _, meta} -> meta
-    after
-      500 -> if attempts > 1, do: click_until_dialog(page, css, ref, attempts - 1)
-    end
-  end
-
   defp eventually(fun, retries \\ 50) do
     cond do
       fun.() ->
