@@ -727,6 +727,31 @@ defmodule CDPEx.FetchTest do
              }
     end
 
+    test "an owner that stops with an attach still queued resumes that iframe", %{
+      conn: conn,
+      fake: fake
+    } do
+      Process.flag(:trap_exit, true)
+      pid = start_owner(conn)
+      arm(pid, fake, {:block, ["Image"], 5_000})
+
+      # The attach lands in the mailbox but is never handled: the owner stops first,
+      # as a crash in an earlier message would. Nobody else knows the iframe's session.
+      :ok = :sys.suspend(pid)
+      attach(fake, "C1")
+
+      assert eventually(fn ->
+               match?({:message_queue_len, 1}, Process.info(pid, :message_queue_len))
+             end)
+
+      stopper = spawn(fn -> :sys.terminate(pid, {:shutdown, :crashed}) end)
+
+      expect_call_on(fake, "Fetch.disable", nil)
+      expect_call_on(fake, "Runtime.runIfWaitingForDebugger", "C1")
+      ref = Process.monitor(stopper)
+      assert_receive {:DOWN, ^ref, :process, _, _}, 2_000
+    end
+
     test "an iframe is resumed even when its enable fails", %{conn: conn, fake: fake} do
       pid = start_owner(conn)
       arm(pid, fake, {:block, ["Image"], 5_000})
@@ -1002,6 +1027,14 @@ defmodule CDPEx.FetchTest do
 
       GenServer.stop(pid)
       assert expect_strict(fake, "Target.setAutoAttach", nil)["autoAttach"] == false
+    end
+  end
+
+  defp eventually(fun, retries \\ 100) do
+    cond do
+      fun.() -> true
+      retries == 0 -> false
+      true -> Process.sleep(10) && eventually(fun, retries - 1)
     end
   end
 

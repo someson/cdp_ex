@@ -297,8 +297,28 @@ defmodule CDPEx.Fetch do
         true -> :ok
       end
 
+    _ = if not state.detached, do: resume_queued_attaches(state)
     _ = if state.subscribed, do: safe_unsubscribe(state)
     :ok
+  end
+
+  # An iframe whose attach is still in our mailbox is paused, and only its own session
+  # can resume it: Chrome doesn't resume it when auto-attach goes off, the session
+  # detaches, or another session attaches to it. Stopping before handling the attach
+  # (a crash in an earlier message) would leave it, and the page's load, hanging.
+  # Our subscriptions are filtered to our page's sessions, so every attach here is ours.
+  defp resume_queued_attaches(%__MODULE__{conn: conn} = state) do
+    receive do
+      {:cdp_event, ^conn, "Target.attachedToTarget", %{"sessionId" => child} = params, _parent}
+      when is_binary(child) ->
+        _ =
+          if params["waitingForDebugger"] != false,
+            do: call_on(state, child, "Runtime.runIfWaitingForDebugger", %{})
+
+        resume_queued_attaches(state)
+    after
+      0 -> :ok
+    end
   end
 
   # ── requests ────────────────────────────────────────────────────────────────

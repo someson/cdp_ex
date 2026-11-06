@@ -89,10 +89,17 @@ iframes start unpaused.
 ## Risks
 
 - **A stuck iframe.** `waitForDebuggerOnStart` holds every new OOPIF until the
-  owner resumes it. The owner resumes on every path for that child. An owner that
-  crashes between an attach and its resume would leave that iframe waiting;
-  unverified whether Chrome resumes it on its own when the auto-attach is dropped.
-  The integration tests must check this before the design is called done.
+  owner resumes it. The owner resumes on every path for that child. Checked
+  (2026-11-06, Google Chrome 156, macOS): an owner that stops with an attach still
+  in its mailbox leaves that iframe paused for good, and the page's `load` with it.
+  Chrome does not resume it when auto-attach goes off, when `Fetch.disable` is
+  sent, when the child session is detached, or when another session attaches to
+  the target; only `Runtime.runIfWaitingForDebugger` on the child's own session
+  does. So `terminate/2` drains the attaches still queued and resumes each one
+  (integration test "a Fetch owner that stops with an iframe's attach unhandled
+  still resumes it"). An owner killed outright (`:kill`, no `terminate/2`) still
+  leaves them paused, and its page's paused requests too; nothing in CDPEx sends
+  it that signal.
 - **Cost with auth on.** Every request of every iframe round-trips through the
   owner, as on the page today.
 - **Another client auto-attaching** on the same page (a caller sending

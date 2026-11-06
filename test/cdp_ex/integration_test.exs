@@ -1905,6 +1905,34 @@ defmodule CDPEx.IntegrationTest do
       assert {:ok, "Console"} = Page.text(frame, "#greeting")
     end
 
+    test "a Fetch owner that stops with an iframe's attach unhandled still resumes it" do
+      {:ok, %{port: port}} = FixtureServer.start()
+      {:ok, browser} = CDPEx.launch(extra_args: @sites)
+      on_exit(fn -> stop_quietly(browser) end)
+
+      {:ok, page} = CDPEx.new_page(browser, block: [:image])
+      fetch = :sys.get_state(browser).fetchers[page.target_id]
+
+      # Hold the owner so the iframe's attach queues up, then stop it the way a crash
+      # in an earlier message would: terminate/2 runs, the attach is never handled.
+      :ok = :sys.suspend(fetch)
+      top = frame_url("a.test", port, "http://b.test:#{port}/with-assets")
+      nav = Task.async(fn -> Page.navigate(page, top, wait_until: :load, timeout: 10_000) end)
+
+      assert eventually(fn ->
+               {:messages, msgs} = Process.info(fetch, :messages)
+               Enum.any?(msgs, &match?({:cdp_event, _, "Target.attachedToTarget", _, _}, &1))
+             end)
+
+      :ok = :sys.terminate(fetch, {:shutdown, :crashed})
+
+      # The page's load waits for the iframe: it fires only if the iframe was resumed.
+      {elapsed_us, {:ok, _}} = :timer.tc(fn -> Task.await(nav, 12_000) end)
+      assert elapsed_us < 5_000_000
+      {:ok, frame} = Page.frame(page, "iframe", wait: 5_000)
+      assert {:ok, "Assets"} = Page.text(frame, "#greeting")
+    end
+
     test "with blocking off again, a new cross-site iframe loads unfiltered" do
       {:ok, %{port: port}} = FixtureServer.start(report: self())
       {:ok, browser} = CDPEx.launch(extra_args: @sites)
