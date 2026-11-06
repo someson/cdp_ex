@@ -39,9 +39,9 @@ scraper, where it replaced a Wallaby/ChromeDriver setup.
 | Per-job isolation | a browser context per job, the pool's default | browser contexts (`new_context`) | — | — |
 | Attach to a running browser | `connect/2` (`ws://`, `wss://`, discovery) | a remote Playwright server | experimental (`chrome_address`) | — |
 | Request interception | ✓ | ✓ (`route`) | — | — |
-| Block resources by type | ✓ (`block:`, no handler process) | by hand, with `route` | — | — |
-| Proxy with credentials | ✓ (`:proxy`, any page) | — | — | — |
-| Waits | selector, JS predicate (in the page), response, network idle | load state, events | a selector before printing | queries block until satisfied |
+| Block resources by type | ✓ (`block:`, cross-site iframes included, no handler process) | by hand, with `route` | — | — |
+| Proxy with credentials | ✓ (`:proxy`, any page and its cross-site iframes; kept out of crash reports) | — | — | — |
+| Waits | selector, JS predicate (in the page), response (with its body), network idle | load state, events | a selector before printing | queries block until satisfied |
 | Screenshots / PDF | ✓ / ✓ | — | ✓ / ✓ (and PDF/A) | ✓ / — |
 | `:telemetry` events | ✓ | — | ✓ | — |
 
@@ -72,6 +72,13 @@ Chromium and Chrome for Testing builds from switching on experimental features
 (about 30% less memory with 8 concurrent pages; a no-op on branded Google Chrome),
 and `--disable-component-extensions-with-background-pages` saves one Chrome
 process per browser.
+
+They also turn off Chrome's own background calls to Google (sync, metrics, network
+time, optimization hints, Safe Browsing real-time lookups, the search preconnect),
+and `accounts.google.com` and `update.googleapis.com` never reach the network
+(`:block_background_hosts`, on by default). Behind a paid proxy that is 1 request
+to Google instead of 14 in the first 20 seconds (Google Chrome 157, Linux); the one
+left is the AI Mode eligibility check. See `CDPEx.Chrome`.
 
 ### Running on a server or in a container
 
@@ -116,7 +123,7 @@ box on a constrained host (e.g. 2 vCPU / 2 GB).
   - [Block or rewrite requests (interception)](docs/guides/recipes.md#block-or-rewrite-requests-interception)
   - [Grab an API response triggered by a click (SPA)](docs/guides/recipes.md#grab-an-api-response-triggered-by-a-click-spa)
   - [Detect a 403 wall, a 404 or a login redirect](docs/guides/recipes.md#detect-a-403-wall-a-404-or-a-login-redirect)
-  - [Authenticated proxy](docs/guides/recipes.md#authenticated-proxy)
+  - [Authenticated proxy](docs/guides/recipes.md#authenticated-proxy), with resource blocking to save its traffic
   - [Keep jobs apart on a shared browser](docs/guides/recipes.md#keep-jobs-apart-on-a-shared-browser)
 - [Error handling](docs/guides/error-handling.md): what returns `{:error, _}`, what
   still raises, and classifying reasons for retries.

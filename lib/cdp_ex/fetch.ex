@@ -25,6 +25,13 @@ defmodule CDPEx.Fetch do
   off, until the page ends: it stops when the page's connection goes down, when a
   `:session` page's session detaches, or on `stop/1`.
 
+  Cross-site iframes run as their own Chrome targets. With any mode on, the owner turns
+  on `Target.setAutoAttach` (iframes only, paused on start) for the page's session:
+  each iframe that attaches, nested ones included, gets the page's `Fetch.enable`
+  params on its own session and is then resumed, on every path. Block and auth answer
+  there; interception covers the page's own frames only, so an iframe's other pauses
+  are continued. With every mode off, auto-attach is turned off again.
+
   This is an internal building block; use the `CDPEx.Page` functions.
   """
 
@@ -38,6 +45,16 @@ defmodule CDPEx.Fetch do
   @call_timeout 10_000
   @max_tracked 1024
   @events ["Fetch.requestPaused", "Fetch.authRequired"]
+  # A cross-site iframe is its own target: it attaches as a child session of the page
+  # (or of its parent iframe), paused until resumed, so its Fetch domain is armed
+  # before its first request.
+  @target_events ["Target.attachedToTarget", "Target.detachedFromTarget"]
+  @auto_attach %{
+    "autoAttach" => true,
+    "waitForDebuggerOnStart" => true,
+    "flatten" => true,
+    "filter" => [%{"type" => "iframe"}]
+  }
 
   defstruct [
     :conn,
@@ -51,6 +68,11 @@ defmodule CDPEx.Fetch do
     # nil | [CDP resource type string], deduplicated
     block: nil,
     subscribed: false,
+    # Target.setAutoAttach is on for the page's session.
+    auto_attach: false,
+    # Child sessions of attached cross-site iframes (session id => true).
+    children: %{},
+    # {session_id, requestId} => answers given, for the bad-credentials guard.
     attempts: %{},
     # requestIds forwarded to the interception owner, released if it goes away
     forwarded: MapSet.new(),
@@ -112,18 +134,31 @@ defmodule CDPEx.Fetch do
   end
 
   def handle_info(
+        {:cdp_event, conn, "Fetch.requestPaused", %{"requestId" => request_id} = params, sid},
+        %__MODULE__{conn: conn} = state
+      )
+      when is_map_key(state.children, sid) do
+    # An iframe's pause: block applies there too; interception covers the page's own
+    # frames only, so everything else goes on.
+    case decide(%{state | intercept: nil}, params) do
+      :block ->
+        _ = fail_blocked(state, sid, request_id)
+        {:noreply, state}
+
+      _continue ->
+        _ = call_on(state, sid, "Fetch.continueRequest", %{"requestId" => request_id})
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(
         {:cdp_event, conn, "Fetch.requestPaused", %{"requestId" => request_id} = params, sid} =
           event,
         %__MODULE__{conn: conn, session_id: sid} = state
       ) do
     case decide(state, params) do
       :block ->
-        _ =
-          call(state, "Fetch.failRequest", %{
-            "requestId" => request_id,
-            "errorReason" => "BlockedByClient"
-          })
-
+        _ = fail_blocked(state, sid, request_id)
         {:noreply, state}
 
       :forward ->
@@ -138,24 +173,34 @@ defmodule CDPEx.Fetch do
 
   def handle_info(
         {:cdp_event, conn, "Fetch.authRequired", %{"requestId" => request_id} = params, sid},
-        %__MODULE__{conn: conn, session_id: sid, auth: %{} = auth} = state
-      ) do
+        %__MODULE__{conn: conn, auth: %{} = auth} = state
+      )
+      when sid == state.session_id or is_map_key(state.children, sid) do
     {response, attempts} =
       auth_decision(
         auth.source,
         state.attempts,
-        request_id,
+        {sid, request_id},
         params["authChallenge"] || %{},
         auth.credentials
       )
 
     _ =
-      call(state, "Fetch.continueWithAuth", %{
+      call_on(state, sid, "Fetch.continueWithAuth", %{
         "requestId" => request_id,
         "authChallengeResponse" => response
       })
 
     {:noreply, %{state | attempts: attempts}}
+  end
+
+  # A cross-site iframe attached under the page or one of its iframes.
+  def handle_info(
+        {:cdp_event, conn, "Target.attachedToTarget", %{"sessionId" => child} = params, parent},
+        %__MODULE__{conn: conn} = state
+      )
+      when is_binary(child) and (parent == state.session_id or is_map_key(state.children, parent)) do
+    {:noreply, arm_child(state, child, params)}
   end
 
   def handle_info({:DOWN, _ref, :process, conn, _reason}, %__MODULE__{conn: conn} = state) do
@@ -192,6 +237,16 @@ defmodule CDPEx.Fetch do
     {:stop, :normal, %{state | detached: true}}
   end
 
+  # An iframe went away (navigated, removed, its parent gone): forget its session.
+  def handle_info(
+        {:cdp_event, conn, "Target.detachedFromTarget", %{"sessionId" => child}, _parent},
+        %__MODULE__{conn: conn} = state
+      )
+      when is_map_key(state.children, child) do
+    Enum.each(@events ++ @target_events, &Connection.unsubscribe(conn, &1, session_id: child))
+    {:noreply, %{state | children: Map.delete(state.children, child)}}
+  end
+
   # Includes Fetch.authRequired while auth is off: it isn't ours to answer (a caller
   # that enabled handleAuthRequests itself answers it).
   def handle_info(_msg, state), do: {:noreply, state}
@@ -200,9 +255,7 @@ defmodule CDPEx.Fetch do
   def terminate(_reason, state) do
     # Best-effort: the connection may already be gone (Connection.call and
     # safe_unsubscribe both tolerate that), leaving nothing to disable.
-    _ =
-      if not state.detached and any_mode?(state),
-        do: call(state, "Fetch.disable", %{})
+    _ = if not state.detached and any_mode?(state), do: disable_all(state, @call_timeout)
 
     _ = if state.subscribed, do: safe_unsubscribe(state)
     :ok
@@ -293,18 +346,36 @@ defmodule CDPEx.Fetch do
   defp disable(%__MODULE__{auth: nil, intercept: nil, block: nil}, next, _timeout), do: {:ok, next}
 
   defp disable(_prev, next, timeout) do
-    case call(next, "Fetch.disable", %{}, timeout) do
-      {:ok, _} -> {:ok, next}
-      {:error, reason} -> {{:error, reason}, next}
+    case disable_all(next, timeout) do
+      {:ok, _} -> {:ok, %{next | auto_attach: false}}
+      {:error, reason} -> {{:error, reason}, %{next | auto_attach: false}}
     end
+  end
+
+  # Every iframe first (turning auto-attach off may detach them), then the page: stop
+  # pausing new iframes, and release the page's Fetch domain.
+  defp disable_all(state, timeout) do
+    Enum.each(Map.keys(state.children), &call_on(state, &1, "Fetch.disable", %{}, timeout))
+
+    _ =
+      if state.auto_attach,
+        do: call(state, "Target.setAutoAttach", %{@auto_attach | "autoAttach" => false}, timeout)
+
+    call(state, "Fetch.disable", %{}, timeout)
   end
 
   defp enable(prev, next, params, timeout) do
     case ensure_subscribed(next, timeout) do
       {:ok, next} ->
+        next = ensure_auto_attach(next, timeout)
+
         case call(next, "Fetch.enable", params, timeout) do
-          {:ok, _} -> {:ok, next}
-          {:error, reason} -> arm_failed(reason, %{prev | subscribed: true})
+          {:ok, _} ->
+            Enum.each(Map.keys(next.children), &enable_child(next, &1, params))
+            {:ok, next}
+
+          {:error, reason} ->
+            arm_failed(reason, %{prev | subscribed: true, auto_attach: next.auto_attach})
         end
 
       {:error, reason} ->
@@ -322,14 +393,87 @@ defmodule CDPEx.Fetch do
   defp ensure_subscribed(%__MODULE__{subscribed: true} = state, _timeout), do: {:ok, state}
 
   defp ensure_subscribed(state, timeout) do
-    methods = if state.session_id, do: ["Target.detachedFromTarget" | @events], else: @events
+    case subscribe_session(state, state.session_id, timeout) do
+      :ok -> {:ok, %{state | subscribed: true}}
+      {:error, _} = error -> error
+    end
+  end
 
-    Enum.reduce_while(methods, {:ok, state}, fn method, {:ok, acc} ->
-      case Connection.subscribe(acc.conn, method, timeout, session_id: acc.session_id) do
-        :ok -> {:cont, {:ok, %{acc | subscribed: true}}}
+  defp subscribe_session(state, sid, timeout) do
+    Enum.reduce_while(@events ++ @target_events, :ok, fn method, :ok ->
+      case Connection.subscribe(state.conn, method, timeout, session_id: sid) do
+        :ok -> {:cont, :ok}
         {:error, _} = error -> {:halt, error}
       end
     end)
+  end
+
+  # Turn on iframe auto-attach for the page's session. A failure (an old Chrome, a
+  # target that doesn't support it) leaves iframes unfiltered, not the page: logged.
+  defp ensure_auto_attach(%__MODULE__{auto_attach: true} = state, _timeout), do: state
+
+  defp ensure_auto_attach(state, timeout) do
+    case call(state, "Target.setAutoAttach", @auto_attach, timeout) do
+      {:ok, _} ->
+        %{state | auto_attach: true}
+
+      {:error, reason} ->
+        if not benign?(reason),
+          do: Logger.warning("[CDPEx.Fetch] iframe auto-attach failed: #{inspect(reason)}")
+
+        state
+    end
+  end
+
+  # A new iframe session: subscribe it, filter it with the page's current modes, let it
+  # auto-attach its own iframes, then resume it. The resume runs whatever failed before
+  # it, so an iframe is never left paused (it then loads unfiltered: logged).
+  defp arm_child(state, child, params) do
+    state =
+      case subscribe_session(state, child, @call_timeout) do
+        :ok -> %{state | children: Map.put(state.children, child, true)}
+        {:error, reason} -> child_failed(state, child, reason)
+      end
+
+    _ =
+      case is_map_key(state.children, child) && params_of(state) do
+        enable when is_map(enable) ->
+          _ = enable_child(state, child, enable)
+          _ = call_on(state, child, "Target.setAutoAttach", @auto_attach)
+
+        _off ->
+          :ok
+      end
+
+    _ =
+      if params["waitingForDebugger"] != false,
+        do: call_on(state, child, "Runtime.runIfWaitingForDebugger", %{})
+
+    state
+  end
+
+  defp enable_child(state, child, params) do
+    case call_on(state, child, "Fetch.enable", params) do
+      {:ok, _} -> :ok
+      {:error, reason} -> child_failed(state, child, reason)
+    end
+  end
+
+  defp child_failed(state, child, reason) do
+    if not benign?(reason) do
+      Logger.warning(
+        "[CDPEx.Fetch] arming iframe session #{child} failed: #{inspect(reason)}; its requests are not filtered"
+      )
+    end
+
+    state
+  end
+
+  defp fail_blocked(state, sid, request_id) do
+    call_on(state, sid, "Fetch.failRequest", %{
+      "requestId" => request_id,
+      "errorReason" => "BlockedByClient"
+    })
   end
 
   # The page connection died, or a :session page's session detached, mid-arm (a
@@ -465,7 +609,9 @@ defmodule CDPEx.Fetch do
   # Decide the authChallengeResponse and the next attempts map for a challenge.
   # Pure, so the source filter + bad-credentials loop guard are unit-testable
   # without Chrome.
-  @spec auth_decision(atom(), map(), String.t(), map(), (-> {String.t(), String.t()})) ::
+  # `request_key` keys the attempts map: {session_id, requestId}, since request ids
+  # are per target and an iframe's session has its own.
+  @spec auth_decision(atom(), map(), term(), map(), (-> {String.t(), String.t()})) ::
           {map(), map()}
   def auth_decision(source_filter, attempts, request_id, challenge, credentials) do
     cond do
@@ -515,12 +661,15 @@ defmodule CDPEx.Fetch do
   defp source_match?(:server, "Server"), do: true
   defp source_match?(_filter, _source), do: false
 
-  defp call(state, method, params, timeout \\ @call_timeout) do
-    Connection.call(state.conn, method, params, timeout, session_id: state.session_id)
+  defp call(state, method, params, timeout \\ @call_timeout),
+    do: call_on(state, state.session_id, method, params, timeout)
+
+  defp call_on(state, sid, method, params, timeout \\ @call_timeout) do
+    Connection.call(state.conn, method, params, timeout, session_id: sid)
   end
 
   defp safe_unsubscribe(state) do
-    for method <- ["Target.detachedFromTarget" | @events] do
+    for method <- @events ++ @target_events do
       Connection.unsubscribe(state.conn, method)
     end
   end

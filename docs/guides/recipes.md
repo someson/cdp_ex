@@ -135,8 +135,8 @@ rest, so no process of yours has to handle them:
 `CDPEx.Page.block_resources/3` changes the list on an open page. For a rule by URL
 rather than by type, use `enable_request_interception/2` from a process that
 resolves each pause, since the caller is busy in `navigate/3` while they arrive.
-Requests from a cross-site iframe are not blocked: Chrome runs it as a separate
-target (see `docs/TODO.md` item 13).
+Cross-site iframes (ads, embeds) are blocked too: Chrome runs each as its own target,
+and the library filters it before it loads.
 
 ## Keep jobs apart on a shared browser
 

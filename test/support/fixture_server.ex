@@ -69,6 +69,8 @@ defmodule CDPEx.FixtureServer do
   #   /data       — a tiny XHR/fetch target (the #fetch-btn calls it), for the
   #     wait_for_response/3 and wait_for_network_idle/2 paths.
   #   /interact   — the click :wait / click_text/3 / scroll/3 page (interact_page/0).
+  #   /frame?src=URL — a page holding one iframe of URL (percent-encoded), for
+  #     cross-site and nested iframes.
   #   /with-assets — a page that loads /pixel.png, /style.css and the font
   #     /font.woff2, for resource blocking (the assets themselves get the default page).
   #   anything else serves the page.
@@ -108,6 +110,10 @@ defmodule CDPEx.FixtureServer do
   end
 
   defp page_body("/interact" <> rest, _request), do: interact_page(rest =~ "smooth")
+
+  defp page_body("/frame?src=" <> src, _request) do
+    ~s(<!doctype html><html><body><h1 id="greeting">Frame</h1><iframe src="#{URI.decode_www_form(src)}"></iframe></body></html>)
+  end
 
   defp page_body("/with-assets", _request) do
     ~s(<!doctype html><html><head><link rel="stylesheet" href="/style.css">) <>

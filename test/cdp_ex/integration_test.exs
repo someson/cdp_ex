@@ -1632,25 +1632,100 @@ defmodule CDPEx.IntegrationTest do
       refute served("/pixel.png")
     end
 
-    # Known gap (docs/TODO.md item 13): a cross-site iframe is its own target, and only
-    # the page target's Fetch domain is driven. Flip these assertions once iframes are
-    # auto-attached.
-    test "a cross-site iframe's requests are not blocked (known gap)" do
+    # Sites a.test, b.test, c.test all resolve to the fixture server: Chrome runs each
+    # in its own process, so every iframe below is a cross-site (out-of-process) one.
+    @sites ["--host-resolver-rules=MAP *.test 127.0.0.1"]
+
+    defp frame_url(host, port, src),
+      do: "http://#{host}:#{port}/frame?src=" <> URI.encode_www_form(src)
+
+    for launch_opts <- [[], [pipe: true]] do
+      test "block: reaches a cross-site iframe (#{inspect(launch_opts)})" do
+        {:ok, %{port: port}} = FixtureServer.start(report: self())
+        {:ok, browser} = CDPEx.launch([extra_args: @sites] ++ unquote(launch_opts))
+        on_exit(fn -> stop_quietly(browser) end)
+
+        {:ok, page} = CDPEx.new_page(browser, block: [:image])
+        top = frame_url("a.test", port, "http://b.test:#{port}/with-assets")
+        assert {:ok, _} = Page.navigate(page, top, wait_until: :load)
+
+        assert eventually(fn -> served("/style.css") end)
+        refute served("/pixel.png")
+      end
+    end
+
+    test "block: reaches a nested cross-site iframe" do
       {:ok, %{port: port}} = FixtureServer.start(report: self())
-      {:ok, browser} = CDPEx.launch()
+      {:ok, browser} = CDPEx.launch(extra_args: @sites)
       on_exit(fn -> stop_quietly(browser) end)
 
       {:ok, page} = CDPEx.new_page(browser, block: [:image])
-      {:ok, _} = Page.navigate(page, "http://127.0.0.1:#{port}/")
-      inner = Jason.encode!("http://localhost:#{port}/with-assets")
+      inner = frame_url("b.test", port, "http://c.test:#{port}/with-assets")
+      assert {:ok, _} = Page.navigate(page, frame_url("a.test", port, inner), wait_until: :load)
+
+      assert eventually(fn -> served("/style.css") end)
+      refute served("/pixel.png")
+    end
+
+    test "with blocking off again, a new cross-site iframe loads unfiltered" do
+      {:ok, %{port: port}} = FixtureServer.start(report: self())
+      {:ok, browser} = CDPEx.launch(extra_args: @sites)
+      on_exit(fn -> stop_quietly(browser) end)
+
+      {:ok, page} = CDPEx.new_page(browser, block: [:image])
+      assert :ok = Page.block_resources(page, [])
+      top = frame_url("a.test", port, "http://b.test:#{port}/with-assets")
+      assert {:ok, _} = Page.navigate(page, top, wait_until: :load)
+      assert eventually(fn -> served("/pixel.png") end)
+    end
+
+    test "interception covers the page's own frames only; a cross-site iframe still loads" do
+      {:ok, %{port: port}} = FixtureServer.start(report: self())
+      {:ok, browser} = CDPEx.launch(extra_args: @sites)
+      on_exit(fn -> stop_quietly(browser) end)
+      {:ok, page} = CDPEx.new_page(browser)
+      test = self()
+
+      spawn_link(fn ->
+        send(test, {:enabled, Page.enable_request_interception(page)})
+        continue_all(page, test)
+      end)
+
+      assert_receive {:enabled, :ok}, 5_000
+      top = frame_url("a.test", port, "http://b.test:#{port}/with-assets")
+      assert {:ok, _} = Page.navigate(page, top, wait_until: :load)
+
+      assert eventually(fn -> served("/pixel.png") end)
+      refute_received {:paused, "http://b.test:" <> _, "Image"}
+      assert_received {:paused, "http://a.test:" <> _, "Document"}
+    end
+
+    test "a credentialed proxy plus block: loads a cross-site iframe, blocks its image" do
+      {:ok, %{port: proxy_port}} =
+        ProxyAuthServer.start(username: "puser", password: "ppass", report: self())
+
+      {:ok, browser} = CDPEx.launch(proxy: "http://puser:ppass@127.0.0.1:#{proxy_port}")
+      on_exit(fn -> stop_quietly(browser) end)
+
+      {:ok, page} = CDPEx.new_page(browser, block: [:image])
+      {:ok, _} = Page.navigate(page, "http://proxied.test/", wait_until: :load)
 
       {:ok, _} =
         Page.evaluate(
           page,
-          "const f = document.createElement('iframe'); f.src = #{inner}; document.body.appendChild(f); 1"
+          "const f = document.createElement('iframe'); f.src = 'http://other.test/with-image'; document.body.appendChild(f); 1"
         )
 
-      assert eventually(fn -> served("/pixel.png") end)
+      assert eventually(fn ->
+               receive do
+                 {:proxy_served, "http://other.test/with-image"} -> true
+               after
+                 0 -> false
+               end
+             end)
+
+      Process.sleep(500)
+      refute_received {:proxy_served, "http://proxied.test/pixel.png"}
     end
 
     test "Chrome doesn't pause a WebSocket handshake (why :websocket is rejected)", %{

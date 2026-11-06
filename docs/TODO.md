@@ -166,21 +166,10 @@ found"); the docs tell the caller to retry. ReqBot's capture retries 3 times,
 request's `loadingFinished` (or `loadingFailed`) and return the body with the
 response. Estimate: 2–3 hours.
 
-## 13. Cross-site iframes are outside the page's `Fetch` domain
+## 13. Cross-site iframes are outside the page's `Fetch` domain — done
 
-Chrome runs a cross-site iframe as its own `iframe` target. `CDPEx.Fetch` drives
-only the page target's `Fetch` domain, so `block:`, request interception and
-`authenticate/4` don't see that iframe's requests: checked with an image in a
-`localhost` iframe on a `127.0.0.1` page (Google Chrome 156, macOS), which reached
-the server with `block: [:image]`. The integration test "a cross-site iframe's
-requests are not blocked (known gap)" pins it. A fix would auto-attach to child
-targets (`Target.setAutoAttach` with `flatten: true` on the page session) and run
-the same Fetch modes on each iframe session.
-
-A credentialed `:proxy` is not affected in the usual case (checked 2026-11-06,
-Google Chrome 156, macOS, `ProxyAuthServer`): a `http://other.test` iframe on a
-`http://proxied.test` page loaded its document and image through the proxy on a
-`:dedicated` page, an isolated one and a `pipe: true` `:session` page. Chrome
-reuses the credentials the page target already gave the proxy. A proxy that
-challenges the iframe's requests again (a new realm, rotating credentials) would
-raise `Fetch.authRequired` on the iframe target, which nothing answers.
+Block and login now apply inside cross-site iframes, nested ones included; request
+interception covers the page's own frames only (decided). Design:
+`docs/design/2026-11-06-cross-site-iframes.md`. Still unverified: whether Chrome
+resumes an iframe left waiting if the Fetch owner crashes between its attach and its
+resume.
