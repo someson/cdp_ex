@@ -528,6 +528,17 @@ defmodule CDPEx.IntegrationTest do
       assert {:ok, "Hello"} = Page.text(page, "#greeting")
     end
 
+    test "navigate/3 response: true returns the final document's headers and a readable body",
+         %{page: page, fixture: fixture} do
+      assert {:ok, ^page, %{status: 200, headers: headers, request_id: id}} =
+               Page.navigate(page, fixture <> "redirect", response: true)
+
+      assert headers["Content-Type"] == "text/html; charset=utf-8"
+      assert is_binary(id)
+      assert {:ok, html} = Page.response_body(page, id)
+      assert html =~ ~s(id="greeting")
+    end
+
     test "navigate/3 ends on a client-side redirect's successor document, not the deadline", %{
       page: page,
       fixture: fixture

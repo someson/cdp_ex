@@ -141,7 +141,10 @@ resource types fail with `net::ERR_BLOCKED_BY_CLIENT`, resolved by the page's
 `docs/design/2026-11-06-block-resources-by-type.md`. ReqBot can replace its
 image/font interceptor with `block:`.
 
-## 11. Full document response from `navigate/3`
+## 11. Full document response from `navigate/3` — done
+
+`headers` and `request_id` in the `response: true` map (see `CHANGELOG.md`).
+Kept below for the original problem statement.
 
 `navigate(page, url, response: true)` returns only `%{status, url}`. ReqBot
 needs the headers and body of the main document, so it re-implements the

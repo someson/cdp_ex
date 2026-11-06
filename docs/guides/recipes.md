@@ -91,6 +91,16 @@ case CDPEx.Page.navigate(page, url, response: true) do
 end
 ```
 
+The map also carries the document's `headers` and `request_id`; the raw HTML as the
+server sent it (before any script ran) is one call away:
+
+```elixir
+{:ok, _page, %{request_id: id, headers: headers}} =
+  CDPEx.Page.navigate(page, url, response: true)
+
+{:ok, html} = CDPEx.Page.response_body(page, id)
+```
+
 ## Authenticated proxy
 
 Pass `:proxy` — CDPEx sets `--proxy-server` and answers the proxy's auth challenge on
