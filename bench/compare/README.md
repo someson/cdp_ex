@@ -66,10 +66,18 @@ How each library runs its jobs, the way its docs show:
 
 | Library | Sequential tasks | `concurrent` |
 |---------|------------------|--------------|
-| CDPEx | one browser, `new_page(isolated: true)` per job | the same, 8 workers on one browser; and `CDPEx.Pool` of 8 browsers with `Pool.with_page/3` ("cdp_ex (pool)") |
+| CDPEx | one browser, `new_page(isolated: true)` per job (a fresh context, as `Pool.with_page/3` does) | the same, 8 workers on one browser |
+| CDPEx (reuse) | one page, opened at start and navigated by every job | a page per worker on one browser |
+| CDPEx (pool) | – | `CDPEx.Pool` of 8 browsers, `Pool.with_page/3` |
 | playwright_ex | one browser, a new context + page per job | the same, 8 workers |
 | ChromicPDF | `capture_screenshot` / `print_to_pdf` on its session pool | session pool of 8 tabs in one Chrome |
 | Wallaby | one session, reused | 8 sessions (one Chrome each) |
+
+"cdp_ex" and playwright_ex pay for a new context and page per job; ChromicPDF,
+Wallaby and "cdp_ex (reuse)" navigate a tab that already exists. Compare like
+with like. The `js` page's waits and targets each match one element
+(`.article-preview:first-child`): Wallaby checks the visibility of every element a
+query matches, and on the 20-item list that alone cost about a second per job.
 
 Workarounds that show up in the timings are marked ¹ in the report: ChromicPDF
 can't wait for an element to appear (`:wait_for` needs it to exist), so on
@@ -118,3 +126,157 @@ Playwright's own builds) and, for Wallaby, against a pinned
 | `CPUS` | `4` | CPU cap per run container |
 | `DELAY_MS` | `20` | Fixture delay per response |
 | `RESULTS` | `bench/results/compare-<timestamp>` | Output dir |
+
+## Reference run
+
+`bench/compare/run.sh` on 2026-11-06: Apple Silicon host, Docker Desktop, 4 CPUs
+per run container, Chromium 156.0.8078.79 and ChromeDriver 156.0.8078.79
+(Debian trixie), playwright-core 1.64.1, Elixir 1.20.5 / OTP 27, Node 20, 3
+rounds of 20 samples (`cold`: 10; `concurrent`: 20 s, 8 workers).
+
+### Capabilities
+
+| Capability | cdp_ex 0.14.0 | playwright_ex 0.16.0 | chromic_pdf 1.17.2 | wallaby 0.31.0 |
+|---|---|---|---|---|
+| Screenshot | ✓ | ✓ | ✓ | ✓ |
+| PDF | ✓ | partial | ✓ | ✗ |
+| PDF/A | ✗ | ✗ | ✓ | ✗ |
+| PDF header / footer | ✗ | ✗ | ✓ | ✗ |
+| PDF from an HTML string | ✗ | ✗ | ✓ | ✗ |
+| Read an element's text | ✓ | ✓ | ✗ | ✓ |
+| Click | ✓ | ✓ | ✗ | ✓ |
+| Fill a form (type, select, check) | ✓ | ✓ | ✗ | ✓ |
+| File upload | ✗ | ✓ | ✗ | ✓ |
+| Download | ✗ | fail | ✗ | ✗ |
+| Answer a JS dialog | ✗ | ✓ | ✗ | ✓ |
+| Hover | ✗ | ✓ | ✗ | ✓ |
+| Evaluate JS, get the value | ✓ | ✓ | partial | ✓ |
+| Console messages | ✗ | ✓ | ✗ | ✓ |
+| Read inside an iframe | ✗ | ✓ | ✗ | ✓ |
+| Wait for a selector | ✓ | ✓ | partial | ✓ |
+| Wait for a JS predicate | ✓ | ✓ | ✗ | ✗ |
+| Wait for network idle | ✓ | ✓ | ✗ | ✗ |
+| Wait for a response, with its body | ✓ | ✗ | ✗ | ✗ |
+| Set / read cookies | ✓ | ✓ | partial | ✓ |
+| Request interception (fulfill) | ✓ | ✓ | ✗ | ✗ |
+| Block resources by type | ✓ | partial | ✗ | ✗ |
+| Block inside a cross-site iframe | ✓ | partial | ✗ | ✗ |
+| HTTP auth (site login) | ✓ | ✓ | ✗ | ✗ |
+| Proxy with credentials | ✓ | ✓ | ✗ | ✗ |
+| Per-job isolation | ✓ | ✓ | ✗ | ✓ |
+| Pool of warm sessions | ✓ | ✗ | ✓ | ✗ |
+| Attach to a running Chrome | ✓ | ✗ | ✓ | partial |
+| :telemetry events | ✓ | ✗ | ✓ | ✗ |
+| Viewport and user agent | ✓ | ✓ | ✗ | ✓ |
+| Timezone | ✗ | ✓ | partial | ✗ |
+| Clock control | ✗ | ✓ | ✗ | ✗ |
+| Tracing | ✗ | ✓ | ✗ | ✗ |
+| Firefox | ✗ | ✓ | ✗ | partial |
+| WebKit | ✗ | ✓ | ✗ | ✗ |
+
+Partial and failed results, with the probe's note:
+
+- PDF / playwright_ex: **partial** no function in playwright_ex; raw protocol message `pdf` via PlaywrightEx.send/2; PDF, 1210 KB
+- Download / playwright_ex: **fail** the documented expect_download/await_download flow raised in the library: no function clause matching in PlaywrightEx.Download.from_event/2
+- Evaluate JS, get the value / chromic_pdf: **partial** :evaluate runs JS before the capture; its value isn't returned; ran
+- Wait for a selector / chromic_pdf: **partial** no wait for an element to appear; an :evaluate Promise that polls for it (:wait_for needs the element to exist already); waited
+- Set / read cookies / chromic_pdf: **partial** set_cookie before navigating; cookies can't be read back; set
+- Block resources by type / playwright_ex: **partial** no block-by-type option; a route/4 handler that aborts images; 3 page(s) from site.test, 0 images requested
+- Block inside a cross-site iframe / playwright_ex: **partial** no block-by-type option; a route/4 handler that aborts images; 2 page(s) from embed.test, 0 images requested
+- Attach to a running Chrome / wallaby: **partial** ChromeDriver's debuggerAddress capability, passed through start_session/1; Probe page
+- Timezone / chromic_pdf: **partial** timezone option on a capture; the effect is only visible in the output; set
+- Firefox / wallaby: **partial** only with a Selenium 3 server (3.141.59, amd64 only): Selenium 4 refused the session (Could not start a new session. No nodes support the capabilities in the request 
+
+### Timings
+
+| Task | Page | Library | p50 ms | p95 ms | jobs/s | memory peak MB | PSS peak MB (browser / driver / beam) | procs | CPU s |
+|---|---|---|---|---|---|---|---|---|---|
+| screenshot | heavy | cdp_ex | 450 | 469 | – | 398 | 617 (521 / – / 99) | 13 | 21.4 |
+| screenshot | heavy | cdp_ex (reuse) | 366 | 382 | – | 476 | 692 (600 / – / 99) | 12 | 8.1 |
+| screenshot | heavy | playwright_ex | 450 | 480 | – | 449 | 704 (472 / 139 / 94) | 12 | 23.5 |
+| screenshot | heavy | chromic_pdf | 380 | 388 | – | 390 | 613 (520 / – / 97) | 12 | 9.6 |
+| screenshot | heavy | wallaby | 417 | 436 | – | 488 | 720 (604 / 22 / 98) | 15 | 9.0 |
+| screenshot | html | cdp_ex | 546 | 632 | – | 441 | 666 (572 / – / 95) | 12 | 25.5 |
+| screenshot | html | cdp_ex (reuse) | 351 | 432 | – | 797 | 1022 (928 / – / 97) | 11 | 9.7 |
+| screenshot | html | playwright_ex | 551 | 615 | – | 530 | 733 (502 / 137 / 97) | 11 | 26.9 |
+| screenshot | html | chromic_pdf | 438 | 451 | – | 455 | 658 (563 / – / 96) | 12 | 12.8 |
+| screenshot | html | wallaby | 399 | 513 | – | 871 | 1083 (965 / 22 / 99) | 14 | 10.1 |
+| screenshot | js | cdp_ex | 266 | 273 | – | 364 | 586 (489 / – / 97) | 12 | 16.8 |
+| screenshot | js | cdp_ex (reuse) | 155 | 170 | – | 397 | 611 (514 / – / 99) | 11 | 2.9 |
+| screenshot | js | playwright_ex | 270 | 287 | – | 415 | 674 (442 / 140 / 94) | 11 | 18.5 |
+| screenshot | js | chromic_pdf ¹ | 204 | 219 | – | 363 | 585 (491 / – / 97) | 12 | 5.3 |
+| screenshot | js | wallaby | 316 | 326 | – | 388 | 622 (503 / 22 / 99) | 14 | 3.9 |
+| pdf | heavy | cdp_ex | 575 | 591 | – | 436 | 655 (558 / – / 102) | 14 | 25.0 |
+| pdf | heavy | cdp_ex (reuse) | 493 | 510 | – | 515 | 737 (633 / – / 105) | 13 | 12.4 |
+| pdf | heavy | playwright_ex ¹ | 579 | 632 | – | 480 | 732 (499 / 142 / 97) | 13 | 27.2 |
+| pdf | heavy | chromic_pdf | 508 | 521 | – | 428 | 654 (556 / – / 100) | 13 | 13.6 |
+| pdf | heavy | wallaby | can't | | | | no print/PDF in Wallaby.Browser or its WebDriver client | | |
+| pdf | html | cdp_ex | 1850 | 2040 | – | 643 | 863 (740 / – / 157) | 13 | 55.2 |
+| pdf | html | cdp_ex (reuse) | 1542 | 1679 | – | 972 | 1175 (1055 / – / 133) | 12 | 36.8 |
+| pdf | html | playwright_ex ¹ | 1485 | 1563 | – | 617 | 870 (629 / 146 / 107) | 12 | 48.7 |
+| pdf | html | chromic_pdf | 1672 | 1697 | – | 609 | 836 (716 / – / 125) | 12 | 39.9 |
+| pdf | html | wallaby | can't | | | | no print/PDF in Wallaby.Browser or its WebDriver client | | |
+| pdf | js | cdp_ex | 264 | 286 | – | 366 | 580 (480 / – / 98) | 12 | 17.6 |
+| pdf | js | cdp_ex (reuse) | 162 | 170 | – | 421 | 642 (547 / – / 99) | 12 | 3.4 |
+| pdf | js | playwright_ex ¹ | 261 | 278 | – | 411 | 663 (436 / 140 / 94) | 12 | 18.8 |
+| pdf | js | chromic_pdf ¹ | 201 | 211 | – | 366 | 589 (493 / – / 97) | 12 | 5.8 |
+| pdf | js | wallaby | can't | | | | no print/PDF in Wallaby.Browser or its WebDriver client | | |
+| text | heavy | cdp_ex | 376 | 388 | – | 382 | 607 (515 / – / 96) | 13 | 19.8 |
+| text | heavy | cdp_ex (reuse) | 303 | 310 | – | 473 | 698 (605 / – / 97) | 12 | 7.2 |
+| text | heavy | playwright_ex | 404 | 432 | – | 434 | 689 (461 / 141 / 94) | 12 | 22.5 |
+| text | heavy | chromic_pdf | can't | | | | no DOM or JS result is returned; `:evaluate` runs JS before printing and discards its value | | |
+| text | heavy | wallaby | 533 | 543 | – | 446 | 686 (572 / 22 / 97) | 15 | 8.8 |
+| text | html | cdp_ex | 455 | 530 | – | 405 | 634 (539 / – / 96) | 12 | 23.7 |
+| text | html | cdp_ex (reuse) | 263 | 347 | – | 942 | 1170 (1076 / – / 97) | 11 | 8.4 |
+| text | html | playwright_ex | 501 | 566 | – | 457 | 713 (493 / 137 / 95) | 11 | 25.8 |
+| text | html | chromic_pdf | can't | | | | no DOM or JS result is returned; `:evaluate` runs JS before printing and discards its value | | |
+| text | html | wallaby | 512 | 620 | – | 805 | 1046 (932 / 22 / 96) | 14 | 10.6 |
+| text | js | cdp_ex | 191 | 206 | – | 338 | 558 (465 / – / 98) | 12 | 14.0 |
+| text | js | cdp_ex (reuse) | 101 | 109 | – | 398 | 621 (527 / – / 96) | 11 | 2.2 |
+| text | js | playwright_ex | 221 | 240 | – | 397 | 647 (416 / 143 / 96) | 11 | 16.6 |
+| text | js | chromic_pdf | can't | | | | no DOM or JS result is returned; `:evaluate` runs JS before printing and discards its value | | |
+| text | js | wallaby | 428 | 440 | – | 375 | 612 (494 / 22 / 101) | 14 | 4.0 |
+| click | js | cdp_ex | 233 | 257 | – | 348 | 569 (475 / – / 99) | 12 | 16.0 |
+| click | js | cdp_ex (reuse) | 130 | 135 | – | 398 | 621 (522 / – / 97) | 11 | 3.0 |
+| click | js | playwright_ex | 343 | 353 | – | 403 | 658 (428 / 142 / 93) | 11 | 20.3 |
+| click | js | chromic_pdf | can't | | | | no input or DOM API; `:evaluate` can click from JS, but nothing reads the result back | | |
+| click | js | wallaby | 639 | 655 | – | 380 | 618 (503 / 22 / 98) | 14 | 6.5 |
+| cold | html | cdp_ex | 833 | 915 | – | 438 | 663 (571 / – / 96) | 12 | 21.9 |
+| cold | html | playwright_ex | 1353 | 1435 | – | 454 | 709 (500 / 122 / 97) | 11 | 26.2 |
+| cold | html | chromic_pdf | 981 | 1072 | – | 440 | 668 (577 / – / 95) | 12 | 25.6 |
+| cold | html | wallaby | 1431 | 1557 | – | 411 | 626 (506 / 24 / 103) | 15 | 20.2 |
+| concurrent | html | cdp_ex | 2603 | 3271 | 2.6 | 1394 | 1405 (1307 / – / 101) | 26 | 84.1 |
+| concurrent | html | cdp_ex (reuse) | 1237 | 1674 | 6.0 | 1582 | 1771 (1668 / – / 102) | 18 | 82.4 |
+| concurrent | html | cdp_ex (pool) | 3103 | 4026 | 2.2 | 2590 | 2610 (2514 / – / 99) | 89 | 86.6 |
+| concurrent | html | playwright_ex | 2815 | 3860 | 2.4 | 1583 | 1699 (1481 / 141 / 98) | 25 | 84.8 |
+| concurrent | html | chromic_pdf | 1480 | 1780 | 5.0 | 1503 | 1642 (1547 / – / 97) | 33 | 82.7 |
+| concurrent | html | wallaby | 1429 | 3079 | 1.4 | 3631 | 3352 (3242 / 24 / 102) | 79 | 145.0 |
+
+¹ no wait for an element to appear; an :evaluate Promise that polls for it
+¹ no function in playwright_ex; raw protocol message `pdf` via PlaywrightEx.send/2
+
+What the numbers say, read with the setup table above in mind:
+
+- **A new context per job costs ~80–200 ms.** "cdp_ex" (a fresh context per
+  job) against "cdp_ex (reuse)": 266 vs 155 ms for a `js` screenshot, 546 vs
+  351 on `html`. playwright_ex pays the same: it is within 10% of "cdp_ex" on
+  every sequential task but two, `click` (343 vs 233 ms) and the `html` PDF,
+  where it is faster (1485 vs 1850 ms).
+- **Reusing a tab**, "cdp_ex (reuse)" is the fastest row on every task but the
+  `html` PDF (1542 ms, behind playwright_ex's 1485): ahead of ChromicPDF on
+  screenshots and PDFs (`js` screenshot 155 vs 204 ms), of Wallaby on
+  interaction (`click` 130 vs 639 ms), and at 6.0 jobs/s in `concurrent`
+  against ChromicPDF's 5.0.
+- **ChromicPDF**, whose session pool reuses tabs too, is the fastest library
+  default for screenshots and PDFs of `js` and `heavy`; Wallaby is faster on
+  the `html` screenshot (399 vs 438 ms). It reads nothing back from a page, so
+  `text` and `click` are out of its reach.
+- **playwright_ex** prints the long `html` page fastest, through the raw
+  protocol, and carries ~140 MB for the Node driver.
+- **Wallaby** is slowest at interaction (each step is a WebDriver round trip)
+  and, with a Chrome per session, needs the most memory under load (3.3 GB PSS
+  for 8 workers vs 1.4–1.8 GB on one browser).
+- **Cold start**: CDPEx 833 ms, ChromicPDF 981, playwright_ex 1353 (the Node
+  driver starts too), Wallaby 1431 (ChromeDriver too).
+- A reused tab keeps more memory between jobs: "cdp_ex (reuse)" and Wallaby
+  peak at ~1 GB PSS on the `html` page against ~650 MB for a fresh page per job.
