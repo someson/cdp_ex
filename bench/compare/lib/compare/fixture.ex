@@ -14,10 +14,12 @@ defmodule Compare.Fixture do
 
   @pages %{
     "html" => %{path: "/html/", ready: :load, text: "#firstHeading", expect: "Saint Petersburg"},
+    # One element each, so a library that checks every match (Wallaby checks
+    # each one's visibility) isn't measured on 20 of them.
     "js" => %{
       path: "/js/",
-      ready: {:css, ".article-preview"},
-      text: ".article-preview h2",
+      ready: {:css, ".article-preview:first-child"},
+      text: ".article-preview:first-child h2",
       expect: "How to"
     },
     "heavy" => %{path: "/heavy/", ready: :load, text: "#headline", expect: "Morning edition"}
@@ -28,7 +30,7 @@ defmodule Compare.Fixture do
   def url(%__MODULE__{base: base}, name), do: base <> page(name).path
 
   # The click task: on /js/, open the first article and read its heading.
-  def click_target, do: ".article-preview a.preview-link"
+  def click_target, do: ".article-preview:first-child a.preview-link"
   def after_click, do: ".article-page h1"
 
   def log(%__MODULE__{base: base}) do

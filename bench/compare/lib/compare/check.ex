@@ -8,6 +8,9 @@ defmodule Compare.Check do
       else: {:fail, "#{w}x#{h} PNG of #{byte_size(bin)} B: looks blank"}
   end
 
+  def png(other),
+    do: {:fail, "not a PNG: #{inspect(binary_part(other, 0, min(16, byte_size(other))))}"}
+
   @doc "A PNG of exactly this size: every library must render the same viewport."
   def png(bin, {w, h}) do
     case png(bin) do
@@ -21,9 +24,6 @@ defmodule Compare.Check do
         other
     end
   end
-
-  def png(other),
-    do: {:fail, "not a PNG: #{inspect(binary_part(other, 0, min(16, byte_size(other))))}"}
 
   def pdf(<<"%PDF-", _::binary>> = bin) when byte_size(bin) > 1_000,
     do: {:ok, "PDF, #{div(byte_size(bin), 1024)} KB"}

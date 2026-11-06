@@ -188,3 +188,30 @@ interception covers the page's own frames only (decided). Design:
 `docs/design/2026-11-06-cross-site-iframes.md`. Still unverified: whether Chrome
 resumes an iframe left waiting if the Fetch owner crashes between its attach and its
 resume.
+
+## 14. Gaps found by the competitor comparison
+
+`bench/compare` (see its README) probes every capability for CDPEx,
+playwright_ex 0.16, ChromicPDF 1.17 and Wallaby 0.31 by running code. What
+the others do and CDPEx doesn't, roughly by how often a scraper needs it:
+
+- **Click lands in a gap.** `Page.click/3` dispatches at the centre of the
+  element's bounding box without a hit test. On an inline `<a>` that wraps
+  block children the centre was empty space (the parent `div`), the click did
+  nothing, and `click/3` still returned `:ok`. WebDriver clicks the in-view
+  centre of the first client rect; Playwright checks the hit target. Found on
+  the `js` fixture before it got `display: block`.
+- **Inside an iframe.** No way to read or act inside a frame (Wallaby
+  `focus_frame/2`, playwright_ex `internal:control=enter-frame`).
+- **Hover, file upload, JS dialogs, downloads.** All four are in playwright_ex,
+  the first three in Wallaby. A `confirm()` blocks a CDPEx page today.
+- **Console messages.** playwright_ex (context `console` events) and Wallaby
+  (`js_logger`).
+- **Timezone, clock, tracing.** playwright_ex only (ChromicPDF: timezone).
+- **PDF extras.** Header/footer templates, PDF from an HTML string, PDF/A:
+  ChromicPDF only.
+- **Firefox / WebKit.** playwright_ex (Playwright's builds); Wallaby Firefox only
+  through a Selenium 3 server.
+
+Each of these can be done today with raw CDP through `CDPEx.Connection.call/5`,
+which is what the probes' notes say; none has an API.

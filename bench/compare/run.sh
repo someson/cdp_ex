@@ -24,7 +24,7 @@ stamp="$(date +%Y%m%d-%H%M%S)"
 out="${RESULTS:-$root/bench/results/compare-$stamp}"
 mkdir -p "$out"
 results="$out/results.jsonl"
-: >"$results"
+touch "$results"
 
 docker build -q -t "$image" "$here" >/dev/null
 docker network inspect "$net" >/dev/null 2>&1 || docker network create "$net" >/dev/null
@@ -126,6 +126,12 @@ for ((round = 1; round <= ROUNDS; round++)); do
     for lib in "${order[@]}"; do
       echo "round $round: $task/$page $lib"
       run "$round-$task-$page-$lib" "LIB=$lib" "TASK=$task" "PAGE=$page"
+      # CDPEx also as "reuse": a page per worker, navigated by every job, as
+      # ChromicPDF's session pool and a Wallaby session do.
+      if [ "$lib" = cdp_ex ] && [ "$task" != cold ]; then
+        echo "round $round: $task/$page cdp_ex (reuse)"
+        run "$round-$task-$page-cdp_ex-reuse" "LIB=cdp_ex" "TASK=$task" "PAGE=$page" "CDP_EX_SETUP=reuse"
+      fi
       if [ "$lib" = cdp_ex ] && [ "$task" = concurrent ]; then
         echo "round $round: $task/$page cdp_ex (pool)"
         run "$round-$task-$page-cdp_ex-pool" "LIB=cdp_ex" "TASK=$task" "PAGE=$page" "CDP_EX_SETUP=pool"

@@ -65,7 +65,7 @@ defmodule Compare.Report do
       |> File.read!()
       |> String.split("\n", trim: true)
       |> Enum.map(&Jason.decode!/1)
-      |> Enum.reject(&(&1["task"] == "probe"))
+      |> Enum.reject(&(&1["task"] in ["probe", "probe_browsers"]))
 
     groups =
       runs
@@ -108,11 +108,14 @@ defmodule Compare.Report do
   end
 
   defp label(%{"lib" => "cdp_ex", "setup" => "pool"}), do: "cdp_ex (pool)"
+  defp label(%{"lib" => "cdp_ex", "setup" => "reuse"}), do: "cdp_ex (reuse)"
   defp label(%{"lib" => lib}), do: lib
 
   @tasks ~w(screenshot pdf text click cold concurrent)
   defp task_order(t), do: Enum.find_index(@tasks, &(&1 == t)) || 99
-  defp lib_order(l), do: Enum.find_index(@libs ++ ["cdp_ex (pool)"], &(&1 == l)) || 99
+
+  defp lib_order(l),
+    do: Enum.find_index(["cdp_ex", "cdp_ex (reuse)", "cdp_ex (pool)" | tl(@libs)], &(&1 == l)) || 99
 
   defp med(rs, f) do
     case rs |> Enum.map(f) |> Enum.reject(&is_nil/1) |> Enum.sort() do

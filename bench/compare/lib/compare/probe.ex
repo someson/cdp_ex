@@ -190,7 +190,8 @@ defmodule Compare.Probe do
   @doc "Runs `fun`, counting `:telemetry` events whose name starts with `prefix`."
   def telemetry(prefix, fun) do
     parent = self()
-    :erlang.trace_pattern({:telemetry, :execute, 3}, true, [:global])
+    # :local too: :telemetry.span/3 calls execute/3 as a local call.
+    :erlang.trace_pattern({:telemetry, :execute, 3}, true, [:local])
     tracer = spawn(fn -> collect(parent, []) end)
     :erlang.trace(:all, true, [:call, {:tracer, tracer}])
 
@@ -198,7 +199,7 @@ defmodule Compare.Probe do
       _ = fun.()
     after
       :erlang.trace(:all, false, [:call])
-      :erlang.trace_pattern({:telemetry, :execute, 3}, false, [:global])
+      :erlang.trace_pattern({:telemetry, :execute, 3}, false, [:local])
     end
 
     send(tracer, {:done, self()})

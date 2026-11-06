@@ -6,6 +6,9 @@ defmodule Compare.CDPEx do
       and closes it, so each job gets a fresh context.
     * `"pool"`: `CDPEx.Pool` with one browser per worker and `Pool.with_page/3`, the
       library's documented way to run parallel jobs (a fresh context per job too).
+    * `"reuse"`: one browser and one page per worker, opened at start and
+      navigated by every job: what ChromicPDF's session pool and a Wallaby
+      session do, for a like-for-like row.
   """
   @behaviour Compare.Lib
 
@@ -42,14 +45,21 @@ defmodule Compare.CDPEx do
       "browser" ->
         {:ok, browser} = CDPEx.launch(launch)
         {:browser, browser}
+
+      "reuse" ->
+        {:ok, browser} = CDPEx.launch(launch)
+        pages = for _ <- 1..Keyword.get(opts, :parallel, 1), do: ok!(CDPEx.new_page(browser))
+        {:reuse, browser, List.to_tuple(pages)}
     end
   end
 
   @impl true
   def stop({:pool, pool}), do: CDPEx.Pool.stop(pool)
   def stop({:browser, browser}), do: CDPEx.stop(browser)
+  def stop({:reuse, browser, _}), do: CDPEx.stop(browser)
 
   defp with_page({:pool, pool}, fun), do: CDPEx.Pool.with_page(pool, fun)
+  defp with_page({:reuse, _, pages}, fun), do: fun.(elem(pages, Process.get(:worker, 0)))
 
   defp with_page({:browser, browser}, fun) do
     page = ok!(CDPEx.new_page(browser, isolated: true))
@@ -74,7 +84,9 @@ defmodule Compare.CDPEx do
   end
 
   @impl true
-  def screenshot(st, _w, url, ready) do
+  def screenshot(st, w, url, ready) do
+    Process.put(:worker, w)
+
     with_page(st, fn page ->
       open(page, url, ready)
       Page.screenshot(page)
@@ -83,7 +95,9 @@ defmodule Compare.CDPEx do
   end
 
   @impl true
-  def pdf(st, _w, url, ready) do
+  def pdf(st, w, url, ready) do
+    Process.put(:worker, w)
+
     with_page(st, fn page ->
       open(page, url, ready)
       Page.pdf(page)
@@ -92,7 +106,9 @@ defmodule Compare.CDPEx do
   end
 
   @impl true
-  def text(st, _w, url, ready, css) do
+  def text(st, w, url, ready, css) do
+    Process.put(:worker, w)
+
     with_page(st, fn page ->
       open(page, url, ready)
       Page.text(page, css)
@@ -101,7 +117,9 @@ defmodule Compare.CDPEx do
   end
 
   @impl true
-  def click(st, _w, url, ready, click, after_css) do
+  def click(st, w, url, ready, click, after_css) do
+    Process.put(:worker, w)
+
     with_page(st, fn page ->
       open(page, url, ready)
       :ok = Page.click(page, click)
@@ -293,7 +311,7 @@ defmodule Compare.CDPEx do
     end
   end
 
-  defp with_page_opts({:pool, _} = st, _opts, fun), do: with_page(st, fun)
+  defp with_page_opts(st, _opts, fun), do: with_page(st, fun)
 
   defp proxy_probe(fx) do
     Compare.Fixture.reset_log(fx)
