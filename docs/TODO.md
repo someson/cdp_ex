@@ -195,12 +195,9 @@ resume.
 playwright_ex 0.16, ChromicPDF 1.17 and Wallaby 0.31 by running code. What
 the others do and CDPEx doesn't, roughly by how often a scraper needs it:
 
-- **Click lands in a gap.** `Page.click/3` dispatches at the centre of the
-  element's bounding box without a hit test. On an inline `<a>` that wraps
-  block children the centre was empty space (the parent `div`), the click did
-  nothing, and `click/3` still returned `:ok`. WebDriver clicks the in-view
-  centre of the first client rect; Playwright checks the hit target. Found on
-  the `js` fixture before it got `display: block`.
+- ~~**Click lands in a gap.**~~ Done: a trusted click hits the in-view centre
+  of the first client rect whose point lands on the element, else
+  `{:error, {:obscured, label}}`.
 - **Inside an iframe.** No way to read or act inside a frame (Wallaby
   `focus_frame/2`, playwright_ex `internal:control=enter-frame`).
 - **Hover, file upload, JS dialogs, downloads.** All four are in playwright_ex,

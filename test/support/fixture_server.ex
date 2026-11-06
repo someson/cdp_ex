@@ -193,6 +193,9 @@ defmodule CDPEx.FixtureServer do
   # Clicks land in window.clicks as {id, tag, trusted}. #late-btn appears only when a test
   # calls armLate(ms), at the end of the page so it can't shift another target mid-click.
   # #wrapper is wider than its button, so its center hits the wrapper itself.
+  # #split-link wraps from the end of one line to the start of the next, so its bounding-box
+  # centre is on #split-wrap. #block-link is an inline <a> around blocks, whose client rects
+  # include the blocks' anonymous boxes. #cover sits on top of #covered-btn.
   defp interact_page(smooth?) do
     style = if smooth?, do: "<style>html { scroll-behavior: smooth; }</style>", else: ""
 
@@ -216,6 +219,9 @@ defmodule CDPEx.FixtureServer do
         <button id="icon-close"><svg width="16" height="16"><title>Close</title><rect width="16" height="16"></rect></svg></button>
         <a id="next-link" href="#"><span style="display:contents">Next</span></a>
         <svg width="80" height="20"><text id="svg-zoom" x="0" y="15">Zoom</text></svg>
+        <div id="split-wrap" style="width:300px;font:16px/20px monospace">xxxxxxxxxxxxxxxxxxxxxxxxxxxx <a id="split-link" href="#">ab cd</a></div>
+        <div id="block-wrap" style="width:600px"><a id="block-link" href="#"><div style="margin-bottom:40px">One</div><div>Two</div></a></div>
+        <div style="position:relative;width:200px"><button id="covered-btn">Covered</button><div id="cover" style="position:absolute;inset:0;background:#fff"></div></div>
         <div style="height:5000px"></div>
         <p id="footer">end</p>
         <div id="late-slot"></div>

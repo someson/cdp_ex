@@ -51,7 +51,7 @@ defmodule CDPEx.Page do
   @command_timeout 10_000
   @click_poll_interval 100
   @probe_timeout 2_000
-  @retryable_locate [:selector_not_found, :text_not_found, :not_clickable]
+  @retryable_locate [:selector_not_found, :text_not_found, :not_clickable, :obscured]
   # All -32000: a context that never existed (the script didn't run) vs one torn down mid-call.
   @context_not_found ["Cannot find context", "Cannot find default execution context"]
   @context_torn_down ["Execution context was destroyed", "Inspected target navigated or closed"]
@@ -1047,18 +1047,23 @@ defmodule CDPEx.Page do
   Clicks the first element matching `css` with a real, trusted mouse event.
 
   Scrolls the element into view, then dispatches `Input.dispatchMouseEvent`
-  `mousePressed`/`mouseReleased` at its center, so `event.isTrusted` is `true`.
+  `mousePressed`/`mouseReleased` at a point on it, so `event.isTrusted` is `true`.
 
-  The click is dispatched at the element's center but is **not** verified against
-  what is actually on top — if an overlay covers the center, the overlay receives
-  the event and the call still returns `:ok`. `{:error, {:not_clickable, css}}`
-  reflects the layout at call time; on pages that render or animate content in
-  late (an SPA that hydrates after load), pass `:wait` so the click retries until
-  the element is there and has a box.
+  The point is the centre of the in-view part of the element's first client rect
+  (one per line box, so a link that wraps onto a second line is clicked on its
+  text, not in the gap between its lines), checked with `elementFromPoint`: the
+  element there must be the target or one of its descendants. When it is
+  something else (a cookie banner, a modal backdrop, a sibling positioned on top,
+  or the page behind a `pointer-events: none` target) the next rect is tried, and
+  with none left the call returns `{:error, {:obscured, css}}` without clicking.
+  Both errors reflect the layout at call time; on pages that render or animate
+  content in late (an SPA that hydrates after load, an overlay that fades out),
+  pass `:wait` so the click retries until the element is there and on top.
 
   Options:
     * `:wait` — total milliseconds to keep retrying while the element is missing
-      (`:selector_not_found`), has no box yet (`:not_clickable`), or the lookup
+      (`:selector_not_found`), has no box yet (`:not_clickable`), is covered
+      (`:obscured`), or the lookup
       finds no execution context (a `{:cdp_error, _, _}` while the page is
       mid-navigation), waiting #{@click_poll_interval}ms between attempts; the last
       of those errors is returned once the budget is spent. Any other CDP error
@@ -1073,16 +1078,18 @@ defmodule CDPEx.Page do
       integer raises `ArgumentError`.
     * `:trusted` — `false` falls back to a synthetic JS `.click()` (no
       hit-testing, `event.isTrusted == false`); the escape hatch for elements not
-      at a clickable point. It clicks the element whatever its box, so it never
-      returns `:not_clickable` and `:wait` only waits for the element to exist.
+      at a clickable point. It clicks the element whatever its box and whatever
+      covers it, so it never returns `:not_clickable` or `:obscured`, and `:wait`
+      only waits for the element to exist.
       The lookup and the click are one script there, so `:wait` retries a CDP
       error only when the context was never found; one torn down mid-call may be
       the click's own navigation, and a retry would click twice. Default `true`.
     * `:timeout` — per-CDP-call timeout, default #{@evaluate_timeout}.
 
-  Returns `:ok`, `{:error, {:selector_not_found, css}}` when nothing matches, or
+  Returns `:ok`, `{:error, {:selector_not_found, css}}` when nothing matches,
   `{:error, {:not_clickable, css}}` when the element has no usable box (zero-size
-  or not visible even after scroll; trusted clicks only).
+  or not in the viewport even after scroll), or `{:error, {:obscured, css}}` when
+  another element is on top of every part of it in view (trusted clicks only).
   """
   @spec click(t(), String.t(), keyword()) :: :ok | {:error, term()}
   def click(%__MODULE__{} = page, css, opts \\ []) when is_binary(css) do
@@ -1123,14 +1130,18 @@ defmodule CDPEx.Page do
   `:wait` attempt).
 
   Clicks the same way as `click/3` — trusted by default, synthetic with
-  `trusted: false`, with the same overlay caveat. A synthetic click picks the same
-  element but clicks it whatever its box, so it never reports `:not_clickable`.
+  `trusted: false`, with the same hit test. A synthetic click picks the same
+  element but clicks it whatever its box and whatever covers it, so it never
+  reports `:not_clickable` or `:obscured`. The choice among matches looks at
+  visibility, not at what covers them: a visible match under an overlay is still
+  chosen, and the trusted click reports `:obscured`.
 
   Options:
     * `:selector` — CSS selector (a string) the candidates must match; any other
       value raises `ArgumentError`. Default: any element.
-    * `:wait` — as in `click/3`, retrying while nothing matches, no match has a
-      box yet (trusted clicks only), or the lookup finds no execution context.
+    * `:wait` — as in `click/3`, retrying while nothing matches, the match has no
+      box yet or is covered (trusted clicks only), or the lookup finds no
+      execution context.
       Default `0`; an invalid value raises `ArgumentError`.
     * `:trusted` — as in `click/3`. Default `true`.
     * `:timeout` — per-CDP-call timeout, default #{@evaluate_timeout}.
@@ -1139,7 +1150,8 @@ defmodule CDPEx.Page do
   would match any element with no text.
 
   Returns `:ok`, `{:error, {:text_not_found, text}}` when no candidate matches,
-  `{:error, {:not_clickable, text}}` when the match has no usable box, or
+  `{:error, {:not_clickable, text}}` when the match has no usable box,
+  `{:error, {:obscured, text}}` when another element covers it, or
   `{:error, {:evaluate_exception, _}}` for an invalid `:selector`.
   """
   @spec click_text(t(), String.t(), keyword()) :: :ok | {:error, term()}
@@ -1400,9 +1412,24 @@ defmodule CDPEx.Page do
       if (!el) { return {found: false}; }
       if (el.scrollIntoViewIfNeeded) { el.scrollIntoViewIfNeeded(); }
       else { el.scrollIntoView({block: "center", inline: "center"}); }
-      var r = el.getBoundingClientRect();
-      if (r.width === 0 || r.height === 0) { return {found: true, clickable: false}; }
-      return {found: true, clickable: true, x: r.left + r.width / 2, y: r.top + r.height / 2};
+      var root = el.getRootNode();
+      var probe = typeof root.elementFromPoint === "function" ? root : document;
+      var owns = function (hit) {
+        for (var n = hit; n; n = n.parentNode || n.host) { if (n === el) { return true; } }
+        return false;
+      };
+      var rects = el.getClientRects();
+      var inView = false;
+      for (var i = 0; i < rects.length; i++) {
+        var r = rects[i];
+        var left = Math.max(r.left, 0), right = Math.min(r.right, window.innerWidth);
+        var top = Math.max(r.top, 0), bottom = Math.min(r.bottom, window.innerHeight);
+        if (right <= left || bottom <= top) { continue; }
+        inView = true;
+        var x = (left + right) / 2, y = (top + bottom) / 2;
+        if (owns(probe.elementFromPoint(x, y))) { return {found: true, clickable: true, x: x, y: y}; }
+      }
+      return {found: true, clickable: false, obscured: inView};
     })()
     """
 
@@ -1411,6 +1438,9 @@ defmodule CDPEx.Page do
     case evaluate(page, js, opts) do
       {:ok, %{"found" => false}} ->
         {:locate, not_found}
+
+      {:ok, %{"clickable" => false, "obscured" => true}} ->
+        {:locate, {:obscured, label}}
 
       {:ok, %{"clickable" => false}} ->
         {:locate, {:not_clickable, label}}

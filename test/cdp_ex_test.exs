@@ -57,6 +57,7 @@ defmodule CDPExTest do
       {:selector_not_found, ".missing"},
       {:text_not_found, "Load more"},
       {:not_clickable, ".hidden"},
+      {:obscured, "#under-banner"},
       {:unknown_key, "F13"},
       {:evaluate_exception, %{"text" => "ReferenceError"}},
       {:unserializable_value, "NaN"},

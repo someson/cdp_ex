@@ -143,6 +143,7 @@ defmodule CDPEx do
           | {:selector_not_found, String.t()}
           | {:text_not_found, String.t()}
           | {:not_clickable, String.t()}
+          | {:obscured, String.t()}
           | {:unknown_key, String.t()}
           | {:evaluate_exception, term()}
           | {:unserializable_value, String.t()}
@@ -248,6 +249,7 @@ defmodule CDPEx do
   def classify_error({:selector_not_found, _}), do: :terminal
   def classify_error({:text_not_found, _}), do: :terminal
   def classify_error({:not_clickable, _}), do: :terminal
+  def classify_error({:obscured, _}), do: :terminal
   def classify_error({:unknown_key, _}), do: :terminal
   def classify_error({:evaluate_exception, _}), do: :terminal
   def classify_error({:unserializable_value, _}), do: :terminal

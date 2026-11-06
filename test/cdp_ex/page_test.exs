@@ -444,6 +444,20 @@ defmodule CDPEx.PageTest do
       assert :ok = Task.await(task, 2_000)
     end
 
+    test "retries while another element covers the target, then gives up with :obscured", %{
+      page: page,
+      fake: fake
+    } do
+      task = Task.async(fn -> Page.click(page, "#under-banner", wait: 300) end)
+
+      {result, attempts} =
+        answer_until_done(task, fake, %{"found" => true, "clickable" => false, "obscured" => true})
+
+      assert result == {:error, {:obscured, "#under-banner"}}
+      assert attempts > 1
+      refute_received {:fake_cdp_recv, ^fake, %{"method" => "Input.dispatchMouseEvent"}}
+    end
+
     test "returns the last retryable error once the budget is spent", %{page: page, fake: fake} do
       task = Task.async(fn -> Page.click(page, "#hidden", wait: 300) end)
 
