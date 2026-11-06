@@ -207,7 +207,7 @@ defmodule CDPEx.WithPageDeadlineTest do
       assert tid == "T2"
       assert Process.alive?(browser)
       assert :sys.get_state(browser).open == %{}
-      assert :sys.get_state(pool).count == 1
+      assert map_size(:sys.get_state(pool).loads) == 1
     end
 
     test "is decided by the clock, not by when the watchdog gets to run", %{browser: browser} do

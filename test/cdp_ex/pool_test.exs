@@ -46,12 +46,12 @@ defmodule CDPEx.PoolTest do
     {:ok, b1} = Pool.checkout(pool)
     {:ok, b2} = Pool.checkout(pool)
     assert b1 != b2
-    assert :sys.get_state(pool).count == 2
+    assert browser_count(pool) == 2
 
     :ok = Pool.checkin(pool, b1)
     # Reuses the freed browser instead of launching a third.
     assert {:ok, ^b1} = Pool.checkout(pool)
-    assert :sys.get_state(pool).count == 2
+    assert browser_count(pool) == 2
   end
 
   test "checkout blocks when the pool is exhausted and is served on checkin" do
@@ -145,8 +145,8 @@ defmodule CDPEx.PoolTest do
       end)
 
     assert log =~ "checkin"
-    assert %{busy: %{^b1 => {owner, _ref}}} = :sys.get_state(pool)
-    assert owner == self()
+    me = self()
+    assert [{^b1, ^me}] = Map.values(:sys.get_state(pool).holders)
 
     # The holder can still check it in.
     :ok = Pool.checkin(pool, b1)
@@ -159,7 +159,7 @@ defmodule CDPEx.PoolTest do
     :ok = Pool.checkin(pool, b1)
 
     Process.exit(b1, :kill)
-    assert eventually(fn -> :sys.get_state(pool).count == 0 end)
+    assert eventually(fn -> browser_count(pool) == 0 end)
 
     assert {:ok, b2} = Pool.checkout(pool, 1_000)
     assert b2 != b1
@@ -283,7 +283,7 @@ defmodule CDPEx.PoolTest do
       end
 
     assert length(Enum.uniq(browsers)) == 3
-    assert :sys.get_state(pool).count == 3
+    assert browser_count(pool) == 3
 
     Enum.each(holders, &send(&1, :release))
   end
@@ -322,7 +322,7 @@ defmodule CDPEx.PoolTest do
     # leaked, and a later checkout reuses it (count stays 1, no second launch).
     send(launcher, :proceed)
     assert {:ok, _b} = Pool.checkout(pool, 1_000)
-    assert :sys.get_state(pool).count == 1
+    assert browser_count(pool) == 1
   end
 
   test "a launch that fails after its waiter timed out is handled without crashing" do
@@ -423,6 +423,170 @@ defmodule CDPEx.PoolTest do
       assert opts[:isolated] == false
     end
   end
+
+  describe "pages_per_browser" do
+    test "an invalid value raises in the caller" do
+      for bad <- [0, -1, 1.5, :many, nil] do
+        assert_raise ArgumentError, ~r/invalid :pages_per_browser/, fn ->
+          Pool.start_link(pages_per_browser: bad, start_fun: &FakeBrowser.start_link/1)
+        end
+      end
+    end
+
+    test "fills a warm browser's slots before launching another" do
+      pool = start_pool(size: 2, pages_per_browser: 2)
+
+      {:ok, b1} = Pool.checkout(pool)
+      assert {:ok, ^b1} = Pool.checkout(pool)
+      assert browser_count(pool) == 1
+
+      {:ok, b2} = Pool.checkout(pool)
+      assert b2 != b1
+      assert {:ok, ^b2} = Pool.checkout(pool)
+      assert browser_count(pool) == 2
+
+      assert {:error, :timeout} = Pool.checkout(pool, 50)
+    end
+
+    test "hands out the least-loaded browser" do
+      pool = start_pool(size: 2, pages_per_browser: 2)
+      {:ok, b1} = Pool.checkout(pool)
+      {:ok, ^b1} = Pool.checkout(pool)
+      {:ok, b2} = Pool.checkout(pool)
+      {:ok, ^b2} = Pool.checkout(pool)
+
+      :ok = Pool.checkin(pool, b2)
+      :ok = Pool.checkin(pool, b1)
+      :ok = Pool.checkin(pool, b1)
+
+      # b1 is idle, b2 still has a holder.
+      assert {:ok, ^b1} = Pool.checkout(pool)
+      assert :sys.get_state(pool).loads == %{b1 => 1, b2 => 1}
+    end
+
+    test "a checkin frees one slot of the caller's" do
+      pool = start_pool(size: 1, pages_per_browser: 2)
+      {:ok, b1} = Pool.checkout(pool)
+      {:ok, ^b1} = Pool.checkout(pool)
+
+      :ok = Pool.checkin(pool, b1)
+      assert {:ok, ^b1} = Pool.checkout(pool, 0)
+      assert {:error, :timeout} = Pool.checkout(pool, 0)
+    end
+
+    test "an owner that dies frees every slot it held" do
+      pool = start_pool(size: 1, pages_per_browser: 3)
+      test = self()
+
+      {owner, _ref} =
+        spawn_monitor(fn ->
+          {:ok, b} = Pool.checkout(pool)
+          {:ok, ^b} = Pool.checkout(pool)
+          send(test, {:checked_out, b})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:checked_out, b1}, 1_000
+      {:ok, ^b1} = Pool.checkout(pool)
+      assert {:error, :timeout} = Pool.checkout(pool, 0)
+
+      Process.exit(owner, :kill)
+      assert {:ok, ^b1} = Pool.checkout(pool, 1_000)
+      assert {:ok, ^b1} = Pool.checkout(pool, 1_000)
+      assert {:error, :timeout} = Pool.checkout(pool, 0)
+    end
+
+    test "a browser that dies drops all its holders" do
+      pool = start_pool(size: 1, pages_per_browser: 2)
+      {:ok, b1} = Pool.checkout(pool)
+      {:ok, ^b1} = Pool.checkout(pool)
+
+      Process.exit(b1, :kill)
+      assert eventually(fn -> browser_count(pool) == 0 end)
+      assert :sys.get_state(pool).holders == %{}
+
+      assert {:ok, b2} = Pool.checkout(pool, 1_000)
+      assert b2 != b1
+      assert {:ok, ^b2} = Pool.checkout(pool, 0)
+    end
+
+    test "one launch covers pages_per_browser waiters" do
+      test = self()
+
+      parked_start = fn opts ->
+        send(test, {:launching, self()})
+        receive do: (:proceed -> :ok)
+        FakeBrowser.start_link(opts)
+      end
+
+      pool = start_pool(size: 2, pages_per_browser: 2, start_fun: parked_start)
+
+      waiter = fn ->
+        spawn(fn ->
+          send(test, {:got, Pool.checkout(pool, 3_000)})
+          receive do: (:release -> :ok), after: (5_000 -> :ok)
+        end)
+      end
+
+      w1 = waiter.()
+      w2 = waiter.()
+      assert_receive {:launching, l1}, 1_000
+      refute_receive {:launching, _}, 100
+
+      w3 = waiter.()
+      assert_receive {:launching, l2}, 1_000
+
+      send(l1, :proceed)
+      send(l2, :proceed)
+
+      browsers =
+        for _ <- 1..3 do
+          assert_receive {:got, {:ok, b}}, 2_000
+          b
+        end
+
+      assert length(Enum.uniq(browsers)) == 2
+      Enum.each([w1, w2, w3], &send(&1, :release))
+    end
+
+    test "a failed launch fails a waiter only when the others can't cover the queue" do
+      test = self()
+
+      controlled = fn opts ->
+        send(test, {:launch, self()})
+
+        receive do
+          :proceed_ok -> FakeBrowser.start_link(opts)
+          {:proceed_error, reason} -> {:error, reason}
+        end
+      end
+
+      pool = start_pool(size: 2, pages_per_browser: 2, start_fun: controlled)
+
+      waiter = fn tag ->
+        spawn(fn ->
+          send(test, {tag, Pool.checkout(pool, 3_000)})
+          receive do: (:release -> :ok), after: (5_000 -> :ok)
+        end)
+      end
+
+      # Three waiters: two launches in flight, covering up to four.
+      ws = for tag <- [:w1, :w2, :w3], do: waiter.(tag)
+      assert_receive {:launch, la}, 1_000
+      assert_receive {:launch, lb}, 1_000
+
+      # One launch fails: the survivor covers two of the three, so one waiter fails.
+      send(la, {:proceed_error, :boom})
+      assert_receive {:w1, {:error, :boom}}, 1_000
+
+      send(lb, :proceed_ok)
+      assert_receive {:w2, {:ok, b}}, 2_000
+      assert_receive {:w3, {:ok, ^b}}, 2_000
+      Enum.each(ws, &send(&1, :release))
+    end
+  end
+
+  defp browser_count(pool), do: map_size(:sys.get_state(pool).loads)
 
   defp start_pool(opts) do
     {:ok, pool} =
