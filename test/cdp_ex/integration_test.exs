@@ -1797,6 +1797,78 @@ defmodule CDPEx.IntegrationTest do
       refute served("/pixel.png")
     end
 
+    for launch_opts <- [[], [pipe: true]] do
+      test "observe_console reaches nested cross-site iframes (#{inspect(launch_opts)})" do
+        {:ok, %{port: port}} = FixtureServer.start()
+        {:ok, browser} = CDPEx.launch([extra_args: @sites] ++ unquote(launch_opts))
+        on_exit(fn -> stop_quietly(browser) end)
+
+        {:ok, page} = CDPEx.new_page(browser)
+        assert :ok = Page.observe_console(page)
+
+        inner = frame_url("b.test", port, "http://c.test:#{port}/console")
+        assert {:ok, _} = Page.navigate(page, frame_url("a.test", port, inner), wait_until: :load)
+
+        assert_receive {:cdp_event, _, "Runtime.consoleAPICalled",
+                        %{"args" => [%{"value" => "console:c.test"}]}, sid},
+                       5_000
+
+        assert is_binary(sid) and sid != page.session_id
+
+        assert_receive {:cdp_event, _, "Runtime.exceptionThrown", %{"exceptionDetails" => d}, ^sid},
+                       5_000
+
+        assert d["exception"]["description"] =~ "boom:c.test"
+
+        assert :ok = Page.stop_observing_console(page)
+        assert {:ok, _} = Page.navigate(page, frame_url("a.test", port, inner), wait_until: :load)
+        {:ok, frame} = Page.frame(page, "iframe", wait: 5_000)
+        {:ok, inner_frame} = Page.frame(frame, "iframe", wait: 5_000)
+        assert {:ok, "Console"} = Page.text(inner_frame, "#greeting")
+        refute_received {:cdp_event, _, "Runtime.consoleAPICalled", _, _}
+      end
+    end
+
+    test "observe_console and block: share a cross-site iframe" do
+      {:ok, %{port: port}} = FixtureServer.start(report: self())
+      {:ok, browser} = CDPEx.launch(extra_args: @sites)
+      on_exit(fn -> stop_quietly(browser) end)
+
+      {:ok, page} = CDPEx.new_page(browser, block: [:image])
+      assert :ok = Page.observe_console(page)
+
+      # Blocking goes off; the console observer keeps the iframes attached.
+      assert :ok = Page.block_resources(page, [])
+
+      top = frame_url("a.test", port, "http://b.test:#{port}/console")
+      assert {:ok, _} = Page.navigate(page, top, wait_until: :load)
+
+      assert_receive {:cdp_event, _, "Runtime.consoleAPICalled",
+                      %{"args" => [%{"value" => "console:b.test"}]}, _},
+                     5_000
+
+      assert :ok = Page.block_resources(page, [:image])
+      top = frame_url("a.test", port, "http://b.test:#{port}/with-assets")
+      assert {:ok, _} = Page.navigate(page, top, wait_until: :load)
+      assert eventually(fn -> served("/style.css") end)
+      refute served("/pixel.png")
+    end
+
+    test "a console observer that dies leaves new cross-site iframes loading" do
+      {:ok, %{port: port}} = FixtureServer.start()
+      {:ok, browser} = CDPEx.launch(extra_args: @sites)
+      on_exit(fn -> stop_quietly(browser) end)
+
+      {:ok, page} = CDPEx.new_page(browser)
+      task = Task.async(fn -> Page.observe_console(page) end)
+      assert :ok = Task.await(task)
+
+      top = frame_url("a.test", port, "http://b.test:#{port}/console")
+      assert {:ok, _} = Page.navigate(page, top, wait_until: :load)
+      {:ok, frame} = Page.frame(page, "iframe", wait: 5_000)
+      assert {:ok, "Console"} = Page.text(frame, "#greeting")
+    end
+
     test "with blocking off again, a new cross-site iframe loads unfiltered" do
       {:ok, %{port: port}} = FixtureServer.start(report: self())
       {:ok, browser} = CDPEx.launch(extra_args: @sites)

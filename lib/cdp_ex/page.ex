@@ -2010,34 +2010,37 @@ defmodule CDPEx.Page do
 
   @doc """
   Starts observing the page's console, delivering `console.*` calls and uncaught
-  exceptions to the calling process.
+  exceptions to the calling process — the page's own and its iframes', cross-site
+  (out-of-process) ones included.
 
   Subscribes the caller to `:events`, by default `Runtime.consoleAPICalled` (params
   carry `"type"` such as `"log"` or `"error"`, the `"args"` as `Runtime.RemoteObject`s
   and a `"stackTrace"`) and `Runtime.exceptionThrown` (params carry
   `"exceptionDetails"`). Each event arrives as
   `{:cdp_event, conn, method, params, session_id}` — handle them in a `handle_info`.
-  Call `stop_observing_console/2` to unsubscribe. The `Runtime` domain is enabled
-  when the page opens, so this sends nothing to Chrome.
+  Call `stop_observing_console/2` to unsubscribe.
 
   Start observing **before** navigating: messages logged before the call are not
-  delivered. The page's same-process iframes log into the same session, told apart
-  by `"executionContextId"`; a cross-site (out-of-process) iframe's console is not
-  delivered. Delivery is scoped to this page's session, as with `observe_network/2`.
+  delivered. Same-process iframes log into the page's session, told apart by
+  `"executionContextId"`. A cross-site iframe's events carry its own session id: the
+  page's `CDPEx.Fetch` process auto-attaches each such iframe and enables `Runtime`
+  there before it runs. On a `:session` page it passes the iframe's events on, so they
+  can arrive out of order with the page's own; only the two methods above come from
+  those iframes. Delivery is scoped to this page, as with `observe_network/2`.
 
   Options:
     * `:events` — `Runtime.*` method names (default the two above)
-    * `:timeout` — ms for each subscription (default 10_000)
+    * `:timeout` — ms for the subscriptions and the iframe setup (default 10_000)
   """
   @spec observe_console(t(), keyword()) :: :ok | {:error, term()}
   def observe_console(%__MODULE__{frame: nil} = page, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
     methods = Keyword.get(opts, :events, @console_events)
 
-    case subscribe_each(page.conn, methods, timeout, page.session_id) do
-      :ok ->
-        :ok
-
+    with :ok <- subscribe_each(page.conn, methods, timeout, page.session_id),
+         :ok <- Browser.observe_console(page.browser, page, methods, timeout) do
+      :ok
+    else
       {:error, _} = error ->
         unsubscribe_each(page.conn, methods, page.session_id)
         error
@@ -2045,12 +2048,14 @@ defmodule CDPEx.Page do
   end
 
   @doc """
-  Stops observing the console — unsubscribes the caller from the console `:events`.
-  Pass the **same** `:events` you gave `observe_console/2`.
+  Stops observing the console — unsubscribes the caller from the console `:events`, the
+  iframes' included. Pass the **same** `:events` you gave `observe_console/2`.
   """
   @spec stop_observing_console(t(), keyword()) :: :ok
   def stop_observing_console(%__MODULE__{frame: nil} = page, opts \\ []) do
     unsubscribe_each(page.conn, Keyword.get(opts, :events, @console_events), page.session_id)
+    _ = Browser.unobserve_console(page.browser, page, @command_timeout)
+    :ok
   end
 
   @doc """
