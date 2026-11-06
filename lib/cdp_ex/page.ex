@@ -24,6 +24,7 @@ defmodule CDPEx.Page do
     * **Emulation** — `set_viewport/4`, `set_user_agent/3`
     * **Cookies & headers** — `cookies/2`, `set_cookies/3`, `clear_cookies/2`, `set_extra_headers/3`
     * **Network** — `observe_network/2`, `stop_observing_network/2`, `response_body/3`
+    * **Console** — `observe_console/2`, `stop_observing_console/2`
     * **Interception** — `enable_request_interception/2`, `disable_request_interception/2`, `continue_request/3`, `fulfill_request/3`, `fail_request/3`
     * **Auth** — `authenticate/4` (proxy / HTTP Basic challenges)
   """
@@ -88,6 +89,7 @@ defmodule CDPEx.Page do
   @loading_finished "Network.loadingFinished"
   @loading_failed "Network.loadingFailed"
   @network_events [@request_will_be_sent, @response_received]
+  @console_events ["Runtime.consoleAPICalled", "Runtime.exceptionThrown"]
   # In-flight accounting for wait_for_network_idle/2: requestWillBeSent (+1),
   # loadingFinished / loadingFailed (−1). responseReceived is deliberately excluded.
   @idle_events [@request_will_be_sent, @loading_finished, @loading_failed]
@@ -2004,6 +2006,51 @@ defmodule CDPEx.Page do
   @spec stop_observing_network(t(), keyword()) :: :ok
   def stop_observing_network(%__MODULE__{frame: nil} = page, opts \\ []) do
     unsubscribe_each(page.conn, Keyword.get(opts, :events, @network_events), page.session_id)
+  end
+
+  @doc """
+  Starts observing the page's console, delivering `console.*` calls and uncaught
+  exceptions to the calling process.
+
+  Subscribes the caller to `:events`, by default `Runtime.consoleAPICalled` (params
+  carry `"type"` such as `"log"` or `"error"`, the `"args"` as `Runtime.RemoteObject`s
+  and a `"stackTrace"`) and `Runtime.exceptionThrown` (params carry
+  `"exceptionDetails"`). Each event arrives as
+  `{:cdp_event, conn, method, params, session_id}` — handle them in a `handle_info`.
+  Call `stop_observing_console/2` to unsubscribe. The `Runtime` domain is enabled
+  when the page opens, so this sends nothing to Chrome.
+
+  Start observing **before** navigating: messages logged before the call are not
+  delivered. The page's same-process iframes log into the same session, told apart
+  by `"executionContextId"`; a cross-site (out-of-process) iframe's console is not
+  delivered. Delivery is scoped to this page's session, as with `observe_network/2`.
+
+  Options:
+    * `:events` — `Runtime.*` method names (default the two above)
+    * `:timeout` — ms for each subscription (default 10_000)
+  """
+  @spec observe_console(t(), keyword()) :: :ok | {:error, term()}
+  def observe_console(%__MODULE__{frame: nil} = page, opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, @command_timeout)
+    methods = Keyword.get(opts, :events, @console_events)
+
+    case subscribe_each(page.conn, methods, timeout, page.session_id) do
+      :ok ->
+        :ok
+
+      {:error, _} = error ->
+        unsubscribe_each(page.conn, methods, page.session_id)
+        error
+    end
+  end
+
+  @doc """
+  Stops observing the console — unsubscribes the caller from the console `:events`.
+  Pass the **same** `:events` you gave `observe_console/2`.
+  """
+  @spec stop_observing_console(t(), keyword()) :: :ok
+  def stop_observing_console(%__MODULE__{frame: nil} = page, opts \\ []) do
+    unsubscribe_each(page.conn, Keyword.get(opts, :events, @console_events), page.session_id)
   end
 
   @doc """
