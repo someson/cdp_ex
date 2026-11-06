@@ -159,3 +159,15 @@ found"); the docs tell the caller to retry. ReqBot's capture retries 3 times,
 500 ms apart. Add `body: true` to `wait_for_response/3`: wait for this
 request's `loadingFinished` (or `loadingFailed`) and return the body with the
 response. Estimate: 2–3 hours.
+
+## 13. Cross-site iframes are outside the page's `Fetch` domain
+
+Chrome runs a cross-site iframe as its own `iframe` target. `CDPEx.Fetch` drives
+only the page target's `Fetch` domain, so `block:`, request interception and
+`authenticate/4` don't see that iframe's requests: checked with an image in a
+`localhost` iframe on a `127.0.0.1` page (Google Chrome 156, macOS), which reached
+the server with `block: [:image]`. The integration test "a cross-site iframe's
+requests are not blocked (known gap)" pins it. A fix would auto-attach to child
+targets (`Target.setAutoAttach` with `flatten: true` on the page session) and run
+the same Fetch modes on each iframe session. Unchecked: whether a credentialed
+`:proxy` still answers a 407 for such an iframe's requests.

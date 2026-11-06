@@ -2061,6 +2061,9 @@ defmodule CDPEx.Page do
   owner, even when its patterns match it. Without login on the page, only the
   blocked types are paused, so the other requests cost nothing extra.
 
+  Only the page's own frames are covered: a cross-site iframe runs as a separate
+  target in Chrome, and its requests are not blocked (nor intercepted).
+
   Unblocking doesn't reload what was already blocked, and navigating the page to the
   same document again may reuse Chrome's in-memory result for it without a request.
 

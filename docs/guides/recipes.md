@@ -13,8 +13,8 @@ before that process stops resolving, or the page's next request hangs.
 
 It combines with `authenticate/4` and a credentialed `:proxy`: the library answers the
 login and lets through the requests outside `:patterns`, so the loop below still sees
-only the ones it asked for. To block images behind an authenticated proxy, pass
-`patterns: [%{"resourceType" => "Image"}]` and fail every pause.
+only the ones it asked for. To drop whole resource types (images, fonts), use
+`block:` instead (see "Use a proxy" below); no loop is needed.
 
 ```elixir
 defmodule ImageBlocker do
@@ -125,6 +125,8 @@ rest, so no process of yours has to handle them:
 `CDPEx.Page.block_resources/3` changes the list on an open page. For a rule by URL
 rather than by type, use `enable_request_interception/2` from a process that
 resolves each pause, since the caller is busy in `navigate/3` while they arrive.
+Requests from a cross-site iframe are not blocked: Chrome runs it as a separate
+target (see `docs/TODO.md` item 13).
 
 ## Keep jobs apart on a shared browser
 

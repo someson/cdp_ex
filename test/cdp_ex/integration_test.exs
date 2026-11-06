@@ -1604,6 +1604,27 @@ defmodule CDPEx.IntegrationTest do
       refute served("/pixel.png")
     end
 
+    # Known gap (docs/TODO.md item 13): a cross-site iframe is its own target, and only
+    # the page target's Fetch domain is driven. Flip these assertions once iframes are
+    # auto-attached.
+    test "a cross-site iframe's requests are not blocked (known gap)" do
+      {:ok, %{port: port}} = FixtureServer.start(report: self())
+      {:ok, browser} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(browser) end)
+
+      {:ok, page} = CDPEx.new_page(browser, block: [:image])
+      {:ok, _} = Page.navigate(page, "http://127.0.0.1:#{port}/")
+      inner = Jason.encode!("http://localhost:#{port}/with-assets")
+
+      {:ok, _} =
+        Page.evaluate(
+          page,
+          "const f = document.createElement('iframe'); f.src = #{inner}; document.body.appendChild(f); 1"
+        )
+
+      assert eventually(fn -> served("/pixel.png") end)
+    end
+
     test "Chrome doesn't pause a WebSocket handshake (why :websocket is rejected)", %{
       fixture: fixture
     } do
