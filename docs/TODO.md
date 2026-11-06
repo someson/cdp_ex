@@ -94,7 +94,6 @@ the click in a line gap, iframes, hover, file upload, JS dialogs, console
 messages, downloads (#42) and the lost first click into a just-loaded
 cross-site iframe (#43). Still open, roughly by how often a scraper needs it:
 
-- **Timezone, clock, tracing.** playwright_ex only (ChromicPDF: timezone).
 - **PDF extras.** Header/footer templates, PDF from an HTML string, PDF/A:
   ChromicPDF only.
 - **Firefox / WebKit.** playwright_ex (Playwright's builds); Wallaby Firefox only
