@@ -14,6 +14,7 @@ defmodule CDPEx.FetchTest do
     "flatten" => true,
     "filter" => [%{"type" => "iframe"}]
   }
+  @console ["Runtime.consoleAPICalled", "Runtime.exceptionThrown"]
 
   defp creds, do: fn -> {"u", "p"} end
   defp auth, do: %{credentials: creds(), source: :any}
@@ -839,8 +840,173 @@ defmodule CDPEx.FetchTest do
     end
   end
 
-  defp start_owner(conn) do
-    {:ok, pid} = Fetch.start_link(conn: conn, browser: self())
+  describe "iframe console on FakeCDP" do
+    setup do
+      {:ok, server} = FakeCDP.start()
+      {:ok, conn} = Connection.start_link(server.url)
+      assert_receive {:fake_cdp_connected, fake}, 2_000
+
+      on_exit(fn ->
+        try do
+          if Process.alive?(conn), do: Connection.close(conn)
+        catch
+          :exit, _ -> :ok
+        end
+      end)
+
+      %{conn: conn, fake: fake}
+    end
+
+    test "observing turns on iframe auto-attach with no Fetch mode", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      tag = make_ref()
+      Fetch.request(pid, tag, {:observe_console, self(), @console, 5_000})
+
+      assert expect_strict(fake, "Target.setAutoAttach", nil) == @auto_attach
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+      refute_received {:fake_cdp_recv, ^fake, %{"method" => "Fetch.enable"}}
+    end
+
+    test "a second observer sends nothing to Chrome", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      observe(pid, fake, self())
+
+      tag = make_ref()
+      Fetch.request(pid, tag, {:observe_console, relay_owner(), @console, 5_000})
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+      refute_received {:fake_cdp_recv, ^fake, _}
+    end
+
+    test "an attached iframe gets Runtime, auto-attach and a resume, but no Fetch", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+      observe(pid, fake, self())
+
+      attach(fake, "C1")
+      expect_console_armed(fake, "C1")
+      refute_received {:fake_cdp_recv, ^fake, %{"method" => "Fetch.enable"}}
+    end
+
+    test "a :session owner passes an iframe's console events to every observer it asked for",
+         %{conn: conn, fake: fake} do
+      pid = start_owner(conn, "S")
+      other = relay_owner()
+      observe(pid, fake, self())
+      observe(pid, fake, other, ["Runtime.exceptionThrown"])
+      attach(fake, "C1", "S")
+      expect_console_armed(fake, "C1")
+
+      event(fake, "Runtime.consoleAPICalled", %{"type" => "log"}, "C1")
+      event(fake, "Runtime.exceptionThrown", %{"exceptionDetails" => %{}}, "C1")
+
+      assert_receive {:cdp_event, ^conn, "Runtime.consoleAPICalled", %{"type" => "log"}, "C1"},
+                     2_000
+
+      assert_receive {:cdp_event, ^conn, "Runtime.exceptionThrown", _, "C1"}, 2_000
+      assert_receive {:owner_got, {:cdp_event, ^conn, "Runtime.exceptionThrown", _, "C1"}}, 2_000
+      refute_receive {:owner_got, {:cdp_event, _, "Runtime.consoleAPICalled", _, _}}, 200
+    end
+
+    test "a :session owner doesn't pass on the page's own console events", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn, "S")
+      observe(pid, fake, self())
+
+      event(fake, "Runtime.consoleAPICalled", %{"type" => "log"}, "S")
+      refute_receive {:cdp_event, _, "Runtime.consoleAPICalled", _, _}, 200
+    end
+
+    test "a :dedicated owner passes nothing on: the observer gets it from the connection", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+      observer = relay_owner()
+      observe(pid, fake, observer)
+      attach(fake, "C1")
+      expect_console_armed(fake, "C1")
+
+      event(fake, "Runtime.consoleAPICalled", %{"type" => "log"}, "C1")
+      refute_receive {:owner_got, _}, 200
+    end
+
+    test "iframes attached under a Fetch mode get Runtime when observing starts", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+      arm(pid, fake, {:block, ["Image"], 5_000})
+      attach(fake, "C1")
+      expect_iframe_armed(fake, "C1")
+
+      tag = make_ref()
+      Fetch.request(pid, tag, {:observe_console, self(), @console, 5_000})
+      expect_call_on(fake, "Runtime.enable", "C1")
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+    end
+
+    test "with an observer, the last Fetch mode off keeps auto-attach on", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+      arm(pid, fake, {:block, ["Image"], 5_000})
+      observe(pid, fake, self())
+
+      tag = make_ref()
+      Fetch.request(pid, tag, {:block, [], 5_000})
+      expect_strict(fake, "Fetch.disable", nil)
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+
+      attach(fake, "C1")
+      expect_console_armed(fake, "C1")
+    end
+
+    test "the last observer gone with no Fetch mode turns auto-attach off", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+      observe(pid, fake, self())
+
+      Fetch.request(pid, make_ref(), {:unobserve_console, self()})
+      assert expect_strict(fake, "Target.setAutoAttach", nil)["autoAttach"] == false
+    end
+
+    test "an observer that dies is dropped, and auto-attach goes off", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      observer = relay_owner()
+      observe(pid, fake, observer)
+
+      Process.exit(observer, :kill)
+      assert expect_strict(fake, "Target.setAutoAttach", nil)["autoAttach"] == false
+      assert Process.alive?(pid)
+    end
+
+    test "unobserving keeps auto-attach on while a Fetch mode needs it", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      arm(pid, fake, {:block, ["Image"], 5_000})
+      observe(pid, fake, self())
+
+      Fetch.request(pid, make_ref(), {:unobserve_console, self()})
+      refute_receive {:fake_cdp_recv, ^fake, %{"method" => "Target.setAutoAttach"}}, 200
+    end
+
+    test "terminate turns auto-attach off with observers left", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      observe(pid, fake, self())
+
+      GenServer.stop(pid)
+      assert expect_strict(fake, "Target.setAutoAttach", nil)["autoAttach"] == false
+    end
+  end
+
+  defp start_owner(conn, session_id \\ nil) do
+    {:ok, pid} = Fetch.start_link(conn: conn, browser: self(), session_id: session_id)
     pid
   end
 
@@ -925,6 +1091,44 @@ defmodule CDPEx.FetchTest do
     assert expect_call_on(fake, "Target.setAutoAttach", child) == @auto_attach
     expect_call_on(fake, "Runtime.runIfWaitingForDebugger", child)
     params
+  end
+
+  # Observe the console from `observer`; answers the auto-attach it turns on.
+  defp observe(pid, fake, observer, methods \\ @console) do
+    tag = make_ref()
+    Fetch.request(pid, tag, {:observe_console, observer, methods, 5_000})
+
+    receive do
+      {:fake_cdp_recv, ^fake, %{"id" => id, "method" => "Target.setAutoAttach"}} ->
+        answer(fake, id, :ok)
+    after
+      200 -> :ok
+    end
+
+    assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+  end
+
+  # The owner's answer to an iframe attach with console observers and no Fetch mode.
+  defp expect_console_armed(fake, child) do
+    expect_call_on(fake, "Runtime.enable", child)
+    assert expect_call_on(fake, "Target.setAutoAttach", child) == @auto_attach
+    expect_call_on(fake, "Runtime.runIfWaitingForDebugger", child)
+  end
+
+  # Like expect_call_on/3, but answers no Target.setAutoAttach on the way, so a test can
+  # check one never came.
+  defp expect_strict(fake, method, sid) do
+    receive do
+      {:fake_cdp_recv, ^fake, %{"id" => id, "method" => ^method} = frame} ->
+        assert frame["sessionId"] == sid
+        answer(fake, id, :ok)
+        frame["params"] || %{}
+
+      {:fake_cdp_recv, ^fake, other} ->
+        flunk("expected #{method}, got #{inspect(other)}")
+    after
+      2_000 -> flunk("no #{method} call")
+    end
   end
 
   defp pause_on(fake, sid, id, url, type) do

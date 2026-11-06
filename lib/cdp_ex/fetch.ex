@@ -32,6 +32,15 @@ defmodule CDPEx.Fetch do
   there; interception covers the page's own frames only, so an iframe's other pauses
   are continued. With every mode off, auto-attach is turned off again.
 
+  The owner also carries the console of those iframes for `CDPEx.Page.observe_console/2`.
+  While a process observes, auto-attach stays on even with every mode off: each iframe
+  gets `Runtime.enable` on its own session before it is resumed, and its
+  `Runtime.consoleAPICalled` / `Runtime.exceptionThrown` events reach every observer as
+  the original event tuple, carrying the iframe's session id (passed on by the owner on
+  a `:session` page; on a `:dedicated` page the observer's unfiltered subscription gets
+  them from the connection). An observer
+  that dies is dropped; with no observer and no mode left, auto-attach is turned off.
+
   This is an internal building block; use the `CDPEx.Page` functions.
   """
 
@@ -49,6 +58,8 @@ defmodule CDPEx.Fetch do
   # (or of its parent iframe), paused until resumed, so its Fetch domain is armed
   # before its first request.
   @target_events ["Target.attachedToTarget", "Target.detachedFromTarget"]
+  @console_events ["Runtime.consoleAPICalled", "Runtime.exceptionThrown"]
+  @child_events @events ++ @target_events ++ @console_events
   @auto_attach %{
     "autoAttach" => true,
     "waitForDebuggerOnStart" => true,
@@ -67,6 +78,8 @@ defmodule CDPEx.Fetch do
     intercept: nil,
     # nil | [CDP resource type string], deduplicated
     block: nil,
+    # Console observers of the page's iframes: monitor ref => {pid, methods}.
+    console: %{},
     subscribed: false,
     # Target.setAutoAttach is on for the page's session.
     auto_attach: false,
@@ -90,6 +103,8 @@ defmodule CDPEx.Fetch do
           | {:intercept, pid(), [map()], timeout()}
           | {:release_intercept, timeout()}
           | {:block, [String.t()], timeout()}
+          | {:observe_console, pid(), [String.t()], timeout()}
+          | {:unobserve_console, pid()}
 
   @doc false
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -194,6 +209,24 @@ defmodule CDPEx.Fetch do
     {:noreply, %{state | attempts: attempts}}
   end
 
+  # An iframe's console on a :session page: every observer gets the event as it came,
+  # with the iframe's session id. A :dedicated page's observers subscribed with no
+  # session filter on the page's own connection, so they get the iframes' events from
+  # it directly and nothing is passed on.
+  def handle_info({:cdp_event, conn, method, _params, sid} = event, %__MODULE__{conn: conn} = state)
+      when method in @console_events and is_map_key(state.children, sid) and
+             is_binary(state.session_id) do
+    for {_ref, {pid, methods}} <- state.console, method in methods, do: send(pid, event)
+    {:noreply, state}
+  end
+
+  # A console observer died without unobserving. Keyed by the monitor ref: the same
+  # process may also be the interception owner, with a monitor of its own.
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, state)
+      when is_map_key(state.console, ref) do
+    {:noreply, drop_observer(state, ref)}
+  end
+
   # A cross-site iframe attached under the page or one of its iframes.
   def handle_info(
         {:cdp_event, conn, "Target.attachedToTarget", %{"sessionId" => child} = params, parent},
@@ -243,7 +276,7 @@ defmodule CDPEx.Fetch do
         %__MODULE__{conn: conn} = state
       )
       when is_map_key(state.children, child) do
-    Enum.each(@events ++ @target_events, &Connection.unsubscribe(conn, &1, session_id: child))
+    Enum.each(@child_events, &Connection.unsubscribe(conn, &1, session_id: child))
     {:noreply, %{state | children: Map.delete(state.children, child)}}
   end
 
@@ -255,7 +288,14 @@ defmodule CDPEx.Fetch do
   def terminate(_reason, state) do
     # Best-effort: the connection may already be gone (Connection.call and
     # safe_unsubscribe both tolerate that), leaving nothing to disable.
-    _ = if not state.detached and any_mode?(state), do: disable_all(state, @call_timeout)
+    # Auto-attach goes off too, observers or not: nobody would resume a new iframe.
+    _ =
+      cond do
+        state.detached -> :ok
+        any_mode?(state) -> disable_all(%{state | console: %{}}, @call_timeout)
+        state.auto_attach -> stop_auto_attach(state, @call_timeout)
+        true -> :ok
+      end
 
     _ = if state.subscribed, do: safe_unsubscribe(state)
     :ok
@@ -304,6 +344,28 @@ defmodule CDPEx.Fetch do
     rearm(state, %{state | block: block}, timeout)
   end
 
+  # Subscribe to the page's attaches, give the iframes already attached their console,
+  # then make sure new ones attach. A failed auto-attach is logged, not returned: the
+  # page's own console still works. A second call from the same process replaces its
+  # methods.
+  defp apply_request({:observe_console, pid, methods, timeout}, _tag, state) do
+    case observer_ref(state, pid) do
+      nil -> add_observer(state, pid, methods, timeout)
+      ref -> {:ok, %{state | console: Map.put(state.console, ref, {pid, methods})}}
+    end
+  end
+
+  defp apply_request({:unobserve_console, pid}, _tag, state) do
+    case observer_ref(state, pid) do
+      nil ->
+        {:ok, state}
+
+      ref ->
+        Process.demonitor(ref, [:flush])
+        {:ok, drop_observer(state, ref)}
+    end
+  end
+
   defp apply_request({:release_intercept, _timeout}, _tag, %__MODULE__{intercept: nil} = state),
     do: {:ok, state}
 
@@ -346,23 +408,58 @@ defmodule CDPEx.Fetch do
   defp disable(%__MODULE__{auth: nil, intercept: nil, block: nil}, next, _timeout), do: {:ok, next}
 
   defp disable(_prev, next, timeout) do
-    case disable_all(next, timeout) do
-      {:ok, _} -> {:ok, %{next | auto_attach: false}}
-      {:error, reason} -> {{:error, reason}, %{next | auto_attach: false}}
+    result = disable_all(next, timeout)
+    next = if next.console == %{}, do: %{next | auto_attach: false}, else: next
+
+    case result do
+      {:ok, _} -> {:ok, next}
+      {:error, reason} -> {{:error, reason}, next}
     end
   end
 
   # Every iframe first (turning auto-attach off may detach them), then the page: stop
-  # pausing new iframes, and release the page's Fetch domain.
+  # pausing new iframes, unless a console observer still needs them, and release the
+  # page's Fetch domain.
   defp disable_all(state, timeout) do
     Enum.each(Map.keys(state.children), &call_on(state, &1, "Fetch.disable", %{}, timeout))
-
-    _ =
-      if state.auto_attach,
-        do: call(state, "Target.setAutoAttach", %{@auto_attach | "autoAttach" => false}, timeout)
-
+    _ = if state.auto_attach and state.console == %{}, do: stop_auto_attach(state, timeout)
     call(state, "Fetch.disable", %{}, timeout)
   end
+
+  defp stop_auto_attach(state, timeout),
+    do: call(state, "Target.setAutoAttach", %{@auto_attach | "autoAttach" => false}, timeout)
+
+  # The last observer gone with every mode off: new iframes need not attach any more.
+  defp drop_observer(state, ref) do
+    state = %{state | console: Map.delete(state.console, ref)}
+
+    if state.console == %{} and state.auto_attach and params_of(state) == nil do
+      _ = stop_auto_attach(state, @call_timeout)
+      %{state | auto_attach: false}
+    else
+      state
+    end
+  end
+
+  defp add_observer(state, pid, methods, timeout) do
+    case ensure_subscribed(state, timeout) do
+      {:ok, state} ->
+        if state.console == %{},
+          do: Enum.each(Map.keys(state.children), &enable_runtime(state, &1))
+
+        state = %{state | console: Map.put(state.console, Process.monitor(pid), {pid, methods})}
+        {:ok, ensure_auto_attach(state, timeout)}
+
+      {:error, reason} ->
+        arm_failed(reason, state)
+    end
+  end
+
+  defp observer_ref(state, pid),
+    do: Enum.find_value(state.console, fn {ref, {owner, _}} -> if owner == pid, do: ref end)
+
+  # Auto-attach is needed while a mode filters requests or a process observes the console.
+  defp attaching?(state), do: params_of(state) != nil or state.console != %{}
 
   defp enable(prev, next, params, timeout) do
     case ensure_subscribed(next, timeout) do
@@ -393,14 +490,14 @@ defmodule CDPEx.Fetch do
   defp ensure_subscribed(%__MODULE__{subscribed: true} = state, _timeout), do: {:ok, state}
 
   defp ensure_subscribed(state, timeout) do
-    case subscribe_session(state, state.session_id, timeout) do
+    case subscribe_session(state, state.session_id, @events ++ @target_events, timeout) do
       :ok -> {:ok, %{state | subscribed: true}}
       {:error, _} = error -> error
     end
   end
 
-  defp subscribe_session(state, sid, timeout) do
-    Enum.reduce_while(@events ++ @target_events, :ok, fn method, :ok ->
+  defp subscribe_session(state, sid, methods, timeout) do
+    Enum.reduce_while(methods, :ok, fn method, :ok ->
       case Connection.subscribe(state.conn, method, timeout, session_id: sid) do
         :ok -> {:cont, :ok}
         {:error, _} = error -> {:halt, error}
@@ -425,24 +522,23 @@ defmodule CDPEx.Fetch do
     end
   end
 
-  # A new iframe session: subscribe it, filter it with the page's current modes, let it
-  # auto-attach its own iframes, then resume it. The resume runs whatever failed before
-  # it, so an iframe is never left paused (it then loads unfiltered: logged).
+  # A new iframe session: subscribe it, filter it with the page's current modes, turn
+  # on its console for the observers, let it auto-attach its own iframes, then resume
+  # it. The resume runs whatever failed before it, so an iframe is never left paused (it
+  # then loads unfiltered: logged).
   defp arm_child(state, child, params) do
     state =
-      case subscribe_session(state, child, @call_timeout) do
+      case subscribe_session(state, child, @child_events, @call_timeout) do
         :ok -> %{state | children: Map.put(state.children, child, true)}
         {:error, reason} -> child_failed(state, child, reason)
       end
 
     _ =
-      case is_map_key(state.children, child) && params_of(state) do
-        enable when is_map(enable) ->
-          _ = enable_child(state, child, enable)
-          _ = call_on(state, child, "Target.setAutoAttach", @auto_attach)
-
-        _off ->
-          :ok
+      if is_map_key(state.children, child) and attaching?(state) do
+        enable = params_of(state)
+        _ = if enable, do: enable_child(state, child, enable)
+        _ = if state.console != %{}, do: enable_runtime(state, child)
+        _ = call_on(state, child, "Target.setAutoAttach", @auto_attach)
       end
 
     _ =
@@ -456,6 +552,20 @@ defmodule CDPEx.Fetch do
     case call_on(state, child, "Fetch.enable", params) do
       {:ok, _} -> :ok
       {:error, reason} -> child_failed(state, child, reason)
+    end
+  end
+
+  defp enable_runtime(state, child) do
+    case call_on(state, child, "Runtime.enable", %{}) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        if not benign?(reason) do
+          Logger.warning(
+            "[CDPEx.Fetch] Runtime.enable on iframe session #{child} failed: #{inspect(reason)}; its console is not observed"
+          )
+        end
     end
   end
 
@@ -669,7 +779,7 @@ defmodule CDPEx.Fetch do
   end
 
   defp safe_unsubscribe(state) do
-    for method <- @events ++ @target_events do
+    for method <- @child_events do
       Connection.unsubscribe(state.conn, method)
     end
   end

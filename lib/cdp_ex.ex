@@ -108,7 +108,7 @@ defmodule CDPEx do
   `{:timeout, context}` (a CDP method, `:await_event`, `:subscribe`, `:new_page`,
   `:close_page`, `:authenticate`, `:enable_request_interception`,
   `:disable_request_interception`, `:block_resources`, `:set_dialogs`,
-  `:frame_context` or `:frame`), while the high-level `CDPEx.Page` `wait_for_*` functions and `CDPEx.Pool.checkout/2`
+  `:frame_context`, `:frame` or `:observe_console`), while the high-level `CDPEx.Page` `wait_for_*` functions and `CDPEx.Pool.checkout/2`
   return a bare `:timeout` ("the awaited condition didn't happen in time").
 
   A WebSocket frame that fails to decode is not a standalone reason: the connection
@@ -136,7 +136,8 @@ defmodule CDPEx do
              | :subscribe
              | :set_dialogs
              | :frame_context
-             | :frame}
+             | :frame
+             | :observe_console}
           | {:navigate, String.t()}
           | {:loading_failed, String.t()}
           | {:no_document_response, String.t()}
