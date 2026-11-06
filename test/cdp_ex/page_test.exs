@@ -745,6 +745,38 @@ defmodule CDPEx.PageTest do
     end
   end
 
+  describe "frame/3" do
+    test "reports a missing element and one that is no frame", %{page: page, fake: fake} do
+      for {answer, expected} <- [
+            {"not_found", {:selector_not_found, "#f"}},
+            {"not_frame", {:not_a_frame, "#f"}}
+          ] do
+        task = Task.async(fn -> Page.frame(page, "#f") end)
+        reply_evaluate(fake, answer)
+
+        assert_receive {:fake_cdp_recv, ^fake,
+                        %{"id" => id, "method" => "Runtime.releaseObjectGroup"}},
+                       2_000
+
+        FakeCDP.send_text(fake, ~s({"id":#{id},"result":{}}))
+        assert {:error, ^expected} = Task.await(task, 2_000)
+      end
+    end
+
+    test "an invalid :wait raises", %{page: page} do
+      assert_raise ArgumentError, ~r/invalid :wait/, fn -> Page.frame(page, "#f", wait: -1) end
+    end
+
+    test "page-level functions refuse a frame handle", %{page: page} do
+      frame = %{page | frame: %{id: "F", label: "#f", parent: page, owner: 1}}
+
+      assert_raise FunctionClauseError, fn -> apply(Page, :navigate, [frame, "about:blank"]) end
+      assert_raise FunctionClauseError, fn -> apply(Page, :screenshot, [frame]) end
+      assert_raise FunctionClauseError, fn -> apply(Page, :set_dialogs, [frame, :dismiss]) end
+      assert_raise FunctionClauseError, fn -> apply(CDPEx, :close_page, [page.browser, frame]) end
+    end
+  end
+
   describe "click_text/3" do
     test "JSON-encodes the text and selector into the locator", %{page: page, fake: fake} do
       task =

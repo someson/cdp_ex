@@ -1074,6 +1074,63 @@ defmodule CDPEx.ConnectionTest do
     end
   end
 
+  describe "frame_context/4" do
+    defp context_event(fake, method, params, session_id \\ nil) do
+      event = %{"method" => method, "params" => params}
+      event = if session_id, do: Map.put(event, "sessionId", session_id), else: event
+      FakeCDP.send_text(fake, Jason.encode!(event))
+    end
+
+    defp created(fake, id, frame_id, default?, session_id \\ nil) do
+      context = %{"id" => id, "auxData" => %{"frameId" => frame_id, "isDefault" => default?}}
+      context_event(fake, "Runtime.executionContextCreated", %{"context" => context}, session_id)
+    end
+
+    # Events and calls go through the one connection process, in order, so a call made
+    # after the events were sent sees them once a later subscribed event has arrived.
+    defp sync(conn, fake) do
+      :ok = Connection.subscribe(conn, "Test.sync")
+      FakeCDP.send_text(fake, ~s({"method":"Test.sync","params":{}}))
+      assert_receive {:cdp_event, ^conn, "Test.sync", _, _}, 2_000
+    end
+
+    test "tracks each frame's main world per session", %{conn: conn, fake: fake} do
+      created(fake, 1, "F1", true)
+      created(fake, 2, "F1", false)
+      created(fake, 3, "F2", true, "S1")
+      sync(conn, fake)
+
+      assert {:ok, 1} = Connection.frame_context(conn, nil, "F1")
+      assert :error = Connection.frame_context(conn, nil, "F2")
+      assert {:ok, 3} = Connection.frame_context(conn, "S1", "F2")
+    end
+
+    test "forgets a destroyed context, a cleared session and a detached one", %{
+      conn: conn,
+      fake: fake
+    } do
+      created(fake, 1, "F1", true)
+      created(fake, 2, "F2", true)
+      created(fake, 5, "F5", true, "S1")
+      context_event(fake, "Runtime.executionContextDestroyed", %{"executionContextId" => 1})
+      sync(conn, fake)
+      assert :error = Connection.frame_context(conn, nil, "F1")
+      assert {:ok, 2} = Connection.frame_context(conn, nil, "F2")
+
+      # A navigation replaces the frame's context.
+      created(fake, 7, "F2", true)
+      context_event(fake, "Runtime.executionContextDestroyed", %{"executionContextId" => 2})
+      sync(conn, fake)
+      assert {:ok, 7} = Connection.frame_context(conn, nil, "F2")
+
+      context_event(fake, "Runtime.executionContextsCleared", %{})
+      context_event(fake, "Target.detachedFromTarget", %{"sessionId" => "S1"})
+      sync(conn, fake)
+      assert :error = Connection.frame_context(conn, nil, "F2")
+      assert :error = Connection.frame_context(conn, "S1", "F5")
+    end
+  end
+
   describe "format_status/1" do
     test "hides a Fetch.continueWithAuth call's params, keeps any other call's" do
       from = {self(), make_ref()}

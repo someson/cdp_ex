@@ -1944,6 +1944,139 @@ defmodule CDPEx.IntegrationTest do
     end
   end
 
+  describe "frames" do
+    # a.test and b.test resolve to the fixture server (as in "resource blocking"): an
+    # a.test page with an a.test iframe keeps it in process, with a b.test one Chrome
+    # runs the frame as its own target.
+    @frame_sites ["--host-resolver-rules=MAP *.test 127.0.0.1"]
+
+    defp frame_page(port, outer, inner, path, route \\ "frame") do
+      "http://#{outer}:#{port}/#{route}?src=" <>
+        URI.encode_www_form("http://#{inner}:#{port}#{path}")
+    end
+
+    defp open_framed(launch_opts, url) do
+      {:ok, browser} = CDPEx.launch([extra_args: @frame_sites] ++ launch_opts)
+      on_exit(fn -> stop_quietly(browser) end)
+      {:ok, page} = CDPEx.new_page(browser)
+      {:ok, _} = Page.navigate(page, url, wait_until: :load)
+      page
+    end
+
+    for {kind, inner_host, launch_opts} <- [
+          {"same-site", "a.test", []},
+          {"cross-site", "b.test", []},
+          {"cross-site, pipe", "b.test", [pipe: true]}
+        ] do
+      test "#{kind}: reads, clicks, hovers and uploads inside the frame" do
+        {:ok, %{port: port}} = FixtureServer.start()
+        url = frame_page(port, "a.test", unquote(inner_host), "/interact")
+        page = open_framed(unquote(launch_opts), url)
+
+        assert {:ok, frame} = Page.frame(page, "iframe", wait: 5_000)
+        assert {:ok, "/interact"} = Page.evaluate(frame, "location.pathname")
+        assert {:ok, "end"} = Page.text(frame, "#footer")
+        assert {:ok, "Frame"} = Page.text(page, "#greeting")
+
+        # Chrome drops input to an out-of-process frame until it has painted.
+        assert eventually(fn ->
+                 :ok = Page.hover(frame, "#hover-trigger")
+                 match?({:ok, [_ | _]}, Page.evaluate(frame, "window.hovers"))
+               end)
+
+        assert :ok = Page.click(frame, "#subscribe-btn")
+        assert :ok = Page.click(frame, "#footer")
+        assert :ok = Page.click_text(frame, "Load more")
+
+        assert {:ok,
+                [
+                  %{"id" => "subscribe-btn", "trusted" => true},
+                  %{"id" => "footer", "trusted" => true},
+                  %{"id" => "inner", "trusted" => true}
+                ]} = Page.evaluate(frame, "window.clicks")
+
+        path = Path.join(System.tmp_dir!(), "cdp_ex_frame_#{System.unique_integer([:positive])}")
+        File.write!(path, "in a frame")
+        on_exit(fn -> File.rm(path) end)
+        assert :ok = Page.set_input_files(frame, "#upload-one", path)
+
+        assert {:ok, ["upload-one input 1", "upload-one change 1"]} =
+                 Page.evaluate(frame, "window.uploads")
+      end
+
+      test "#{kind}: types and presses keys inside the frame" do
+        {:ok, %{port: port}} = FixtureServer.start()
+
+        page =
+          open_framed(unquote(launch_opts), frame_page(port, "a.test", unquote(inner_host), "/"))
+
+        {:ok, frame} = Page.frame(page, "iframe", wait: 5_000)
+
+        assert :ok = Page.type(frame, "#name", "inside")
+        assert {:ok, "inside"} = Page.text(frame, "#typed")
+        assert :ok = Page.type(frame, "#search", "q")
+        assert :ok = Page.press(frame, "#search", "Enter")
+        assert {:ok, "submitted"} = Page.text(frame, "#greeting")
+        assert {:ok, "Frame"} = Page.text(page, "#greeting")
+      end
+
+      test "#{kind}: a covered frame reports :obscured" do
+        {:ok, %{port: port}} = FixtureServer.start()
+        covered = frame_page(port, "a.test", unquote(inner_host), "/interact", "covered-frame")
+        page = open_framed(unquote(launch_opts), covered)
+        {:ok, frame} = Page.frame(page, "iframe", wait: 5_000)
+        assert {:error, {:obscured, "#subscribe-btn"}} = Page.click(frame, "#subscribe-btn")
+        assert {:ok, []} = Page.evaluate(frame, "window.clicks")
+      end
+
+      test "#{kind}: a frame nested in the frame" do
+        {:ok, %{port: port}} = FixtureServer.start()
+        innermost = "/frame?src=" <> URI.encode_www_form("http://a.test:#{port}/interact")
+
+        page =
+          open_framed(
+            unquote(launch_opts),
+            frame_page(port, "a.test", unquote(inner_host), innermost)
+          )
+
+        {:ok, outer} = Page.frame(page, "iframe", wait: 5_000)
+        assert {:ok, inner} = Page.frame(outer, "iframe", wait: 5_000)
+        assert {:ok, "end"} = Page.text(inner, "#footer")
+
+        assert eventually(fn ->
+                 :ok = Page.click(inner, "#subscribe-btn")
+                 match?({:ok, [_ | _]}, Page.evaluate(inner, "window.clicks"))
+               end)
+
+        assert {:ok, [%{"id" => "subscribe-btn", "trusted" => true} | _]} =
+                 Page.evaluate(inner, "window.clicks")
+      end
+    end
+
+    test "errors, page-only functions, and a same-site frame that navigates" do
+      {:ok, %{port: port}} = FixtureServer.start()
+      page = open_framed([], frame_page(port, "a.test", "a.test", "/"))
+
+      assert {:error, {:selector_not_found, "#nope"}} = Page.frame(page, "#nope")
+      assert {:error, {:not_a_frame, "h1"}} = Page.frame(page, "h1")
+      {:ok, frame} = Page.frame(page, "iframe", wait: 5_000)
+      assert_raise FunctionClauseError, fn -> apply(Page, :screenshot, [frame]) end
+      assert_raise FunctionClauseError, fn -> apply(Page, :navigate, [frame, "about:blank"]) end
+
+      assert {:ok, _} = Page.evaluate(frame, "location.href = '/interact'; 1")
+      assert eventually(fn -> Page.evaluate(frame, "location.pathname") == {:ok, "/interact"} end)
+      assert {:ok, "end"} = Page.text(frame, "#footer")
+
+      # To another site: Chrome moves the frame into its own process, the handle follows.
+      cross = "http://b.test:#{port}/"
+      assert {:ok, _} = Page.evaluate(frame, "location.href = #{Jason.encode!(cross)}; 1")
+      assert eventually(fn -> Page.evaluate(frame, "location.href") == {:ok, cross} end, 250)
+      assert {:ok, "Hello"} = Page.text(frame, "#greeting")
+      assert :ok = Page.type(frame, "#name", "moved")
+      assert {:ok, "moved"} = Page.text(frame, "#typed")
+    end
+  end
+
   describe "request interception" do
     test "fulfill_request serves a synthetic response for an intercepted navigation", %{
       fixture: fixture

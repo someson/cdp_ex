@@ -107,7 +107,8 @@ defmodule CDPEx do
   `await_event/4` and `subscribe/4` and the `CDPEx.Browser` requests return
   `{:timeout, context}` (a CDP method, `:await_event`, `:subscribe`, `:new_page`,
   `:close_page`, `:authenticate`, `:enable_request_interception`,
-  `:disable_request_interception` or `:block_resources`), while the high-level `CDPEx.Page` `wait_for_*` functions and `CDPEx.Pool.checkout/2`
+  `:disable_request_interception`, `:block_resources`, `:set_dialogs`,
+  `:frame_context` or `:frame`), while the high-level `CDPEx.Page` `wait_for_*` functions and `CDPEx.Pool.checkout/2`
   return a bare `:timeout` ("the awaited condition didn't happen in time").
 
   A WebSocket frame that fails to decode is not a standalone reason: the connection
@@ -132,7 +133,10 @@ defmodule CDPEx do
              | :enable_request_interception
              | :disable_request_interception
              | :block_resources
-             | :subscribe}
+             | :subscribe
+             | :set_dialogs
+             | :frame_context
+             | :frame}
           | {:navigate, String.t()}
           | {:loading_failed, String.t()}
           | {:no_document_response, String.t()}
@@ -144,6 +148,8 @@ defmodule CDPEx do
           | {:text_not_found, String.t()}
           | {:not_clickable, String.t()}
           | {:obscured, String.t()}
+          | {:not_a_frame, String.t()}
+          | {:frame_unavailable, String.t()}
           | {:not_file_input, String.t()}
           | {:file_not_found, String.t()}
           | {:unknown_key, String.t()}
@@ -246,12 +252,14 @@ defmodule CDPEx do
   def classify_error({:capture_failed, _}), do: :transient
   def classify_error({:idle_wait_failed, _}), do: :transient
   def classify_error({:launch_crashed, _}), do: :transient
+  def classify_error({:frame_unavailable, _}), do: :transient
   # Terminal — deterministic; retrying the same call yields the same error.
   def classify_error({:chrome_not_found, _}), do: :terminal
   def classify_error({:selector_not_found, _}), do: :terminal
   def classify_error({:text_not_found, _}), do: :terminal
   def classify_error({:not_clickable, _}), do: :terminal
   def classify_error({:obscured, _}), do: :terminal
+  def classify_error({:not_a_frame, _}), do: :terminal
   def classify_error({:not_file_input, _}), do: :terminal
   def classify_error({:file_not_found, _}), do: :terminal
   def classify_error({:unknown_key, _}), do: :terminal

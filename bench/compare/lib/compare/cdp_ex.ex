@@ -292,9 +292,12 @@ defmodule Compare.CDPEx do
           ok!(Page.text(page, "#hover"))
         end),
       console: fn -> {:unsupported, @raw <> " (Runtime.consoleAPICalled)"} end,
-      iframe_content: fn ->
-        {:unsupported, "Page functions run in the main frame only; no frame selection"}
-      end,
+      iframe_content:
+        probe.(fn page ->
+          open(page, url, :load)
+          {:ok, frame} = Page.frame(page, "#embed", wait: 10_000)
+          ok!(Page.text(frame, "#inside"))
+        end),
       timezone: fn -> {:unsupported, @raw <> " (Emulation.setTimezoneOverride)"} end,
       clock: fn -> {:unsupported, "no clock control"} end,
       tracing: fn -> {:unsupported, "no tracing API"} end,

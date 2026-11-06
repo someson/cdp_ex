@@ -93,14 +93,24 @@ defmodule CDPEx.Page do
   @idle_events [@request_will_be_sent, @loading_finished, @loading_failed]
 
   @enforce_keys [:browser, :conn, :target_id]
-  defstruct [:browser, :conn, :target_id, :session_id]
+  defstruct [:browser, :conn, :target_id, :session_id, :frame]
 
+  @typedoc """
+  A page handle, or a frame handle from `frame/3` (`frame` set). A frame handle's
+  other fields are its page's; where the frame's script runs is looked up on each
+  call.
+  """
   @type t :: %__MODULE__{
           browser: pid(),
           conn: pid(),
           target_id: String.t(),
-          session_id: String.t() | nil
+          session_id: String.t() | nil,
+          frame: frame() | nil
         }
+
+  # id: the frame's id (an out-of-process frame's target id too); label: the css
+  # that found it, for errors; owner: the backendNodeId of its <iframe> in `parent`.
+  @typep frame :: %{id: String.t(), label: String.t(), parent: t(), owner: integer()}
 
   @doc """
   Navigates to `url` and (by default) waits until the network is almost idle.
@@ -160,7 +170,7 @@ defmodule CDPEx.Page do
                request_id: String.t() | nil
              }}
           | {:error, term()}
-  def navigate(%__MODULE__{} = page, url, opts \\ []) do
+  def navigate(%__MODULE__{frame: nil} = page, url, opts \\ []) do
     Telemetry.span(:navigate, %{url: url}, fn ->
       result = do_navigate(page, url, opts)
       {result, navigate_metadata(url, result)}
@@ -695,7 +705,7 @@ defmodule CDPEx.Page do
   at once rather than at `:timeout`.
   """
   @spec wait_for_navigation(t(), keyword()) :: :ok | {:error, term()}
-  def wait_for_navigation(%__MODULE__{} = page, opts \\ []) do
+  def wait_for_navigation(%__MODULE__{frame: nil} = page, opts \\ []) do
     case Keyword.get(opts, :wait_until, :network_almost_idle) do
       :none -> :ok
       wait_until -> await_navigation(page, wait_until, opts)
@@ -757,7 +767,7 @@ defmodule CDPEx.Page do
       An unknown value returns `{:error, {:invalid_source, value}}`.
   """
   @spec authenticate(t(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
-  def authenticate(%__MODULE__{} = page, username, password, opts \\ [])
+  def authenticate(%__MODULE__{frame: nil} = page, username, password, opts \\ [])
       when is_binary(username) and is_binary(password) do
     case validate_source(Keyword.get(opts, :source, :any)) do
       :ok ->
@@ -803,9 +813,10 @@ defmodule CDPEx.Page do
       "awaitPromise" => Keyword.get(opts, :await_promise, false)
     }
 
-    case do_call(page, "Runtime.evaluate", params, timeout) do
-      {:ok, result} -> Protocol.evaluate_result(result)
-      {:error, _} = error -> error
+    with {:ok, route, context_id} <- route(page, timeout),
+         params = put_context(params, "contextId", context_id),
+         {:ok, result} <- do_call(route, "Runtime.evaluate", params, timeout) do
+      Protocol.evaluate_result(result)
     end
   end
 
@@ -1253,7 +1264,7 @@ defmodule CDPEx.Page do
 
     case focus(page, css, opts) do
       :ok ->
-        case do_call(page, "Input.insertText", %{"text" => text}, timeout) do
+        case do_call(top(page), "Input.insertText", %{"text" => text}, timeout) do
           {:ok, _} -> :ok
           {:error, _} = error -> error
         end
@@ -1319,12 +1330,25 @@ defmodule CDPEx.Page do
     })()
     """
 
-    params = %{"expression" => js, "objectGroup" => @files_object_group}
+    with {:ok, route, context_id} <- route(page, timeout) do
+      params =
+        put_context(
+          %{"expression" => js, "objectGroup" => @files_object_group},
+          "contextId",
+          context_id
+        )
 
-    case do_call(page, "Runtime.evaluate", params, timeout) do
+      route
+      |> do_call("Runtime.evaluate", params, timeout)
+      |> files_result(route, css, files, timeout)
+    end
+  end
+
+  defp files_result(result, route, css, files, timeout) do
+    case result do
       {:ok, %{"result" => %{"objectId" => object_id}} = result}
       when not is_map_key(result, "exceptionDetails") ->
-        set_files(page, object_id, files, timeout)
+        set_files(route, object_id, files, timeout)
 
       {:ok, %{"result" => %{"value" => "cleared"}}} ->
         :ok
@@ -1372,6 +1396,155 @@ defmodule CDPEx.Page do
   end
 
   @doc """
+  Returns a handle for the frame of the first `<iframe>` (or `<frame>`) matching
+  `css`, for reading and acting inside it: the functions that work on an element or
+  run script take the handle in place of the page and apply to the frame's
+  document. Same-site and cross-site (out-of-process) frames alike; pass a frame
+  handle as `page` to reach a frame nested in it.
+
+  Inside a frame, `evaluate/3`, `call_function/4`, `html/2`, `text/3`,
+  `attribute/4`, `wait_for_selector/3`, `wait_for_function/3`, `scroll/3`,
+  `set_input_files/4` and the synthetic clicks run in the frame's main world, as on
+  a page. `click/3`, `click_text/3` and `hover/3` dispatch trusted mouse events on
+  the page, at the element's point shifted by each enclosing `<iframe>`: every
+  `<iframe>` on the way is scrolled into view and must be what its parent has at
+  that point, else `{:error, {:obscured, label}}`. `type/4` and `press/4` focus the
+  element in the frame and send the keys to the page, which routes them there.
+  The functions that act on the whole page (navigation and its waits, screenshots,
+  PDF, cookies, network observation and interception, emulation, dialogs, login)
+  take a page only: a frame handle raises `FunctionClauseError` there.
+
+  The handle names the frame, not its document: where its script runs is looked up
+  on every call, so it keeps working after the frame navigates, to another site
+  (another process) included. While the new document has no context yet, and once
+  the frame is removed, calls return `{:error, {:frame_unavailable, css}}`. Handles
+  need no closing; a cross-site frame's session on the browser connection is reused
+  for the same frame and ends with it or with the page.
+
+  Returns `{:ok, frame}`, `{:error, {:selector_not_found, css}}`,
+  `{:error, {:not_a_frame, css}}` when the element is no `<iframe>` or `<frame>`,
+  `{:error, {:frame_unavailable, css}}` when the frame has no document to run
+  script in yet (still loading), or a CDP error.
+
+  Options:
+    * `:wait` — milliseconds to keep retrying while the `<iframe>` is missing or its
+      frame unavailable, #{@click_poll_interval}ms apart. Default `0`; anything but a
+      non-negative integer raises `ArgumentError`.
+    * `:timeout` — per-CDP-call timeout, default #{@evaluate_timeout}.
+  """
+  @spec frame(t(), String.t(), keyword()) :: {:ok, t()} | {:error, term()}
+  def frame(%__MODULE__{} = page, css, opts \\ []) when is_binary(css) do
+    timeout = Keyword.get(opts, :timeout, @evaluate_timeout)
+    attempt = fn -> find_frame(page, css, timeout) end
+
+    case Keyword.get(opts, :wait, 0) do
+      0 ->
+        attempt.()
+
+      wait when is_integer(wait) and wait > 0 ->
+        retry_frame(attempt, System.monotonic_time(:millisecond) + wait)
+
+      other ->
+        raise ArgumentError, "invalid :wait #{inspect(other)} (expected a non-negative integer)"
+    end
+  end
+
+  defp retry_frame(attempt, deadline) do
+    case attempt.() do
+      {:error, {tag, _}} = error when tag in [:selector_not_found, :frame_unavailable] ->
+        if remaining(deadline) > 0 do
+          Process.sleep(min(@click_poll_interval, remaining(deadline)))
+          retry_frame(attempt, deadline)
+        else
+          error
+        end
+
+      result ->
+        result
+    end
+  end
+
+  defp find_frame(page, css, timeout) do
+    js = """
+    (function () {
+      var el = document.querySelector(#{Jason.encode!(css)});
+      if (!el) { return "not_found"; }
+      if (!(el instanceof HTMLIFrameElement || el instanceof HTMLFrameElement)) { return "not_frame"; }
+      return el;
+    })()
+    """
+
+    with {:ok, route, context_id} <- route(page, timeout) do
+      group = "cdp_ex-frame-#{System.unique_integer([:positive])}"
+      params = put_context(%{"expression" => js, "objectGroup" => group}, "contextId", context_id)
+
+      result =
+        route
+        |> do_call("Runtime.evaluate", params, timeout)
+        |> owner_result(page, route, css, timeout)
+
+      _ = do_call(route, "Runtime.releaseObjectGroup", %{"objectGroup" => group}, timeout)
+      result
+    end
+  end
+
+  defp owner_result(result, page, route, css, timeout) do
+    case result do
+      {:ok, %{"result" => %{"objectId" => object_id}} = result}
+      when not is_map_key(result, "exceptionDetails") ->
+        describe_owner(page, route, object_id, css, timeout)
+
+      {:ok, %{"result" => %{"value" => "not_found"}}} ->
+        {:error, {:selector_not_found, css}}
+
+      {:ok, %{"result" => %{"value" => "not_frame"}}} ->
+        {:error, {:not_a_frame, css}}
+
+      {:ok, %{"exceptionDetails" => details}} ->
+        {:error, {:evaluate_exception, details}}
+
+      {:ok, other} ->
+        {:error, {:unexpected_evaluate, other}}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  # The handle is checked once here, so a frame with no document yet is reported now;
+  # each later call resolves its route again (see route/2).
+  defp describe_owner(%__MODULE__{} = page, route, object_id, css, timeout) do
+    case do_call(route, "DOM.describeNode", %{"objectId" => object_id}, timeout) do
+      {:ok, %{"node" => %{"frameId" => frame_id, "backendNodeId" => owner} = node}} ->
+        handle = %{page | frame: %{id: frame_id, label: css, parent: page, owner: owner}}
+        loaded_frame(handle, node, timeout)
+
+      {:ok, _no_frame} ->
+        {:error, {:frame_unavailable, css}}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  # An <iframe> shows the initial about:blank, in its parent's process, until its src
+  # commits; a handle then would act on that empty document, so it waits for the real
+  # one (srcdoc and about: sources excepted).
+  defp loaded_frame(handle, node, timeout) do
+    src = node |> Map.get("attributes", []) |> Enum.chunk_every(2) |> Enum.find_value(&src_attr/1)
+    awaits_src? = is_binary(src) and not String.starts_with?(String.trim(src), "about:")
+
+    case evaluate(handle, "location.href", timeout: timeout) do
+      {:ok, "about:blank"} when awaits_src? -> {:error, {:frame_unavailable, handle.frame.label}}
+      {:ok, _href} -> {:ok, handle}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp src_attr(["src", value]), do: value
+  defp src_attr(_attribute), do: nil
+
+  @doc """
   Sets how the page's JavaScript dialogs are answered from now on: `alert`,
   `confirm`, `prompt` and `beforeunload`, its cross-site iframes' included.
 
@@ -1402,7 +1575,7 @@ defmodule CDPEx.Page do
   policy raises `ArgumentError`. Option: `:timeout` (default #{@evaluate_timeout}).
   """
   @spec set_dialogs(t(), Connection.dialog_policy(), keyword()) :: :ok | {:error, term()}
-  def set_dialogs(%__MODULE__{conn: conn, session_id: session_id}, policy, opts \\ []) do
+  def set_dialogs(%__MODULE__{frame: nil, conn: conn, session_id: session_id}, policy, opts \\ []) do
     Connection.set_dialogs(
       conn,
       session_id,
@@ -1423,7 +1596,7 @@ defmodule CDPEx.Page do
   """
   @spec handle_dialog(t(), :accept | :dismiss | {:accept, String.t()}, keyword()) ::
           :ok | {:error, term()}
-  def handle_dialog(%__MODULE__{} = page, answer, opts \\ []) do
+  def handle_dialog(%__MODULE__{frame: nil} = page, answer, opts \\ []) do
     params =
       case answer do
         :accept -> %{"accept" => true}
@@ -1459,9 +1632,9 @@ defmodule CDPEx.Page do
     with {:ok, fields} <- keymap(key),
          :ok <- maybe_focus(page, css, opts),
          {:ok, _} <-
-           do_call(page, "Input.dispatchKeyEvent", Map.put(fields, "type", "keyDown"), timeout),
+           do_call(top(page), "Input.dispatchKeyEvent", Map.put(fields, "type", "keyDown"), timeout),
          {:ok, _} <-
-           do_call(page, "Input.dispatchKeyEvent", Map.put(fields, "type", "keyUp"), timeout) do
+           do_call(top(page), "Input.dispatchKeyEvent", Map.put(fields, "type", "keyUp"), timeout) do
       :ok
     end
   end
@@ -1650,9 +1823,9 @@ defmodule CDPEx.Page do
         {:locate, {:not_clickable, label}}
 
       {:ok, %{"clickable" => true, "x" => x, "y" => y}} ->
-        case dispatch_action(page, action, x, y, timeout) do
-          :ok -> :ok
-          {:error, reason} -> {:dispatch, reason}
+        with {:ok, x, y} <- to_top(page, x, y, label, timeout),
+             {:error, reason} <- dispatch_action(page, action, x, y, timeout) do
+          {:dispatch, reason}
         end
 
       {:error, reason} ->
@@ -1679,7 +1852,7 @@ defmodule CDPEx.Page do
       "clickCount" => if(type == "mouseMoved", do: 0, else: 1)
     }
 
-    case do_call(page, "Input.dispatchMouseEvent", params, timeout) do
+    case do_call(top(page), "Input.dispatchMouseEvent", params, timeout) do
       {:ok, _} -> :ok
       {:error, _} = error -> error
     end
@@ -1717,7 +1890,7 @@ defmodule CDPEx.Page do
   default `false`), `:timeout` (default 30_000).
   """
   @spec screenshot(t(), keyword()) :: {:ok, binary()} | {:error, term()}
-  def screenshot(%__MODULE__{} = page, opts \\ []) do
+  def screenshot(%__MODULE__{frame: nil} = page, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @screenshot_timeout)
 
     params = maybe_full_page(%{"format" => "png"}, Keyword.get(opts, :full_page, false))
@@ -1737,7 +1910,7 @@ defmodule CDPEx.Page do
   Lazily enables the `Network` domain. Options: `:timeout` (default 10_000).
   """
   @spec cookies(t(), keyword()) :: {:ok, [map()]} | {:error, term()}
-  def cookies(%__MODULE__{} = page, opts \\ []) do
+  def cookies(%__MODULE__{frame: nil} = page, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
 
     with :ok <- ensure_network(page, timeout),
@@ -1753,7 +1926,7 @@ defmodule CDPEx.Page do
   Lazily enables `Network`. Options: `:timeout`.
   """
   @spec set_cookies(t(), [map()], keyword()) :: :ok | {:error, term()}
-  def set_cookies(%__MODULE__{} = page, cookies, opts \\ []) when is_list(cookies) do
+  def set_cookies(%__MODULE__{frame: nil} = page, cookies, opts \\ []) when is_list(cookies) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
 
     with :ok <- ensure_network(page, timeout),
@@ -1768,7 +1941,7 @@ defmodule CDPEx.Page do
   `Network`. Options: `:timeout`.
   """
   @spec clear_cookies(t(), keyword()) :: :ok | {:error, term()}
-  def clear_cookies(%__MODULE__{} = page, opts \\ []) do
+  def clear_cookies(%__MODULE__{frame: nil} = page, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
 
     with :ok <- ensure_network(page, timeout),
@@ -1798,7 +1971,7 @@ defmodule CDPEx.Page do
     * `:timeout` — ms for the enable call (default 10_000)
   """
   @spec observe_network(t(), keyword()) :: :ok | {:error, term()}
-  def observe_network(%__MODULE__{} = page, opts \\ []) do
+  def observe_network(%__MODULE__{frame: nil} = page, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
     methods = Keyword.get(opts, :events, @network_events)
 
@@ -1829,7 +2002,7 @@ defmodule CDPEx.Page do
   caller keeps receiving those events.
   """
   @spec stop_observing_network(t(), keyword()) :: :ok
-  def stop_observing_network(%__MODULE__{} = page, opts \\ []) do
+  def stop_observing_network(%__MODULE__{frame: nil} = page, opts \\ []) do
     unsubscribe_each(page.conn, Keyword.get(opts, :events, @network_events), page.session_id)
   end
 
@@ -1854,7 +2027,8 @@ defmodule CDPEx.Page do
   Options: `:timeout` (default 10_000).
   """
   @spec response_body(t(), String.t(), keyword()) :: {:ok, binary()} | {:error, term()}
-  def response_body(%__MODULE__{} = page, request_id, opts \\ []) when is_binary(request_id) do
+  def response_body(%__MODULE__{frame: nil} = page, request_id, opts \\ [])
+      when is_binary(request_id) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
 
     case do_call(page, "Network.getResponseBody", %{"requestId" => request_id}, timeout) do
@@ -1947,7 +2121,7 @@ defmodule CDPEx.Page do
   """
   @spec wait_for_response(t(), (String.t() -> boolean()) | Regex.t() | String.t(), keyword()) ::
           {:ok, map()} | {:error, term()}
-  def wait_for_response(%__MODULE__{} = page, matcher, opts \\ []) do
+  def wait_for_response(%__MODULE__{frame: nil} = page, matcher, opts \\ []) do
     trigger = response_trigger(Keyword.get(opts, :trigger))
     body? = response_body_opt(Keyword.get(opts, :body, false))
     deadline = System.monotonic_time(:millisecond) + Keyword.get(opts, :timeout, @navigate_timeout)
@@ -2168,7 +2342,7 @@ defmodule CDPEx.Page do
     * `:timeout` — overall ceiling in ms (default 30_000)
   """
   @spec wait_for_network_idle(t(), keyword()) :: :ok | {:error, term()}
-  def wait_for_network_idle(%__MODULE__{} = page, opts \\ []) do
+  def wait_for_network_idle(%__MODULE__{frame: nil} = page, opts \\ []) do
     idle_time = Keyword.get(opts, :idle_time, 500)
     max_inflight = Keyword.get(opts, :max_inflight, 0)
     deadline = System.monotonic_time(:millisecond) + Keyword.get(opts, :timeout, @navigate_timeout)
@@ -2359,7 +2533,7 @@ defmodule CDPEx.Page do
     * `:timeout` — ms for the CDP calls (default 10_000)
   """
   @spec enable_request_interception(t(), keyword()) :: :ok | {:error, term()}
-  def enable_request_interception(%__MODULE__{} = page, opts \\ []) do
+  def enable_request_interception(%__MODULE__{frame: nil} = page, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
     raw = Keyword.get(opts, :patterns, [%{"urlPattern" => "*"}])
 
@@ -2386,7 +2560,7 @@ defmodule CDPEx.Page do
   with no interception returns `:ok`.
   """
   @spec disable_request_interception(t(), keyword()) :: :ok | {:error, term()}
-  def disable_request_interception(%__MODULE__{} = page, opts \\ []) do
+  def disable_request_interception(%__MODULE__{frame: nil} = page, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
     Browser.release_interception(page.browser, page, timeout)
   end
@@ -2429,7 +2603,7 @@ defmodule CDPEx.Page do
     * `:timeout` — ms for the CDP calls (default 10_000)
   """
   @spec block_resources(t(), [atom()], keyword()) :: :ok | {:error, term()}
-  def block_resources(%__MODULE__{} = page, types, opts \\ []) do
+  def block_resources(%__MODULE__{frame: nil} = page, types, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
 
     with {:ok, cdp_types} <- Fetch.resource_types(types) do
@@ -2497,7 +2671,8 @@ defmodule CDPEx.Page do
   keyword list), `:post_data` (a binary or iodata, base64-encoded for you), `:timeout`.
   """
   @spec continue_request(t(), String.t(), keyword()) :: :ok | {:error, term()}
-  def continue_request(%__MODULE__{} = page, request_id, opts \\ []) when is_binary(request_id) do
+  def continue_request(%__MODULE__{frame: nil} = page, request_id, opts \\ [])
+      when is_binary(request_id) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
 
     params =
@@ -2518,7 +2693,8 @@ defmodule CDPEx.Page do
   keyword list), `:body` (a binary or iodata, base64-encoded for you), `:timeout`.
   """
   @spec fulfill_request(t(), String.t(), keyword()) :: :ok | {:error, term()}
-  def fulfill_request(%__MODULE__{} = page, request_id, opts \\ []) when is_binary(request_id) do
+  def fulfill_request(%__MODULE__{frame: nil} = page, request_id, opts \\ [])
+      when is_binary(request_id) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
 
     params =
@@ -2539,7 +2715,8 @@ defmodule CDPEx.Page do
   `{:error, {:invalid_error_reason, value}}`.
   """
   @spec fail_request(t(), String.t(), keyword()) :: :ok | {:error, term()}
-  def fail_request(%__MODULE__{} = page, request_id, opts \\ []) when is_binary(request_id) do
+  def fail_request(%__MODULE__{frame: nil} = page, request_id, opts \\ [])
+      when is_binary(request_id) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
 
     case error_reason(Keyword.get(opts, :reason, :failed)) do
@@ -2564,7 +2741,7 @@ defmodule CDPEx.Page do
   """
   @spec set_extra_headers(t(), %{optional(String.t()) => String.t()}, keyword()) ::
           :ok | {:error, term()}
-  def set_extra_headers(%__MODULE__{} = page, headers, opts \\ []) when is_map(headers) do
+  def set_extra_headers(%__MODULE__{frame: nil} = page, headers, opts \\ []) when is_map(headers) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
 
     with :ok <- ensure_network(page, timeout),
@@ -2614,7 +2791,8 @@ defmodule CDPEx.Page do
       )
   """
   @spec set_user_agent(t(), String.t(), keyword()) :: :ok | {:error, term()}
-  def set_user_agent(%__MODULE__{} = page, user_agent, opts \\ []) when is_binary(user_agent) do
+  def set_user_agent(%__MODULE__{frame: nil} = page, user_agent, opts \\ [])
+      when is_binary(user_agent) do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
 
     params =
@@ -2635,7 +2813,7 @@ defmodule CDPEx.Page do
   `:mobile` (default `false`), `:timeout`. Returns `:ok`.
   """
   @spec set_viewport(t(), pos_integer(), pos_integer(), keyword()) :: :ok | {:error, term()}
-  def set_viewport(%__MODULE__{} = page, width, height, opts \\ [])
+  def set_viewport(%__MODULE__{frame: nil} = page, width, height, opts \\ [])
       when is_integer(width) and width > 0 and is_integer(height) and height > 0 do
     timeout = Keyword.get(opts, :timeout, @command_timeout)
 
@@ -2660,7 +2838,7 @@ defmodule CDPEx.Page do
   (default `false`), `:print_background` (default `true`), `:timeout` (default 30_000).
   """
   @spec pdf(t(), keyword()) :: {:ok, binary()} | {:error, term()}
-  def pdf(%__MODULE__{} = page, opts \\ []) do
+  def pdf(%__MODULE__{frame: nil} = page, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @screenshot_timeout)
 
     params = %{
@@ -2792,6 +2970,105 @@ defmodule CDPEx.Page do
 
   # Page ops thread the page's session id (`nil` for a dedicated page) so the same
   # code path serves both the one-socket-per-page and the multiplexed transports.
+  # ── frames ────────────────────────────────────────────────────────────────────
+
+  defp top(%__MODULE__{frame: nil} = page), do: page
+  defp top(%__MODULE__{frame: %{parent: parent}}), do: top(parent)
+
+  # Where a page's or frame's script runs: the page itself, or for a frame either its
+  # parent's session (a child frame there, in the context of its main world) or its
+  # own session on the browser connection (an out-of-process frame). Resolved on each
+  # call, because a navigation can move a frame between processes, and a cross-site
+  # <iframe> starts out in its parent's process on the initial about:blank.
+  defp route(%__MODULE__{frame: nil} = page, _timeout), do: {:ok, page, nil}
+
+  defp route(%__MODULE__{frame: frame} = page, timeout) do
+    with {:ok, parent, _context_id} <- route(frame.parent, timeout) do
+      case Connection.frame_context(parent.conn, parent.session_id, frame.id, timeout) do
+        {:ok, context_id} -> {:ok, parent, context_id}
+        :error -> own_session(top(page), frame, timeout)
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  defp own_session(top, frame, timeout) do
+    case Browser.attach_frame(top.browser, top, frame.id, timeout) do
+      {:ok, conn, session_id} ->
+        {:ok, %{top | conn: conn, session_id: session_id}, nil}
+
+      {:error, :no_target} ->
+        {:error, {:frame_unavailable, frame.label}}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp put_context(params, _key, nil), do: params
+  defp put_context(params, key, context_id), do: Map.put(params, key, context_id)
+
+  # Mouse events go to the top page in its viewport's coordinates: a point in a frame
+  # is shifted by its <iframe>'s content box in the parent, level by level, and each
+  # level checks that the parent's element at the shifted point is that <iframe>, so
+  # a click can't land on whatever covers the frame. The <iframe> is scrolled into
+  # view in its parent first.
+  defp to_top(%__MODULE__{frame: nil}, x, y, _label, _timeout), do: {:ok, x, y}
+
+  defp to_top(%__MODULE__{frame: %{parent: parent, owner: owner}}, x, y, label, timeout) do
+    shift = """
+    function (x, y) {
+      var el = this;
+      if (el.scrollIntoViewIfNeeded) { el.scrollIntoViewIfNeeded(); }
+      else { el.scrollIntoView({block: "center", inline: "center"}); }
+      var r = el.getBoundingClientRect(), s = getComputedStyle(el);
+      var px = r.left + el.clientLeft + parseFloat(s.paddingLeft) + x;
+      var py = r.top + el.clientTop + parseFloat(s.paddingTop) + y;
+      var root = el.getRootNode();
+      var probe = typeof root.elementFromPoint === "function" ? root : document;
+      return probe.elementFromPoint(px, py) === el ? {x: px, y: py} : null;
+    }
+    """
+
+    case call_on_node(parent, owner, shift, [x, y], timeout) do
+      {:ok, %{"x" => px, "y" => py}} -> to_top(parent, px, py, label, timeout)
+      {:ok, nil} -> {:locate, {:obscured, label}}
+      {:error, reason} -> {:locate, reason}
+    end
+  end
+
+  # Calls `function` with `this` = the node `backend_node_id` in `page`'s context and
+  # returns its value; the node's handle is released afterwards.
+  defp call_on_node(page, backend_node_id, function, args, timeout) do
+    group = "cdp_ex-node-#{System.unique_integer([:positive])}"
+
+    with {:ok, route, context_id} <- route(page, timeout),
+         resolve =
+           put_context(
+             %{"backendNodeId" => backend_node_id, "objectGroup" => group},
+             "executionContextId",
+             context_id
+           ),
+         {:ok, %{"object" => %{"objectId" => object_id}}} <-
+           do_call(route, "DOM.resolveNode", resolve, timeout) do
+      params = %{
+        "objectId" => object_id,
+        "functionDeclaration" => function,
+        "arguments" => Enum.map(args, &%{"value" => &1}),
+        "returnByValue" => true
+      }
+
+      result =
+        case do_call(route, "Runtime.callFunctionOn", params, timeout) do
+          {:ok, result} -> Protocol.evaluate_result(result)
+          {:error, _} = error -> error
+        end
+
+      _ = do_call(route, "Runtime.releaseObjectGroup", %{"objectGroup" => group}, timeout)
+      result
+    end
+  end
+
   defp do_call(%__MODULE__{conn: conn, session_id: session_id}, method, params, timeout) do
     Connection.call(conn, method, params, timeout, session_id: session_id)
   end
