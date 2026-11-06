@@ -255,6 +255,22 @@ defmodule CDPEx.Browser do
   def block(browser, %Page{} = page, types, timeout),
     do: call(browser, {:block, page, types, timeout}, timeout + 5_000, :block_resources)
 
+  # Internal hops for `CDPEx.Page.observe_console/2` and `stop_observing_console/2`: the
+  # page's `CDPEx.Fetch` owner auto-attaches its cross-site iframes and sends the calling
+  # process their console events. `timeout` bounds the CDP calls; the request gets 5s on
+  # top.
+  @doc false
+  @spec observe_console(GenServer.server(), Page.t(), [String.t()], timeout()) ::
+          :ok | {:error, term()}
+  def observe_console(browser, %Page{} = page, methods, timeout) do
+    call(browser, {:observe_console, page, methods, timeout}, timeout + 5_000, :observe_console)
+  end
+
+  @doc false
+  @spec unobserve_console(GenServer.server(), Page.t(), timeout()) :: :ok | {:error, term()}
+  def unobserve_console(browser, %Page{} = page, timeout),
+    do: call(browser, {:unobserve_console, page}, timeout, :observe_console)
+
   # Internal hop for `CDPEx.Page.frame/3`: a session on the browser connection for the
   # page's out-of-process iframe `frame_id` (its target id), with Runtime enabled.
   # `{:error, :no_target}` when Chrome has no target by that id (a same-process frame,
@@ -625,6 +641,31 @@ defmodule CDPEx.Browser do
           {:error, reason} -> {:reply, {:error, reason}, state}
         end
     end
+  end
+
+  def handle_call(
+        {:observe_console, %Page{conn: conn, target_id: tid, session_id: sid} = page, methods,
+         timeout},
+        {caller, _} = from,
+        state
+      ) do
+    if own_page?(state, tid, conn, sid) do
+      case fetch_request(state, page, from, nil, {:observe_console, caller, methods, timeout}) do
+        {:ok, state} -> {:noreply, state}
+        {:error, reason} -> {:reply, {:error, reason}, state}
+      end
+    else
+      {:reply, {:error, :unknown_page}, state}
+    end
+  end
+
+  def handle_call({:unobserve_console, %Page{target_id: tid}}, {caller, _}, state) do
+    case Map.get(state.fetchers, tid) do
+      nil -> :ok
+      pid -> Fetch.request(pid, make_ref(), {:unobserve_console, caller})
+    end
+
+    {:reply, :ok, state}
   end
 
   def handle_call(

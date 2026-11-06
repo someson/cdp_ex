@@ -124,6 +124,13 @@ defmodule CDPEx.FixtureServer do
     ~s(<!doctype html><html><body><h1 id="greeting">Frame</h1><iframe src="#{URI.decode_www_form(src)}"></iframe></body></html>)
   end
 
+  defp page_body("/console", _request) do
+    ~s[<!doctype html><html><body><h1 id="greeting">Console</h1><script>] <>
+      ~s[console.log("console:" + location.hostname);] <>
+      ~s[setTimeout(() => { throw new Error("boom:" + location.hostname) });] <>
+      ~s[</script></body></html>]
+  end
+
   defp page_body("/with-assets", _request) do
     ~s(<!doctype html><html><head><link rel="stylesheet" href="/style.css">) <>
       ~s[<style>@font-face{font-family:F;src:url(/font.woff2)} h1{font-family:F}</style></head>] <>

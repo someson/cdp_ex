@@ -28,6 +28,16 @@ defmodule CDPEx.PageTest.StubBrowser do
     {:reply, reply, state}
   end
 
+  def handle_call({:observe_console, page, methods, timeout}, _from, {reply, notify} = state) do
+    if notify, do: send(notify, {:stub_observe_console, page, methods, timeout})
+    {:reply, reply, state}
+  end
+
+  def handle_call({:unobserve_console, page}, _from, {_reply, notify} = state) do
+    if notify, do: send(notify, {:stub_unobserve_console, page})
+    {:reply, :ok, state}
+  end
+
   def handle_call({:release_interception, page, timeout}, _from, {_reply, notify} = state) do
     if notify, do: send(notify, {:stub_release, page, timeout})
     {:reply, :ok, state}
@@ -1806,22 +1816,30 @@ defmodule CDPEx.PageTest do
   end
 
   describe "observe_console/2" do
-    test "subscribes the caller to both console methods without a CDP call", %{
-      page: page,
-      conn: conn,
-      fake: fake
-    } do
+    test "subscribes the caller to both console methods, then hands the iframes to the browser",
+         %{page: page, conn: conn, fake: fake} do
       assert :ok = Page.observe_console(page)
 
       for method <- @console_methods, do: assert(subscribed?(conn, self(), method))
+      assert_received {:stub_observe_console, ^page, @console_methods, 10_000}
       refute_receive {:fake_cdp_recv, ^fake, _}, 100
     end
 
     test "honours a custom :events list", %{page: page, conn: conn} do
-      assert :ok = Page.observe_console(page, events: ["Runtime.exceptionThrown"])
+      events = ["Runtime.exceptionThrown"]
+      assert :ok = Page.observe_console(page, events: events, timeout: 3_000)
 
       assert subscribed?(conn, self(), "Runtime.exceptionThrown")
       refute subscribed?(conn, self(), "Runtime.consoleAPICalled")
+      assert_received {:stub_observe_console, ^page, ^events, 3_000}
+    end
+
+    test "rolls back its subscriptions when the browser refuses", %{conn: conn} do
+      {:ok, browser} = StubBrowser.start_link({:error, :unknown_page}, self())
+      page = %Page{browser: browser, conn: conn, target_id: "T", session_id: nil}
+
+      assert {:error, :unknown_page} = Page.observe_console(page)
+      for method <- @console_methods, do: refute(subscribed?(conn, self(), method))
     end
 
     test "returns {:error, :noproc} when the connection is dead", %{page: page, conn: conn} do
@@ -1838,6 +1856,7 @@ defmodule CDPEx.PageTest do
       assert :ok = Page.stop_observing_console(page)
 
       for method <- @console_methods, do: refute(subscribed?(conn, self(), method))
+      assert_received {:stub_unobserve_console, ^page}
     end
   end
 

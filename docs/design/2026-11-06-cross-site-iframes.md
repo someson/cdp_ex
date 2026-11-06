@@ -128,3 +128,19 @@ Integration (real Chrome, `localhost` iframe on a `127.0.0.1` page):
 a nested OOPIF; a credentialed proxy still loads the iframe; `block_resources(page,
 [])` lets later iframes load unpaused; closing the page mid-attach leaves no Chrome
 behind. The "known gap" test flips.
+
+## Later: the iframes' console (#41)
+
+`Page.observe_console/2` needs the same attaches: an iframe's `Runtime` has to be on
+before it runs, or its first messages are lost. A second process sending its own
+`Target.setAutoAttach` on the page's session would override the owner's, so the
+console rides on this owner. A console observer is a fourth reason to keep
+auto-attach on, next to the three modes: each attached iframe gets `Runtime.enable`
+before its resume (no `Fetch.enable` unless a mode is on), and the owner monitors the
+observers. With no observer and no mode left, auto-attach goes off; it also goes off
+when the owner stops, observers or not, since nobody would resume a new iframe.
+
+On a `:dedicated` page the observer's subscription has no session filter, so the
+page's connection already delivers the iframes' events to it; the owner passes them
+on only on a `:session` page, where the observer's subscription names the page's
+session.

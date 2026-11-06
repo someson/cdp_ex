@@ -42,6 +42,7 @@ defmodule CDPExTest do
       {:timeout, :set_dialogs},
       {:timeout, :frame_context},
       {:timeout, :frame},
+      {:timeout, :observe_console},
       {:frame_unavailable, "#checkout-frame"},
       :deadline_exceeded,
       {:chrome_exited, 1, "stderr excerpt"},
