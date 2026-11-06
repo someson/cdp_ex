@@ -1115,6 +1115,63 @@ defmodule CDPEx.PageTest do
       assert {:ok, %Page{}, _response} = Task.await(task, 2_000)
     end
 
+    test "also returns the document's headers and request id", %{
+      page: page,
+      conn: conn,
+      fake: fake
+    } do
+      task = Task.async(fn -> Page.navigate(page, "http://example.test/", response: true) end)
+
+      answer_network_enable(fake)
+      wait_until_any_subscribed(conn, "Network.responseReceived")
+      wait_until_any_subscribed(conn, "Page.lifecycleEvent")
+
+      assert_receive {:fake_cdp_recv, ^fake, %{"id" => navid, "method" => "Page.navigate"}}, 2_000
+      FakeCDP.send_text(fake, ~s({"id":#{navid},"result":{"frameId":"F","loaderId":"L"}}))
+
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Network.responseReceived","params":{"requestId":"L","type":"Document","loaderId":"L","frameId":"F","response":{"status":200,"url":"http://example.test/","headers":{"Content-Type":"text/html","Set-Cookie":"a=1\\nb=2"}}}})
+      )
+
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Page.lifecycleEvent","params":{"name":"networkAlmostIdle"}})
+      )
+
+      assert {:ok, %Page{}, response} = Task.await(task, 2_000)
+
+      assert response == %{
+               status: 200,
+               url: "http://example.test/",
+               headers: %{"Content-Type" => "text/html", "Set-Cookie" => "a=1\nb=2"},
+               request_id: "L"
+             }
+    end
+
+    test "a response without headers reports an empty map", %{page: page, conn: conn, fake: fake} do
+      task = Task.async(fn -> Page.navigate(page, "http://example.test/", response: true) end)
+
+      answer_network_enable(fake)
+      wait_until_any_subscribed(conn, "Network.responseReceived")
+      wait_until_any_subscribed(conn, "Page.lifecycleEvent")
+
+      assert_receive {:fake_cdp_recv, ^fake, %{"id" => navid, "method" => "Page.navigate"}}, 2_000
+      FakeCDP.send_text(fake, ~s({"id":#{navid},"result":{"frameId":"F","loaderId":"L"}}))
+
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Network.responseReceived","params":{"requestId":"L","type":"Document","loaderId":"L","frameId":"F","response":{"status":204,"url":"http://example.test/"}}})
+      )
+
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Page.lifecycleEvent","params":{"name":"networkAlmostIdle"}})
+      )
+
+      assert {:ok, %Page{}, %{status: 204, headers: %{}, request_id: "L"}} = Task.await(task, 2_000)
+    end
+
     test "reports the main document's status + final URL, correlated by loaderId", %{
       page: page,
       conn: conn,

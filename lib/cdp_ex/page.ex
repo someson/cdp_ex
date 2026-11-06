@@ -119,11 +119,16 @@ defmodule CDPEx.Page do
   for "did I land on the real page", versus a 403 wall / 404 / redirect-to-login that
   all otherwise look like success:
 
-      {:ok, page, %{status: 200, url: final_url}} = Page.navigate(page, url, response: true)
+      {:ok, page, %{status: 200, url: final_url, headers: headers, request_id: id}} =
+        Page.navigate(page, url, response: true)
 
   `status` is the HTTP status and `url` is the **final** URL after redirects,
   correlated to *this* navigation's main document by its `loaderId` (not "the first
-  `Document` response seen"). This lazily enables the `Network` domain (and leaves it
+  `Document` response seen"). `headers` are the final response's headers as Chrome
+  reports them (names as sent; a repeated header such as `Set-Cookie` joined with
+  `"\n"`), `%{}` when Chrome gave none. `request_id` reads the document's body with
+  `response_body/3`: after a `:load` or `:network_almost_idle` wait the document has
+  finished loading; with `wait_until: :none` the body may not have arrived yet. This lazily enables the `Network` domain (and leaves it
   enabled). If no main document response arrives before the wait ends, it returns
   `{:error, {:no_document_response, url}}` (e.g. a same-document/hash navigation that
   loads no new document, or a connection that never produced an HTTP response — though
@@ -139,13 +144,20 @@ defmodule CDPEx.Page do
 
   Options:
     * `:wait_until` — `:network_almost_idle` (default), `:load`, or `:none`
-    * `:response` — `true` to also return `%{status, url}` (default `false`)
+    * `:response` — `true` to also return `%{status, url, headers, request_id}`
+      (default `false`)
     * `:timeout` — overall ceiling in ms (default 30_000); spans the lazy `Network.enable`,
       the event subscription, the navigation, and the readiness/capture wait
   """
   @spec navigate(t(), String.t(), keyword()) ::
           {:ok, t()}
-          | {:ok, t(), %{status: non_neg_integer(), url: String.t()}}
+          | {:ok, t(),
+             %{
+               status: non_neg_integer(),
+               url: String.t(),
+               headers: %{optional(String.t()) => String.t()},
+               request_id: String.t() | nil
+             }}
           | {:error, term()}
   def navigate(%__MODULE__{} = page, url, opts \\ []) do
     Telemetry.span(:navigate, %{url: url}, fn ->
@@ -467,8 +479,15 @@ defmodule CDPEx.Page do
   defp correlates?(_actual, nil), do: true
   defp correlates?(actual, expected), do: actual == expected
 
-  defp response_summary(%{"response" => response}) do
-    %{status: response["status"], url: response["url"]}
+  defp response_summary(%{"response" => response} = params) do
+    headers = response["headers"]
+
+    %{
+      status: response["status"],
+      url: response["url"],
+      headers: if(is_map(headers), do: headers, else: %{}),
+      request_id: params["requestId"]
+    }
   end
 
   # Generic mailbox drain for one cdp method.

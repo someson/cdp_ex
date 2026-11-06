@@ -2,7 +2,7 @@
 
 | Function | Description |
 |---|---|
-| `navigate/3` | Go to a URL, waiting for `networkAlmostIdle` (configurable); `response: true` adds the document's status and final URL |
+| `navigate/3` | Go to a URL, waiting for `networkAlmostIdle` (configurable); `response: true` adds the document's status, final URL, headers and request id |
 | `wait_for_navigation/2` | Wait for a navigation an action triggered (`load`, `networkAlmostIdle`) |
 | `wait_for_selector/3` | Wait until a CSS selector matches, checked in the page on every DOM change |
 | `wait_for_function/3` | Wait until a JS expression is truthy, checked on DOM changes and on an interval |
