@@ -413,9 +413,9 @@ defmodule CDPEx.BrowserTest do
 
   describe "proxy auto-auth cleanup (FakeCDP fault injection)" do
     test "an arm failure during new_page tears down the just-created page and surfaces the error" do
-      # Drive the full new_page → reply_proxy_authed_page path against a fake Chrome and
+      # Drive the full new_page → reply_armed_page path against a fake Chrome and
       # make Fetch.enable fail, so the synchronous arm (await_fetch_armed) returns an error
-      # and close_failed_auth_page must close the page that was never handed back. A
+      # and close_failed_arm_page must close the page that was never handed back. A
       # dedicated process plays the fake Chrome (the FakeCDP controller, answering every
       # CDP frame and erroring only Fetch.enable), leaving this process free to run the
       # blocking handle_call in a Task and await its reply.
@@ -480,6 +480,84 @@ defmodule CDPEx.BrowserTest do
     end
 
     fake_chrome_failing_arm(test)
+  end
+
+  describe "new_page block:" do
+    test "block: arms the page before new_page returns" do
+      {state, conn} = fake_browser_state()
+
+      assert {:reply, {:ok, %Page{target_id: "T1"}}, new_state} =
+               new_page_in_task(state, transport: :session, block: ["Image"])
+
+      assert_received {:sent, "Fetch.enable",
+                       %{"patterns" => [%{"resourceType" => "Image", "requestStage" => "Request"}]}}
+
+      assert Map.has_key?(new_state.fetchers, "T1")
+      Connection.close(conn)
+    end
+
+    test "a proxied page with block: arms auth, then block, on one owner" do
+      {state, conn} = fake_browser_state()
+      state = %{state | proxy_auth: %{username: "u", password: "p"}}
+
+      assert {:reply, {:ok, _page}, new_state} =
+               new_page_in_task(state, transport: :dedicated, block: ["Image"])
+
+      assert_received {:sent, "Fetch.enable", %{"handleAuthRequests" => true}}
+      assert_received {:sent, "Fetch.enable", %{"handleAuthRequests" => true}}
+      assert map_size(new_state.fetchers) == 1
+      Connection.close(conn)
+    end
+
+    test "a failed block arm closes the page and returns the error" do
+      {state, conn} = fake_browser_state(%{"Fetch.enable" => :error})
+
+      capture_log(fn ->
+        assert {:reply, {:error, {:cdp_error, "Fetch.enable", _}}, new_state} =
+                 new_page_in_task(state, transport: :session, block: ["Image"])
+
+        assert_received {:sent, "Target.detachFromTarget", %{"sessionId" => "S1"}}
+        assert new_state.sessions == %{}
+        assert new_state.fetchers == %{}
+      end)
+
+      Connection.close(conn)
+    end
+
+    test "block: [] arms nothing" do
+      {state, conn} = fake_browser_state()
+
+      assert {:reply, {:ok, _page}, new_state} =
+               new_page_in_task(state, transport: :session, block: [])
+
+      refute_received {:sent, "Fetch.enable", _}
+      assert new_state.fetchers == %{}
+      Connection.close(conn)
+    end
+
+    test "an invalid :block creates no target" do
+      assert Browser.new_page(self(), block: [:document]) ==
+               {:error, {:invalid_args, {:block, [:document]}}}
+
+      refute_received {:"$gen_call", _, _}
+    end
+
+    test "the caller's atoms reach the Browser as CDP types" do
+      test = self()
+
+      browser =
+        spawn(fn ->
+          receive do
+            {:"$gen_call", from, msg} ->
+              send(test, {:got, msg})
+              GenServer.reply(from, {:error, :stub})
+          end
+        end)
+
+      assert {:error, :stub} = Browser.new_page(browser, block: [:image, :font])
+      assert_received {:got, {:new_page, opts}}
+      assert opts[:block] == ["Image", "Font"]
+    end
   end
 
   describe "isolated pages: opening" do
