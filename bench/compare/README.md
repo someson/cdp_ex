@@ -146,7 +146,7 @@ rounds of 20 samples (`cold`: 10; `concurrent`: 20 s, 8 workers).
 | Read an element's text | ✓ | ✓ | ✗ | ✓ |
 | Click | ✓ | ✓ | ✗ | ✓ |
 | Fill a form (type, select, check) | ✓ | ✓ | ✗ | ✓ |
-| File upload | ✗ | ✓ | ✗ | ✓ |
+| File upload | ✓¹ | ✓ | ✗ | ✓ |
 | Download | ✗ | fail | ✗ | ✗ |
 | Answer a JS dialog | ✗ | ✓ | ✗ | ✓ |
 | Hover | ✓¹ | ✓ | ✗ | ✓ |
@@ -174,7 +174,7 @@ rounds of 20 samples (`cold`: 10; `concurrent`: 20 s, 8 workers).
 | Firefox | ✗ | ✓ | ✗ | partial |
 | WebKit | ✗ | ✓ | ✗ | ✗ |
 
-¹ Added after the reference run (`Page.hover/3`); the probe passes in the same image (`LIBS=cdp_ex TASKS= ROUNDS=0 bench/compare/run.sh`).
+¹ Added after the reference run (`Page.hover/3`, `Page.set_input_files/4`); the probes pass in the same image (`LIBS=cdp_ex TASKS= ROUNDS=0 bench/compare/run.sh`).
 
 Partial and failed results, with the probe's note:
 

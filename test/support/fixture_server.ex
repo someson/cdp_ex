@@ -197,6 +197,7 @@ defmodule CDPEx.FixtureServer do
   # centre is on #split-wrap. #block-link is an inline <a> around blocks, whose client rects
   # include the blocks' anonymous boxes. #cover sits on top of #covered-btn. #hover-item
   # shows only while #hover-menu is hovered; entering #hover-trigger lands in window.hovers.
+  # #upload-one and #upload-many log their input/change events to window.uploads.
   defp interact_page(smooth?) do
     style = if smooth?, do: "<style>html { scroll-behavior: smooth; }</style>", else: ""
 
@@ -225,6 +226,7 @@ defmodule CDPEx.FixtureServer do
         <div style="position:relative;width:200px"><button id="covered-btn">Covered</button><div id="cover" style="position:absolute;inset:0;background:#fff"></div></div>
         <style>#hover-item { display: none; } #hover-menu:hover #hover-item { display: inline; }</style>
         <div id="hover-menu" style="width:200px"><span id="hover-trigger">Menu</span> <a id="hover-item" href="#">Item</a></div>
+        <input id="upload-one" type="file"><input id="upload-many" type="file" multiple>
         <div style="height:5000px"></div>
         <p id="footer">end</p>
         <div id="late-slot"></div>
@@ -237,6 +239,15 @@ defmodule CDPEx.FixtureServer do
               id: hit ? hit.id : "",
               tag: e.target.tagName.toLowerCase(),
               trusted: e.isTrusted
+            });
+          });
+          window.uploads = [];
+          ["upload-one", "upload-many"].forEach(function (id) {
+            var input = document.getElementById(id);
+            ["input", "change"].forEach(function (type) {
+              input.addEventListener(type, function () {
+                window.uploads.push(id + " " + type + " " + input.files.length);
+              });
             });
           });
           window.hovers = [];

@@ -675,6 +675,76 @@ defmodule CDPEx.PageTest do
     end
   end
 
+  describe "set_input_files/4" do
+    test "refuses a missing local file before any CDP call", %{page: page, fake: fake} do
+      missing = Path.join(System.tmp_dir!(), "cdp_ex_missing_#{System.unique_integer([:positive])}")
+
+      assert {:error, {:file_not_found, ^missing}} =
+               Page.set_input_files(page, "#f", [__ENV__.file, missing])
+
+      refute_received {:fake_cdp_recv, ^fake, _}
+    end
+
+    test "check: false sends the expanded paths unchecked and releases the element", %{
+      page: page,
+      fake: fake
+    } do
+      task = Task.async(fn -> Page.set_input_files(page, "#f", "remote/x.pdf", check: false) end)
+
+      assert_receive {:fake_cdp_recv, ^fake,
+                      %{"id" => id, "method" => "Runtime.evaluate", "params" => params}},
+                     2_000
+
+      group = params["objectGroup"]
+      reply = %{"result" => %{"type" => "object", "subtype" => "node", "objectId" => "obj-1"}}
+      FakeCDP.send_text(fake, Jason.encode!(%{"id" => id, "result" => reply}))
+
+      expanded = Path.expand("remote/x.pdf")
+
+      assert_receive {:fake_cdp_recv, ^fake,
+                      %{
+                        "id" => id,
+                        "method" => "DOM.setFileInputFiles",
+                        "params" => %{"files" => [^expanded], "objectId" => "obj-1"}
+                      }},
+                     2_000
+
+      FakeCDP.send_text(fake, ~s({"id":#{id},"result":{}}))
+
+      assert_receive {:fake_cdp_recv, ^fake,
+                      %{
+                        "id" => id,
+                        "method" => "Runtime.releaseObjectGroup",
+                        "params" => %{"objectGroup" => ^group}
+                      }},
+                     2_000
+
+      FakeCDP.send_text(fake, ~s({"id":#{id},"result":{}}))
+      assert :ok = Task.await(task, 2_000)
+    end
+
+    test "maps the lookup's answers to results", %{page: page, fake: fake} do
+      for {answer, expected} <- [
+            {"not_found", {:selector_not_found, "#f"}},
+            {"not_file_input", {:not_file_input, "#f"}},
+            {"not_multiple", {:invalid_args, {:multiple_files, "#f"}}},
+            {"cleared", nil}
+          ] do
+        task = Task.async(fn -> Page.set_input_files(page, "#f", [], check: false) end)
+        reply_evaluate(fake, answer)
+        assert Task.await(task, 2_000) == if(expected, do: {:error, expected}, else: :ok)
+      end
+    end
+
+    test "raises on paths that are not strings", %{page: page} do
+      assert_raise ArgumentError, ~r/invalid set_input_files\/4 paths/, fn ->
+        Page.set_input_files(page, "#f", [:a])
+      end
+
+      assert_raise ArgumentError, fn -> Page.set_input_files(page, "#f", nil) end
+    end
+  end
+
   describe "click_text/3" do
     test "JSON-encodes the text and selector into the locator", %{page: page, fake: fake} do
       task =
