@@ -630,6 +630,37 @@ defmodule CDPEx.IntegrationTest do
       assert {:error, {:not_clickable, "#hidden-btn"}} = Page.click(page, "#hidden-btn")
     end
 
+    test "click/3 clicks a wrapped inline link inside one of its line boxes", %{
+      page: page,
+      fixture: fixture
+    } do
+      {:ok, _} = Page.navigate(page, fixture <> "interact", wait_until: :load)
+
+      for id <- ["split-link", "block-link"] do
+        assert :ok = Page.click(page, "#" <> id)
+      end
+
+      assert [%{"id" => "split-link", "trusted" => true}, %{"id" => "block-link"}] = clicks(page)
+    end
+
+    test "click/3 returns :obscured when another element covers the target", %{
+      page: page,
+      fixture: fixture
+    } do
+      {:ok, _} = Page.navigate(page, fixture <> "interact", wait_until: :load)
+      assert {:error, {:obscured, "#covered-btn"}} = Page.click(page, "#covered-btn")
+      assert clicks(page) == []
+
+      assert {:ok, true} =
+               Page.evaluate(
+                 page,
+                 "setTimeout(function () { document.getElementById('cover').remove(); }, 300), true"
+               )
+
+      assert :ok = Page.click(page, "#covered-btn", wait: 5_000)
+      assert [%{"id" => "covered-btn", "trusted" => true}] = clicks(page)
+    end
+
     test "click/3 returns :selector_not_found for no match", %{page: page, fixture: fixture} do
       {:ok, _} = Page.navigate(page, fixture)
       assert {:error, {:selector_not_found, "#nope"}} = Page.click(page, "#nope")
