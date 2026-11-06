@@ -17,18 +17,21 @@ defmodule CDPEx.FixtureServer do
     # `:json_version` selects the /json/version variant the connect-discovery tests
     # exercise: :ok (default), :no_key, :non_string, :with_query, :server_error.
     json_version = Keyword.get(opts, :json_version, :ok)
+    # `:report` — a pid sent `{:fixture_served, path}` for every request, so a test can
+    # tell which requests reached the server (resource blocking).
+    report = Keyword.get(opts, :report)
     {:ok, listen} = :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
     {:ok, port} = :inet.port(listen)
-    pid = spawn_link(fn -> accept_loop(listen, json_version) end)
+    pid = spawn_link(fn -> accept_loop(listen, json_version, report) end)
     _ = :gen_tcp.controlling_process(listen, pid)
     {:ok, %{port: port, url: "http://127.0.0.1:#{port}/"}}
   end
 
-  defp accept_loop(listen, json_version) do
+  defp accept_loop(listen, json_version, report) do
     case :gen_tcp.accept(listen) do
       {:ok, socket} ->
-        spawn(fn -> serve(socket, json_version) end)
-        accept_loop(listen, json_version)
+        spawn(fn -> serve(socket, json_version, report) end)
+        accept_loop(listen, json_version, report)
 
       {:error, :closed} ->
         :ok
@@ -37,16 +40,17 @@ defmodule CDPEx.FixtureServer do
 
   # :hang accepts the request then holds the socket without responding, so a client
   # with a short discovery timeout trips :discovery_timeout deterministically.
-  defp serve(socket, :hang) do
+  defp serve(socket, :hang, _report) do
     _ = HttpFixture.recv_request(socket)
     Process.sleep(2_000)
     :gen_tcp.close(socket)
   end
 
-  defp serve(socket, json_version) do
+  defp serve(socket, json_version, report) do
     # Read the full request headers (they may arrive across TCP segments) so the
     # header reflection and auth check are deterministic, then respond.
     request = HttpFixture.recv_request(socket)
+    if report, do: send(report, {:fixture_served, request_path(request)})
     _ = :gen_tcp.send(socket, respond(request, json_version))
     :gen_tcp.close(socket)
   end
@@ -65,6 +69,8 @@ defmodule CDPEx.FixtureServer do
   #   /data       — a tiny XHR/fetch target (the #fetch-btn calls it), for the
   #     wait_for_response/3 and wait_for_network_idle/2 paths.
   #   /interact   — the click :wait / click_text/3 / scroll/3 page (interact_page/0).
+  #   /with-assets — a page that loads /pixel.png, /style.css and the font
+  #     /font.woff2, for resource blocking (the assets themselves get the default page).
   #   anything else serves the page.
   defp respond(request, json_version) do
     path = request_path(request)
@@ -102,6 +108,13 @@ defmodule CDPEx.FixtureServer do
   end
 
   defp page_body("/interact" <> rest, _request), do: interact_page(rest =~ "smooth")
+
+  defp page_body("/with-assets", _request) do
+    ~s(<!doctype html><html><head><link rel="stylesheet" href="/style.css">) <>
+      ~s[<style>@font-face{font-family:F;src:url(/font.woff2)} h1{font-family:F}</style></head>] <>
+      ~s(<body><h1 id="greeting">Assets</h1><img src="/pixel.png"></body></html>)
+  end
+
   defp page_body(_path, request), do: render(request)
 
   @json_ct ["Content-Type: application/json"]
