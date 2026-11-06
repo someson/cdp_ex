@@ -56,6 +56,17 @@ defmodule CDPEx.Telemetry do
   of `:stop` — so a gauge built by pairing `:start`/`:stop` should also decrement on
   those errors, or use a counter.
 
+  ### `[:cdp_ex, :dialog]`
+
+  Emitted when a page opens a JavaScript dialog, as its connection answers it (see
+  `CDPEx.Page.set_dialogs/3`). Runs in the connection process.
+
+    * measurements — `%{system_time: System.system_time()}`
+    * metadata — `%{session_id, type, message, url, action}`: `type` is Chrome's
+      `"alert"`, `"confirm"`, `"prompt"` or `"beforeunload"`, `url` the frame's
+      (an iframe's for its own dialogs), and `action` `:accept`, `:dismiss`, or
+      `:manual` when the dialog is left for `CDPEx.Page.handle_dialog/3`
+
   ### `[:cdp_ex, :network_idle, :watching]`
 
   `CDPEx.Page.wait_for_network_idle/2`'s helper has subscribed, enabled the Network
@@ -141,6 +152,12 @@ defmodule CDPEx.Telemetry do
   @spec page(:start | :stop, :telemetry.event_metadata()) :: :ok
   def page(stage, metadata) when stage in [:start, :stop] do
     :telemetry.execute([:cdp_ex, :page, stage], %{system_time: System.system_time()}, metadata)
+  end
+
+  @doc false
+  @spec dialog(map()) :: :ok
+  def dialog(metadata) do
+    :telemetry.execute([:cdp_ex, :dialog], %{system_time: System.system_time()}, metadata)
   end
 
   @doc false

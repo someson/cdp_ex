@@ -1372,6 +1372,75 @@ defmodule CDPEx.Page do
   end
 
   @doc """
+  Sets how the page's JavaScript dialogs are answered from now on: `alert`,
+  `confirm`, `prompt` and `beforeunload`, its cross-site iframes' included.
+
+  A dialog stops the page's JavaScript until it is answered, and with it any
+  `evaluate/3` or trusted click waiting on that script, so the page's connection
+  answers each one as it opens, before anything else sees it. The policies:
+
+    * `:accept` (the default for every page) — OK: `confirm` returns `true`, `prompt`
+      its default value (`""` when it has none).
+    * `{:accept, text}` — as `:accept`, with `prompt` returning `text`.
+    * `:dismiss` — Cancel: `confirm` returns `false`, `prompt` `null`.
+    * `:manual` — no answer: the page stays paused until `handle_dialog/3`. To see
+      the dialog, subscribe to `"Page.javascriptDialogOpening"` with
+      `CDPEx.Connection.subscribe/4` (`page.conn`, `session_id: page.session_id`),
+      and run whatever opens it in another process, since it won't return before
+      the answer.
+
+  `alert` has only OK, and `beforeunload` is accepted (the page is left) under
+  every policy but `:manual`: staying would stall the navigation or close that
+  raised it. Every dialog emits `[:cdp_ex, :dialog]` telemetry with its type,
+  message and the action taken (see `CDPEx.Telemetry`).
+
+  The default is set per page with `new_page/2`'s `:dialogs` option. Chrome
+  answers natively, so `window.alert` and friends stay untouched for the page's
+  own scripts.
+
+  Returns `:ok` or `{:error, reason}` (`:noproc` once the page is gone). An invalid
+  policy raises `ArgumentError`. Option: `:timeout` (default #{@evaluate_timeout}).
+  """
+  @spec set_dialogs(t(), Connection.dialog_policy(), keyword()) :: :ok | {:error, term()}
+  def set_dialogs(%__MODULE__{conn: conn, session_id: session_id}, policy, opts \\ []) do
+    Connection.set_dialogs(
+      conn,
+      session_id,
+      policy,
+      Keyword.get(opts, :timeout, @evaluate_timeout)
+    )
+  end
+
+  @doc """
+  Answers the dialog the page is showing (`Page.handleJavaScriptDialog`), for a page
+  under `dialogs: :manual` (see `set_dialogs/3`): `:accept`, `:dismiss`, or
+  `{:accept, text}` to answer a `prompt` with `text`. A plain `:accept` gives a
+  prompt `""`, not its default value.
+
+  Returns `:ok`, or `{:error, {:cdp_error, "Page.handleJavaScriptDialog", _}}` when
+  no dialog is showing. Any other `answer` raises `ArgumentError`. Option:
+  `:timeout` (default #{@evaluate_timeout}).
+  """
+  @spec handle_dialog(t(), :accept | :dismiss | {:accept, String.t()}, keyword()) ::
+          :ok | {:error, term()}
+  def handle_dialog(%__MODULE__{} = page, answer, opts \\ []) do
+    params =
+      case answer do
+        :accept -> %{"accept" => true}
+        :dismiss -> %{"accept" => false}
+        {:accept, text} when is_binary(text) -> %{"accept" => true, "promptText" => text}
+        other -> raise ArgumentError, "invalid dialog answer #{inspect(other)}"
+      end
+
+    timeout = Keyword.get(opts, :timeout, @evaluate_timeout)
+
+    case do_call(page, "Page.handleJavaScriptDialog", params, timeout) do
+      {:ok, _} -> :ok
+      {:error, _} = error -> error
+    end
+  end
+
+  @doc """
   Presses a single named `key`, dispatching real `keyDown`/`keyUp` events.
 
   When `css` is a selector, the element is focused first; when `css` is `nil`, the

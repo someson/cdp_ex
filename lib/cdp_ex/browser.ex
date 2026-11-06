@@ -121,7 +121,11 @@ defmodule CDPEx.Browser do
       launched with `pipe: true` defaults to `:session` and rejects `:dedicated` with
       `{:error, {:unsupported_transport, :dedicated}}`. Any other value returns
       `{:error, {:invalid_transport, value}}`.
-    * `:prevent_alerts` — inject no-op `alert`/`confirm`/`prompt` (default `true`)
+    * `:dialogs` — how the page's JavaScript dialogs are answered: `:accept`
+      (default), `:dismiss`, `{:accept, prompt_text}` or `:manual`; see
+      `CDPEx.Page.set_dialogs/3`. An invalid value raises `ArgumentError`.
+    * `:prevent_alerts` — deprecated: `false` stands for `dialogs: :manual` when
+      `:dialogs` isn't given; `true` (the default) changes nothing.
     * `:isolated` — `true` opens the page in a new browser context (its own cookies,
       storage and cache), disposed when the page closes. Default `false`. A value that
       isn't a boolean raises `ArgumentError`.
@@ -156,8 +160,17 @@ defmodule CDPEx.Browser do
       other -> raise ArgumentError, ":isolated must be a boolean, got: #{inspect(other)}"
     end
 
+    opts = Keyword.put(opts, :dialogs, dialog_policy!(opts))
+
     with {:ok, types} <- Fetch.resource_types(Keyword.get(opts, :block, [])) do
       call(browser, {:new_page, Keyword.put(opts, :block, types)}, 95_000, :new_page)
+    end
+  end
+
+  defp dialog_policy!(opts) do
+    case Keyword.fetch(opts, :dialogs) do
+      {:ok, policy} -> Connection.dialog_policy!(policy)
+      :error -> if Keyword.get(opts, :prevent_alerts, true) == false, do: :manual, else: :accept
     end
   end
 
@@ -1044,7 +1057,7 @@ defmodule CDPEx.Browser do
          {:ok, _} <- bcall(conn, session_id, "Runtime.enable", %{}),
          {:ok, _} <-
            bcall(conn, session_id, "Page.setLifecycleEventsEnabled", %{"enabled" => true}) do
-      maybe_prevent_alerts(conn, session_id, opts)
+      set_dialogs(conn, session_id, Keyword.get(opts, :dialogs, :accept))
     end
   end
 
@@ -1053,18 +1066,11 @@ defmodule CDPEx.Browser do
     Connection.call(conn, method, params, @bootstrap_timeout, session_id: session_id)
   end
 
-  defp maybe_prevent_alerts(conn, session_id, opts) do
-    if Keyword.get(opts, :prevent_alerts, true) do
-      params = %{"source" => Protocol.prevent_alerts_js()}
+  # :accept is every connection's default, so only another policy costs a call.
+  defp set_dialogs(_conn, _session_id, :accept), do: :ok
 
-      case bcall(conn, session_id, "Page.addScriptToEvaluateOnNewDocument", params) do
-        {:ok, _} -> :ok
-        error -> error
-      end
-    else
-      :ok
-    end
-  end
+  defp set_dialogs(conn, session_id, policy),
+    do: Connection.set_dialogs(conn, session_id, policy, @bootstrap_timeout)
 
   # One of this browser's open pages: a :dedicated page by its own connection, a
   # :session page by its session on the browser connection.

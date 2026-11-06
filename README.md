@@ -45,7 +45,7 @@ scraper, where it replaced a Wallaby/ChromeDriver setup.
 | Read text, click, fill a form | ✓ | ✓ | ✗ | ✓ |
 | Hover | ✓ `hover/3` | ✓ | ✗ | ✓ |
 | File upload | ✓ `set_input_files/4` | ✓ | ✗ | ✓ |
-| JS dialogs | ✗ | ✓ | ✗ | ✓ |
+| JS dialogs | ✓ `dialogs:`, `set_dialogs/3` | ✓ | ✗ | ✓ |
 | Downloads | ✗ | fails in 0.16.0 (the documented flow raises) | ✗ | ✗ |
 | Inside an iframe | ✗ | ✓ | ✗ | ✓ |
 | Console messages | ✗ | ✓ | ✗ | ✓ |

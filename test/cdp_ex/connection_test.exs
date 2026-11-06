@@ -957,6 +957,123 @@ defmodule CDPEx.ConnectionTest do
     end
   end
 
+  describe "JavaScript dialogs" do
+    defp open_dialog(fake, type, opts \\ []) do
+      event = %{
+        "method" => "Page.javascriptDialogOpening",
+        "params" => %{
+          "type" => type,
+          "message" => "msg",
+          "url" => "https://site.test/",
+          "defaultPrompt" => Keyword.get(opts, :default, "")
+        }
+      }
+
+      event =
+        if sid = opts[:session_id], do: Map.put(event, "sessionId", sid), else: event
+
+      FakeCDP.send_text(fake, Jason.encode!(event))
+    end
+
+    defp assert_answer(fake, expected, session_id \\ nil) do
+      assert_receive {:fake_cdp_recv, ^fake,
+                      %{"method" => "Page.handleJavaScriptDialog", "params" => params} = frame},
+                     2_000
+
+      assert params == expected
+      assert frame["sessionId"] == session_id
+    end
+
+    test "accepts by default, a prompt with its default value", %{fake: fake} do
+      open_dialog(fake, "confirm")
+      assert_answer(fake, %{"accept" => true})
+      open_dialog(fake, "prompt", default: "dflt")
+      assert_answer(fake, %{"accept" => true, "promptText" => "dflt"})
+      open_dialog(fake, "alert")
+      assert_answer(fake, %{"accept" => true})
+    end
+
+    test ":dismiss cancels confirm and prompt, but leaves the page on beforeunload", %{
+      conn: conn,
+      fake: fake
+    } do
+      assert :ok = Connection.set_dialogs(conn, nil, :dismiss)
+
+      for type <- ["confirm", "prompt"] do
+        open_dialog(fake, type)
+        assert_answer(fake, %{"accept" => false})
+      end
+
+      open_dialog(fake, "alert")
+      assert_answer(fake, %{"accept" => true})
+      open_dialog(fake, "beforeunload")
+      assert_answer(fake, %{"accept" => true})
+    end
+
+    test "{:accept, text} answers a prompt with text", %{conn: conn, fake: fake} do
+      assert :ok = Connection.set_dialogs(conn, nil, {:accept, "typed"})
+      open_dialog(fake, "prompt", default: "dflt")
+      assert_answer(fake, %{"accept" => true, "promptText" => "typed"})
+      open_dialog(fake, "confirm")
+      assert_answer(fake, %{"accept" => true})
+    end
+
+    test ":manual leaves the dialog to subscribers", %{conn: conn, fake: fake} do
+      assert :ok = Connection.set_dialogs(conn, nil, :manual)
+      :ok = Connection.subscribe(conn, "Page.javascriptDialogOpening")
+      open_dialog(fake, "beforeunload")
+
+      assert_receive {:cdp_event, ^conn, "Page.javascriptDialogOpening",
+                      %{"type" => "beforeunload"}, nil},
+                     2_000
+
+      refute_received {:fake_cdp_recv, ^fake, %{"method" => "Page.handleJavaScriptDialog"}}
+    end
+
+    test "policies are per session and go with its detach", %{conn: conn, fake: fake} do
+      assert :ok = Connection.set_dialogs(conn, "S1", :dismiss)
+      :ok = Connection.subscribe(conn, "Target.detachedFromTarget")
+      open_dialog(fake, "confirm", session_id: "S2")
+      assert_answer(fake, %{"accept" => true}, "S2")
+      open_dialog(fake, "confirm", session_id: "S1")
+      assert_answer(fake, %{"accept" => false}, "S1")
+
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Target.detachedFromTarget","params":{"sessionId":"S1"}})
+      )
+
+      assert_receive {:cdp_event, ^conn, "Target.detachedFromTarget", _, _}, 2_000
+      assert %{dialogs: dialogs} = :sys.get_state(conn)
+      refute Map.has_key?(dialogs, "S1")
+    end
+
+    test "emits [:cdp_ex, :dialog] with the action", %{conn: conn, fake: fake} do
+      ref = :telemetry_test.attach_event_handlers(self(), [[:cdp_ex, :dialog]])
+      assert :ok = Connection.set_dialogs(conn, "S9", :manual)
+      open_dialog(fake, "confirm", session_id: "S9")
+
+      assert_receive {[:cdp_ex, :dialog], ^ref, %{system_time: _},
+                      %{
+                        session_id: "S9",
+                        type: "confirm",
+                        message: "msg",
+                        url: "https://site.test/",
+                        action: :manual
+                      }},
+                     2_000
+    end
+
+    test "an invalid policy raises in the caller", %{conn: conn} do
+      assert_raise ArgumentError, ~r/invalid dialog policy :yes/, fn ->
+        Connection.set_dialogs(conn, nil, :yes)
+      end
+
+      assert_raise ArgumentError, fn -> Connection.set_dialogs(conn, nil, {:accept, 1}) end
+      assert Process.alive?(conn)
+    end
+  end
+
   describe "format_status/1" do
     test "hides a Fetch.continueWithAuth call's params, keeps any other call's" do
       from = {self(), make_ref()}

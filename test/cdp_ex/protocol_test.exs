@@ -218,11 +218,4 @@ defmodule CDPEx.ProtocolTest do
       assert Protocol.sni("chrome.example.com") == ~c"chrome.example.com"
     end
   end
-
-  test "prevent_alerts_js/0 overrides the three modal dialog functions" do
-    js = Protocol.prevent_alerts_js()
-    assert js =~ "window.alert"
-    assert js =~ "window.confirm"
-    assert js =~ "window.prompt"
-  end
 end

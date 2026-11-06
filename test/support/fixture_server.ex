@@ -69,6 +69,9 @@ defmodule CDPEx.FixtureServer do
   #   /data       — a tiny XHR/fetch target (the #fetch-btn calls it), for the
   #     wait_for_response/3 and wait_for_network_idle/2 paths.
   #   /interact   — the click :wait / click_text/3 / scroll/3 page (interact_page/0).
+  #   /dialogs    — buttons that open confirm/prompt/alert and arm a beforeunload,
+  #     logging what each returned to window.results (dialogs_page/0); /dialogs-frame
+  #     is one full-page #confirm, for clicking through an iframe.
   #   /frame?src=URL — a page holding one iframe of URL (percent-encoded), for
   #     cross-site and nested iframes.
   #   /with-assets — a page that loads /pixel.png, /style.css and the font
@@ -110,6 +113,8 @@ defmodule CDPEx.FixtureServer do
   end
 
   defp page_body("/interact" <> rest, _request), do: interact_page(rest =~ "smooth")
+  defp page_body("/dialogs-frame" <> _, _request), do: dialogs_frame_page()
+  defp page_body("/dialogs" <> _, _request), do: dialogs_page()
 
   defp page_body("/frame?src=" <> src, _request) do
     ~s(<!doctype html><html><body><h1 id="greeting">Frame</h1><iframe src="#{URI.decode_www_form(src)}"></iframe></body></html>)
@@ -264,6 +269,36 @@ defmodule CDPEx.FixtureServer do
             return true;
           };
         </script>
+      </body>
+    </html>
+    """
+  end
+
+  defp dialogs_page do
+    """
+    <!doctype html>
+    <html>
+      <head><title>CDPEx Dialogs</title></head>
+      <body>
+        <button id="confirm" onclick="log('confirm', confirm('Sure?'))">Confirm</button>
+        <button id="prompt" onclick="log('prompt', prompt('Name?', 'dflt'))">Prompt</button>
+        <button id="alert" onclick="log('alert', alert('Hi'))">Alert</button>
+        <button id="arm-unload" onclick="window.onbeforeunload = function (e) { e.preventDefault(); e.returnValue = ''; }; log('armed', true)">Arm</button>
+        <script>
+          window.results = [];
+          function log(kind, value) { window.results.push(kind + "=" + value); }
+        </script>
+      </body>
+    </html>
+    """
+  end
+
+  defp dialogs_frame_page do
+    """
+    <!doctype html>
+    <html>
+      <body style="margin:0">
+        <button id="confirm" style="width:100vw;height:100vh" onclick="this.textContent = confirm('From frame?')">Confirm</button>
       </body>
     </html>
     """

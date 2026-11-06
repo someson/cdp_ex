@@ -60,6 +60,9 @@ defmodule CDPEx.Connection do
     # waiter `to` => monitor ref on the process that registered it, so a waiter
     # whose caller dies goes at once rather than at its timeout (see the :DOWN clause).
     waiter_monitors: %{},
+    # session_id (nil for a dedicated page) => dialog policy; a session with no entry
+    # gets :accept (see set_dialogs/4).
+    dialogs: %{},
     ws_send_error: nil
   ]
 
@@ -168,6 +171,45 @@ defmodule CDPEx.Connection do
     :exit, {:timeout, {GenServer, :call, _}} -> {:error, {:timeout, :subscribe}}
     :exit, {{:shutdown, {:ws_closed, reason}}, _} -> {:error, {:ws_closed, reason}}
     :exit, {reason, {GenServer, :call, _}} when reason != :calling_self -> {:error, :noproc}
+  end
+
+  @doc """
+  Sets how this connection answers JavaScript dialogs (`alert`, `confirm`, `prompt`,
+  `beforeunload`) opened on `session_id` (`nil` for a dedicated page's own
+  connection), including dialogs from the session's cross-site iframes, which Chrome
+  reports on the page's session. See `CDPEx.Page.set_dialogs/3` for the policies.
+
+  The connection answers `Page.javascriptDialogOpening` itself, before subscribers
+  see the event, so a dialog never blocks the page unless the policy is `:manual`. A
+  session with no policy set gets `:accept`. The policy goes with the session's
+  detach.
+
+  Returns `:ok`, `{:error, :noproc}`, or `{:error, {:timeout, :set_dialogs}}`. An
+  invalid policy raises `ArgumentError` in the caller.
+  """
+  @spec set_dialogs(GenServer.server(), String.t() | nil, dialog_policy(), timeout()) ::
+          :ok | {:error, :noproc | {:timeout, :set_dialogs} | {:ws_closed, term()}}
+  def set_dialogs(conn, session_id, policy, timeout \\ @default_call_timeout) do
+    policy = dialog_policy!(policy)
+    GenServer.call(conn, {:set_dialogs, session_id, policy}, timeout)
+  catch
+    :exit, {:timeout, {GenServer, :call, _}} -> {:error, {:timeout, :set_dialogs}}
+    :exit, {{:shutdown, {:ws_closed, reason}}, _} -> {:error, {:ws_closed, reason}}
+    :exit, {reason, {GenServer, :call, _}} when reason != :calling_self -> {:error, :noproc}
+  end
+
+  @typedoc "How a connection answers JavaScript dialogs; see `set_dialogs/4`."
+  @type dialog_policy :: :accept | :dismiss | {:accept, String.t()} | :manual
+
+  @doc false
+  @spec dialog_policy!(term()) :: dialog_policy()
+  def dialog_policy!(policy) when policy in [:accept, :dismiss, :manual], do: policy
+  def dialog_policy!({:accept, text} = policy) when is_binary(text), do: policy
+
+  def dialog_policy!(other) do
+    raise ArgumentError,
+          "invalid dialog policy #{inspect(other)} " <>
+            "(expected :accept, :dismiss, {:accept, text} or :manual)"
   end
 
   @doc """
@@ -408,6 +450,10 @@ defmodule CDPEx.Connection do
     end
   end
 
+  def handle_call({:set_dialogs, session_id, policy}, _from, state) do
+    {:reply, :ok, %{state | dialogs: Map.put(state.dialogs, session_id, policy)}}
+  end
+
   def handle_call({:subscribe, :all, session_id, pid}, _from, state) do
     state = monitor_subscriber(state, pid)
     {:reply, :ok, %{state | all_subscribers: add_filter(state.all_subscribers, pid, session_id)}}
@@ -636,10 +682,57 @@ defmodule CDPEx.Connection do
 
   defp dispatch_event(method, session_id, params, state) do
     state
+    |> answer_dialog(method, session_id, params)
     |> fail_detached_session(method, params)
     |> notify_waiters(session_id, params)
     |> notify_subscribers(method, session_id, params)
     |> drop_detached_subscriptions(method, params)
+  end
+
+  # Answered from this process, with no caller waiting: the reply comes back under an id
+  # with no pending entry and dispatch_reply/3 drops it. A failed write is recorded like
+  # a failed pong, and dispatch_frames/2 stops the connection on it.
+  defp answer_dialog(state, "Page.javascriptDialogOpening", session_id, params) do
+    policy = Map.get(state.dialogs, session_id, :accept)
+    answer = dialog_answer(policy, params["type"], params["defaultPrompt"])
+
+    Telemetry.dialog(%{
+      session_id: session_id,
+      type: params["type"],
+      message: params["message"],
+      url: params["url"],
+      action: if(answer, do: if(answer["accept"], do: :accept, else: :dismiss), else: :manual)
+    })
+
+    if answer, do: send_dialog_answer(state, session_id, answer), else: state
+  end
+
+  defp answer_dialog(state, _method, _session_id, _params), do: state
+
+  # Leaving the page on beforeunload under :dismiss too: staying would stall the
+  # navigation or close that raised it. A prompt accepted with no text answers "", so
+  # :accept passes the prompt's default, as its OK button does.
+  defp dialog_answer(:manual, _type, _default), do: nil
+  defp dialog_answer(_policy, "beforeunload", _default), do: %{"accept" => true}
+  defp dialog_answer(:dismiss, "alert", _default), do: %{"accept" => true}
+  defp dialog_answer(:dismiss, _type, _default), do: %{"accept" => false}
+
+  defp dialog_answer({:accept, text}, "prompt", _default),
+    do: %{"accept" => true, "promptText" => text}
+
+  defp dialog_answer(_accept, "prompt", default) when is_binary(default),
+    do: %{"accept" => true, "promptText" => default}
+
+  defp dialog_answer(_accept, _type, _default), do: %{"accept" => true}
+
+  defp send_dialog_answer(state, session_id, answer) do
+    id = state.next_id
+    {:ok, payload} = encode("Page.handleJavaScriptDialog", answer, id, session_id)
+
+    case ws_send(state, payload) do
+      {:ok, state} -> %{state | next_id: id + 1}
+      {:error, state, reason} -> %{state | next_id: id + 1, ws_send_error: reason}
+    end
   end
 
   # A detached session never sends another event, so a subscription scoped to it can
@@ -655,7 +748,8 @@ defmodule CDPEx.Connection do
     state = %{
       state
       | subscribers: Map.new(state.subscribers, fn {m, subs} -> {m, drop_session(subs, sid)} end),
-        all_subscribers: drop_session(state.all_subscribers, sid)
+        all_subscribers: drop_session(state.all_subscribers, sid),
+        dialogs: Map.delete(state.dialogs, sid)
     }
 
     pids |> Enum.uniq() |> Enum.reduce(state, &demonitor_if_orphaned(&2, &1))

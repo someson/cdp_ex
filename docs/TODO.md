@@ -200,8 +200,14 @@ the others do and CDPEx doesn't, roughly by how often a scraper needs it:
   `{:error, {:obscured, label}}`.
 - **Inside an iframe.** No way to read or act inside a frame (Wallaby
   `focus_frame/2`, playwright_ex `internal:control=enter-frame`).
-- **Hover, file upload, JS dialogs, downloads.** All four are in playwright_ex,
-  the first three in Wallaby. A `confirm()` blocks a CDPEx page today.
+- ~~**Hover, file upload, JS dialogs.**~~ Done: `Page.hover/3`,
+  `Page.set_input_files/4`, `dialogs:` / `Page.set_dialogs/3` /
+  `Page.handle_dialog/3`.
+- **Downloads.** In playwright_ex (fails in 0.16.0).
+- **First click into a just-loaded cross-site iframe is lost.** Chrome drops
+  input to an out-of-process iframe until it has painted, a moment after
+  `load`; `click/3` hit-tests the `<iframe>` element and returns `:ok`. Seen in
+  the dialogs integration test.
 - **Console messages.** playwright_ex (context `console` events) and Wallaby
   (`js_logger`).
 - **Timezone, clock, tracing.** playwright_ex only (ChromicPDF: timezone).

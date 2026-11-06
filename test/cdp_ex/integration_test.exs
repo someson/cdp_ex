@@ -1851,6 +1851,99 @@ defmodule CDPEx.IntegrationTest do
     end
   end
 
+  describe "JavaScript dialogs" do
+    test "dialogs are accepted by default, natively", %{fixture: fixture} do
+      {:ok, browser} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(browser) end)
+      {:ok, page} = CDPEx.new_page(browser)
+      {:ok, _} = Page.navigate(page, fixture <> "dialogs", wait_until: :load)
+
+      for id <- ["#confirm", "#prompt", "#alert"], do: assert(:ok = Page.click(page, id))
+
+      assert {:ok, ["confirm=true", "prompt=dflt", "alert=undefined"]} =
+               Page.evaluate(page, "window.results")
+
+      assert {:ok, true} = Page.evaluate(page, "String(window.confirm).includes('[native code]')")
+    end
+
+    test "dialogs: :dismiss, then set_dialogs/3 at runtime", %{fixture: fixture} do
+      {:ok, browser} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(browser) end)
+      {:ok, page} = CDPEx.new_page(browser, dialogs: :dismiss)
+      {:ok, _} = Page.navigate(page, fixture <> "dialogs", wait_until: :load)
+
+      assert :ok = Page.click(page, "#confirm")
+      assert :ok = Page.click(page, "#prompt")
+      assert :ok = Page.set_dialogs(page, {:accept, "typed"})
+      assert :ok = Page.click(page, "#prompt")
+
+      assert {:ok, ["confirm=false", "prompt=null", "prompt=typed"]} =
+               Page.evaluate(page, "window.results")
+    end
+
+    for opts <- [[dialogs: :manual], [prevent_alerts: false]] do
+      test "#{inspect(opts)} leaves the dialog to handle_dialog/3", %{fixture: fixture} do
+        {:ok, browser} = CDPEx.launch()
+        on_exit(fn -> stop_quietly(browser) end)
+        {:ok, page} = CDPEx.new_page(browser, unquote(opts))
+        {:ok, _} = Page.navigate(page, fixture <> "dialogs", wait_until: :load)
+
+        assert {:error, {:cdp_error, "Page.handleJavaScriptDialog", _}} =
+                 Page.handle_dialog(page, :accept)
+
+        :ok =
+          Connection.subscribe(page.conn, "Page.javascriptDialogOpening", 5_000,
+            session_id: page.session_id
+          )
+
+        click = Task.async(fn -> Page.click(page, "#prompt") end)
+
+        assert_receive {:cdp_event, _, "Page.javascriptDialogOpening",
+                        %{"type" => "prompt", "message" => "Name?", "defaultPrompt" => "dflt"}, _},
+                       5_000
+
+        assert Task.yield(click, 300) == nil
+        assert :ok = Page.handle_dialog(page, {:accept, "by hand"})
+        assert :ok = Task.await(click)
+        assert {:ok, ["prompt=by hand"]} = Page.evaluate(page, "window.results")
+      end
+    end
+
+    test "beforeunload is accepted, so a navigation away goes through", %{fixture: fixture} do
+      {:ok, browser} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(browser) end)
+      {:ok, page} = CDPEx.new_page(browser, dialogs: :dismiss)
+      ref = :telemetry_test.attach_event_handlers(self(), [[:cdp_ex, :dialog]])
+      on_exit(fn -> :telemetry.detach(ref) end)
+
+      {:ok, _} = Page.navigate(page, fixture <> "dialogs", wait_until: :load)
+      assert :ok = Page.click(page, "#arm-unload")
+      assert {:ok, _} = Page.navigate(page, fixture, wait_until: :load)
+      assert {:ok, "Hello"} = Page.text(page, "#greeting")
+
+      assert_receive {[:cdp_ex, :dialog], ^ref, _, %{type: "beforeunload", action: :accept}},
+                     2_000
+    end
+
+    for launch_opts <- [[], [pipe: true]] do
+      test "a cross-site iframe's dialog follows the page's policy (#{inspect(launch_opts)})" do
+        {:ok, %{port: port}} = FixtureServer.start()
+        {:ok, browser} = CDPEx.launch([extra_args: @sites] ++ unquote(launch_opts))
+        on_exit(fn -> stop_quietly(browser) end)
+        {:ok, page} = CDPEx.new_page(browser, dialogs: :dismiss)
+        ref = :telemetry_test.attach_event_handlers(self(), [[:cdp_ex, :dialog]])
+        on_exit(fn -> :telemetry.detach(ref) end)
+
+        inner = "http://b.test:#{port}/dialogs-frame"
+        {:ok, _} = Page.navigate(page, frame_url("a.test", port, inner), wait_until: :load)
+        # Chrome drops input to an out-of-process iframe until it has painted, which can
+        # be a moment after load, so the click is repeated until the dialog shows.
+        assert %{type: "confirm", message: "From frame?", url: ^inner, action: :dismiss} =
+                 click_until_dialog(page, "iframe", ref, 10)
+      end
+    end
+  end
+
   describe "request interception" do
     test "fulfill_request serves a synthetic response for an intercepted navigation", %{
       fixture: fixture
@@ -2890,6 +2983,16 @@ defmodule CDPEx.IntegrationTest do
 
   # Poll until `fun` is true or the deadline passes — for event-driven state (e.g.
   # a CDP event pruning a map) that settles asynchronously after the triggering call.
+  defp click_until_dialog(page, css, ref, attempts) do
+    :ok = Page.click(page, css)
+
+    receive do
+      {[:cdp_ex, :dialog], ^ref, _, meta} -> meta
+    after
+      500 -> if attempts > 1, do: click_until_dialog(page, css, ref, attempts - 1)
+    end
+  end
+
   defp eventually(fun, retries \\ 50) do
     cond do
       fun.() ->
