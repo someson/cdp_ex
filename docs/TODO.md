@@ -204,10 +204,10 @@ the others do and CDPEx doesn't, roughly by how often a scraper needs it:
   `Page.handle_dialog/3`.
 - ~~**Downloads.**~~ Done: `Page.wait_for_download/2`; a launched browser saves
   them in its profile dir. Design: `docs/design/2026-11-06-downloads.md`.
-- **First click into a just-loaded cross-site iframe is lost.** Chrome drops
-  input to an out-of-process iframe until it has painted, a moment after
-  `load`; `click/3` hit-tests the `<iframe>` element and returns `:ok`. Seen in
-  the dialogs integration test.
+- ~~**First click into a just-loaded cross-site iframe is lost.**~~ Done: until
+  the frame is in Chrome's hit-test data, input goes to the parent's `<iframe>`
+  element (a frame `first-paint` isn't enough). Trusted mouse calls on a frame
+  handle now move the pointer until the frame sees the move, then press.
 - ~~**Console messages.**~~ Done: `Page.observe_console/2`, cross-site
   iframes included.
 - **Timezone, clock, tracing.** playwright_ex only (ChromicPDF: timezone).
