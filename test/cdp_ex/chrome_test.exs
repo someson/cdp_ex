@@ -84,11 +84,54 @@ defmodule CDPEx.ChromeTest do
       assert "--disable-component-extensions-with-background-pages" in Chrome.default_args("/tmp/p")
     end
 
+    test "turns off Chrome's own background services" do
+      args = Chrome.default_args("/tmp/p")
+
+      for flag <- [
+            "--disable-sync",
+            "--metrics-recording-only",
+            "--no-service-autorun",
+            "--disable-client-side-phishing-detection",
+            "--disable-domain-reliability",
+            "--disable-default-apps",
+            "--password-store=basic",
+            "--use-mock-keychain"
+          ] do
+        assert flag in args
+      end
+
+      assert ("--disable-features=OptimizationHints,OptimizationGuideModelDownloading," <>
+                "NetworkTimeServiceQuerying,SafeBrowsingHashPrefixRealTimeLookups,PreconnectToSearch") in args
+    end
+
+    test "keeps Google's sign-in and updater hosts off the network by default" do
+      args = Chrome.default_args("/tmp/p")
+      assert "--proxy-bypass-list=accounts.google.com;update.googleapis.com" in args
+
+      assert "--host-resolver-rules=MAP accounts.google.com ~NOTFOUND, MAP update.googleapis.com ~NOTFOUND" in args
+    end
+
+    test "block_background_hosts: false leaves those hosts alone" do
+      args = Chrome.default_args("/tmp/p", block_background_hosts: false)
+      refute Enum.any?(args, &String.starts_with?(&1, "--proxy-bypass-list"))
+      refute Enum.any?(args, &String.starts_with?(&1, "--host-resolver-rules"))
+    end
+
     test "ships no anti-bot defaults" do
       args = Chrome.default_args("/tmp/p")
       refute Enum.any?(args, &String.contains?(&1, "AutomationControlled"))
       refute "--disable-web-security" in args
       refute Enum.any?(args, &String.starts_with?(&1, "--user-agent"))
+    end
+  end
+
+  describe "validate_opts!/2 :block_background_hosts" do
+    test "takes a boolean" do
+      assert :ok = Chrome.validate_opts!(block_background_hosts: false)
+
+      assert_raise ArgumentError, ~r/invalid :block_background_hosts "no"/, fn ->
+        Chrome.validate_opts!(block_background_hosts: "no")
+      end
     end
   end
 
@@ -138,6 +181,51 @@ defmodule CDPEx.ChromeTest do
       args = Chrome.build_args("/tmp/p", extra_args: ["--proxy-server=http://x:1"])
       assert "--proxy-server=http://x:1" in args
       assert "--headless" in args
+    end
+
+    test "a --disable-features in :extra_args joins the default list" do
+      args = Chrome.build_args("/tmp/p", extra_args: ["--disable-features=Translate"])
+      [flag] = Enum.filter(args, &String.starts_with?(&1, "--disable-features="))
+      assert flag =~ ~r/^--disable-features=OptimizationHints,.*,PreconnectToSearch,Translate$/
+    end
+
+    test "a feature in --enable-features is dropped from the default disable list" do
+      args = Chrome.build_args("/tmp/p", extra_args: ["--enable-features=OptimizationHints"])
+      [flag] = Enum.filter(args, &String.starts_with?(&1, "--disable-features="))
+      refute flag =~ "OptimizationHints,"
+      assert flag =~ "OptimizationGuideModelDownloading"
+      assert "--enable-features=OptimizationHints" in args
+    end
+
+    test "a bypass list and resolver rules in :extra_args join the defaults" do
+      args =
+        Chrome.build_args("/tmp/p",
+          extra_args: ["--proxy-bypass-list=*.local", "--host-resolver-rules=MAP x.test 127.0.0.1"]
+        )
+
+      assert Enum.filter(args, &String.starts_with?(&1, "--proxy-bypass-list=")) ==
+               ["--proxy-bypass-list=accounts.google.com;update.googleapis.com;*.local"]
+
+      assert Enum.filter(args, &String.starts_with?(&1, "--host-resolver-rules=")) == [
+               "--host-resolver-rules=MAP accounts.google.com ~NOTFOUND, " <>
+                 "MAP update.googleapis.com ~NOTFOUND, MAP x.test 127.0.0.1"
+             ]
+    end
+
+    test "with block_background_hosts: false, a user bypass list stays as given" do
+      args =
+        Chrome.build_args("/tmp/p",
+          block_background_hosts: false,
+          extra_args: ["--proxy-bypass-list=*.local"]
+        )
+
+      assert Enum.filter(args, &String.starts_with?(&1, "--proxy-bypass-list=")) ==
+               ["--proxy-bypass-list=*.local"]
+    end
+
+    test ":extra_args given as charlists merge too" do
+      args = Chrome.build_args("/tmp/p", extra_args: [~c"--disable-features=Translate"])
+      assert length(Enum.filter(args, &String.starts_with?(&1, "--disable-features="))) == 1
     end
 
     test ":args fully replaces the defaults" do
