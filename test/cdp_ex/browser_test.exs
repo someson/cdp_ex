@@ -640,8 +640,82 @@ defmodule CDPEx.BrowserTest do
       Connection.close(conn)
     end
 
+    test "a launched browser's isolated context gets its download dir" do
+      {state, conn} = fake_browser_state()
+      state = %{state | downloads_dir: "/tmp/profile/cdp_ex-downloads"}
+
+      assert {:reply, {:ok, _}, _} = new_page_in_task(state, transport: :session, isolated: true)
+
+      assert_receive {:sent, "Browser.setDownloadBehavior",
+                      %{
+                        "behavior" => "allowAndName",
+                        "browserContextId" => "C1",
+                        "downloadPath" => "/tmp/profile/cdp_ex-downloads",
+                        "eventsEnabled" => true
+                      }}
+
+      Connection.close(conn)
+    end
+
+    test "a failed download setup disposes the new context and opens no target" do
+      {state, conn} = fake_browser_state(%{"Browser.setDownloadBehavior" => :error})
+      state = %{state | downloads_dir: "/tmp/profile/cdp_ex-downloads"}
+
+      assert {:reply, {:error, {:cdp_error, "Browser.setDownloadBehavior", _}}, new_state} =
+               new_page_in_task(state, transport: :session, isolated: true)
+
+      assert_receive {:sent, "Target.disposeBrowserContext", %{"browserContextId" => "C1"}}
+      refute_received {:sent, "Target.createTarget", _}
+      assert new_state.contexts == %{}
+      Connection.close(conn)
+    end
+
+    test "a connected browser leaves a new context's downloads alone" do
+      {state, conn} = fake_browser_state()
+
+      assert {:reply, {:ok, _}, _} = new_page_in_task(state, transport: :session, isolated: true)
+
+      assert_receive {:sent, "Target.createTarget", _}
+      refute_received {:sent, "Browser.setDownloadBehavior", _}
+      Connection.close(conn)
+    end
+
     test "a non-boolean :isolated raises ArgumentError in the caller" do
       assert_raise ArgumentError, ~r/:isolated/, fn -> Browser.new_page(self(), isolated: :yes) end
+    end
+  end
+
+  describe "downloads/3" do
+    test "hands out the browser connection, the page's context and the dir" do
+      page = %Page{browser: self(), conn: self(), target_id: "T1", session_id: "S1"}
+
+      state = %Browser{
+        browser_conn: self(),
+        sessions: %{"T1" => "S1"},
+        contexts: %{"T1" => "C1"},
+        downloads_dir: "/d"
+      }
+
+      assert {:reply, {:ok, %{conn: conn, context_id: "C1", dir: "/d"}}, ^state} =
+               Browser.handle_call({:downloads, page}, {self(), make_ref()}, state)
+
+      assert conn == self()
+    end
+
+    test "a page the browser doesn't own is :unknown_page" do
+      page = %Page{browser: self(), conn: self(), target_id: "T9", session_id: "S9"}
+      state = %Browser{browser_conn: self(), downloads_dir: "/d"}
+
+      assert {:reply, {:error, :unknown_page}, ^state} =
+               Browser.handle_call({:downloads, page}, {self(), make_ref()}, state)
+    end
+
+    test "connect-mode is {:unsupported_with_connect, :downloads}" do
+      page = %Page{browser: self(), conn: self(), target_id: "T1", session_id: "S1"}
+      state = %Browser{browser_conn: self(), sessions: %{"T1" => "S1"}}
+
+      assert {:reply, {:error, {:unsupported_with_connect, :downloads}}, ^state} =
+               Browser.handle_call({:downloads, page}, {self(), make_ref()}, state)
     end
   end
 

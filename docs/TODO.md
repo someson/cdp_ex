@@ -202,7 +202,8 @@ the others do and CDPEx doesn't, roughly by how often a scraper needs it:
 - ~~**Hover, file upload, JS dialogs.**~~ Done: `Page.hover/3`,
   `Page.set_input_files/4`, `dialogs:` / `Page.set_dialogs/3` /
   `Page.handle_dialog/3`.
-- **Downloads.** In playwright_ex (fails in 0.16.0).
+- ~~**Downloads.**~~ Done: `Page.wait_for_download/2`; a launched browser saves
+  them in its profile dir. Design: `docs/design/2026-11-06-downloads.md`.
 - **First click into a just-loaded cross-site iframe is lost.** Chrome drops
   input to an out-of-process iframe until it has painted, a moment after
   `load`; `click/3` hit-tests the `<iframe>` element and returns `:ok`. Seen in

@@ -50,6 +50,7 @@ defmodule CDPExTest do
       {:devtools_file_malformed, "contents excerpt"},
       {:capture_failed, :timeout},
       {:idle_wait_failed, {:badmatch, nil}},
+      {:download_wait_failed, {:badmatch, nil}},
       {:launch_crashed, {%RuntimeError{message: "launch crash"}, []}},
       {:navigate, "net::ERR_CONNECTION_REFUSED"},
       {:navigate, "net::ERR_TIMED_OUT"}
@@ -98,6 +99,7 @@ defmodule CDPExTest do
       {:launch_failed, {:spawn, :emfile}},
       {:launch_failed, {:user_data_dir, :eacces}},
       {:no_document_response, "https://example.com/#hash"},
+      {:download_canceled, "https://example.com/report.csv"},
       {:connect_discovery_failed, :econnrefused}
     ]
 

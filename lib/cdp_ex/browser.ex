@@ -43,6 +43,8 @@ defmodule CDPEx.Browser do
   # Ceiling for the synchronous Fetch arm (proxy auth and/or block) during new_page, shared
   # by every request it sends (see reply_armed_page).
   @arm_timeout 15_000
+  # Under the profile dir, so a temp profile's removal takes the downloads with it.
+  @downloads_subdir "cdp_ex-downloads"
 
   defstruct [
     :chrome,
@@ -71,7 +73,10 @@ defmodule CDPEx.Browser do
     frames: %{},
     # request tag => {from, caller_monitor_ref | nil, fetch_pid}: a caller parked until
     # its page's Fetch owner reports the result of its request
-    pending: %{}
+    pending: %{},
+    # Where a launched Chrome saves downloads, set on every browser context it serves
+    # (see setup_downloads/2); nil in connect-mode, whose Chrome keeps its own settings.
+    downloads_dir: nil
   ]
 
   @type t :: %__MODULE__{}
@@ -282,6 +287,16 @@ defmodule CDPEx.Browser do
     call(browser, {:attach_frame, page, frame_id, timeout}, 2 * timeout + 5_000, :frame)
   end
 
+  # Internal hop for `CDPEx.Page.wait_for_download/2`: the browser connection, which
+  # receives the `Browser.download*` events, the page's browser context and the downloads
+  # dir. Connect-mode has no local dir: `{:error, {:unsupported_with_connect, :downloads}}`.
+  @doc false
+  @spec downloads(GenServer.server(), Page.t(), timeout()) ::
+          {:ok, %{conn: pid(), context_id: String.t() | nil, dir: String.t()}}
+          | {:error, term()}
+  def downloads(browser, %Page{} = page, timeout),
+    do: call(browser, {:downloads, page}, timeout, :wait_for_download)
+
   @doc false
   @spec release_interception(GenServer.server(), Page.t(), timeout()) :: :ok | {:error, term()}
   def release_interception(browser, %Page{} = page, timeout) do
@@ -427,10 +442,12 @@ defmodule CDPEx.Browser do
     # GenServer loop hasn't started, terminate/2 never runs, so reap Chrome (and the
     # conn) here or leak the OS process and temp profile.
     with {:ok, conn} <- start_browser_conn(endpoint, conn_opts),
-         :ok <- subscribe_detached(conn) do
+         :ok <- subscribe_detached(conn),
+         {:ok, downloads_dir} <- setup_downloads(conn, chrome) do
       {:ok,
        %__MODULE__{
          chrome: chrome,
+         downloads_dir: downloads_dir,
          connected: is_nil(chrome),
          pipe: match?({:pipe, _}, endpoint),
          browser_conn: conn,
@@ -444,6 +461,42 @@ defmodule CDPEx.Browser do
       {:error, reason} ->
         if chrome, do: Chrome.stop(chrome)
         stop_init(reason)
+    end
+  end
+
+  # Chrome's own default saves a download under the user's Downloads folder, on any
+  # click that triggers one. A launched Chrome saves them in its profile dir instead,
+  # named by guid, and reports them on the browser connection. The setting is per browser
+  # context: this covers the default one, set_context_downloads/3 each isolated one.
+  # It must be sent on the browser connection: Chrome resets it when the session that set
+  # it closes, so a page's session would hand the context back to the default on close.
+  defp setup_downloads(_conn, nil), do: {:ok, nil}
+
+  defp setup_downloads(conn, %{user_data_dir: user_data_dir}) do
+    dir = Path.join(user_data_dir, @downloads_subdir)
+
+    with :ok <- mkdir_downloads(dir),
+         :ok <- set_context_downloads(conn, dir, nil) do
+      {:ok, dir}
+    end
+  end
+
+  defp mkdir_downloads(dir) do
+    case File.mkdir_p(dir) do
+      :ok -> :ok
+      {:error, posix} -> {:error, {:launch_failed, {:user_data_dir, posix}}}
+    end
+  end
+
+  defp set_context_downloads(_conn, nil, _context_id), do: :ok
+
+  defp set_context_downloads(conn, dir, context_id) do
+    params = %{"behavior" => "allowAndName", "downloadPath" => dir, "eventsEnabled" => true}
+    params = if context_id, do: Map.put(params, "browserContextId", context_id), else: params
+
+    case Connection.call(conn, "Browser.setDownloadBehavior", params, @bootstrap_timeout) do
+      {:ok, _} -> :ok
+      {:error, _} = error -> error
     end
   end
 
@@ -696,6 +749,23 @@ defmodule CDPEx.Browser do
           {:error, _} = error ->
             {:reply, error, state}
         end
+    end
+  end
+
+  def handle_call({:downloads, %Page{}}, _from, %{downloads_dir: nil} = state),
+    do: {:reply, {:error, {:unsupported_with_connect, :downloads}}, state}
+
+  def handle_call({:downloads, %Page{target_id: tid, conn: conn, session_id: sid}}, _from, state) do
+    if own_page?(state, tid, conn, sid) do
+      downloads = %{
+        conn: state.browser_conn,
+        context_id: Map.get(state.contexts, tid),
+        dir: state.downloads_dir
+      }
+
+      {:reply, {:ok, downloads}, state}
+    else
+      {:reply, {:error, :unknown_page}, state}
     end
   end
 
@@ -1019,7 +1089,7 @@ defmodule CDPEx.Browser do
   end
 
   defp open_page(state, opts) do
-    with {:ok, context_id} <- maybe_create_context(state.browser_conn, opts),
+    with {:ok, context_id} <- maybe_create_context(state, opts),
          {:ok, tid} <- create_target(state.browser_conn, context_id) do
       open_target(state, tid, context_id, opts)
     end
@@ -1029,7 +1099,7 @@ defmodule CDPEx.Browser do
   # browser's default context). `disposeOnDetach` makes Chrome dispose it if the
   # browser connection drops, so a VM that dies without terminate/2 (connect-mode)
   # doesn't leave it behind on a Chrome it doesn't own.
-  defp maybe_create_context(browser_conn, opts) do
+  defp maybe_create_context(%{browser_conn: browser_conn} = state, opts) do
     if Keyword.get(opts, :isolated, false) do
       case Connection.call(
              browser_conn,
@@ -1037,11 +1107,26 @@ defmodule CDPEx.Browser do
              %{"disposeOnDetach" => true},
              @create_timeout
            ) do
-        {:ok, %{"browserContextId" => context_id}} -> {:ok, context_id}
-        {:error, reason} -> {:error, reason}
+        {:ok, %{"browserContextId" => context_id}} ->
+          context_downloads(browser_conn, state.downloads_dir, context_id)
+
+        {:error, reason} ->
+          {:error, reason}
       end
     else
       {:ok, nil}
+    end
+  end
+
+  # A new context starts with Chrome's default download behavior; give it the browser's.
+  defp context_downloads(browser_conn, dir, context_id) do
+    case set_context_downloads(browser_conn, dir, context_id) do
+      :ok ->
+        {:ok, context_id}
+
+      {:error, _} = error ->
+        dispose_context(browser_conn, context_id)
+        error
     end
   end
 
@@ -1092,7 +1177,7 @@ defmodule CDPEx.Browser do
   # bootstrap it over that shared connection. On any failure NEVER `safe_close`
   # browser_conn — it is shared by every other session.
   defp open_session_page(state, opts) do
-    with {:ok, context_id} <- maybe_create_context(state.browser_conn, opts),
+    with {:ok, context_id} <- maybe_create_context(state, opts),
          {:ok, tid} <- create_target(state.browser_conn, context_id) do
       attach_session(state, tid, context_id, opts)
     end

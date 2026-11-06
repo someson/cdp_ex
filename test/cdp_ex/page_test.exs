@@ -2340,6 +2340,21 @@ defmodule CDPEx.PageTest do
     end
   end
 
+  describe "wait_for_download/2 options" do
+    test "a :trigger that isn't a 0-arity function or a non-string :path raises before any call",
+         %{page: page, fake: fake} do
+      assert_raise ArgumentError, ~r/invalid :trigger/, fn ->
+        Page.wait_for_download(page, trigger: :click)
+      end
+
+      assert_raise ArgumentError, ~r/invalid :path/, fn ->
+        Page.wait_for_download(page, path: ~c"/tmp/x")
+      end
+
+      refute_receive {:fake_cdp_recv, ^fake, _}, 50
+    end
+  end
+
   describe "wait_for_response/3 :trigger (#126)" do
     test "catches a response that arrives while the trigger is still running", %{
       page: page,
