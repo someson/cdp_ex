@@ -1923,6 +1923,155 @@ defmodule CDPEx.PageTest do
     end
   end
 
+  describe "wait_for_response/3 body: true" do
+    # Answer Network.enable, then wait until both waiters (finish + response) exist.
+    defp arm_body_wait(conn, fake) do
+      assert_receive {:fake_cdp_recv, ^fake, %{"id" => nid, "method" => "Network.enable"}}, 2_000
+      FakeCDP.send_text(fake, ~s({"id":#{nid},"result":{}}))
+      wait_until_waiters(conn, 2)
+    end
+
+    defp response(fake, id, url),
+      do:
+        FakeCDP.send_text(
+          fake,
+          ~s({"method":"Network.responseReceived","params":{"requestId":"#{id}","response":{"url":"#{url}","status":200}}})
+        )
+
+    defp finished(fake, id),
+      do:
+        FakeCDP.send_text(
+          fake,
+          ~s({"method":"Network.loadingFinished","params":{"requestId":"#{id}","timestamp":1,"encodedDataLength":5}})
+        )
+
+    defp answer_body(fake, id, body, base64 \\ false) do
+      assert_receive {:fake_cdp_recv, ^fake,
+                      %{
+                        "id" => cid,
+                        "method" => "Network.getResponseBody",
+                        "params" => %{"requestId" => ^id}
+                      }},
+                     2_000
+
+      FakeCDP.send_text(
+        fake,
+        ~s({"id":#{cid},"result":{"body":"#{body}","base64Encoded":#{base64}}})
+      )
+    end
+
+    test "waits for the request to finish and returns the body with the response", %{
+      page: page,
+      conn: conn,
+      fake: fake
+    } do
+      task =
+        Task.async(fn -> Page.wait_for_response(page, "/api/data", body: true, timeout: 2_000) end)
+
+      arm_body_wait(conn, fake)
+
+      response(fake, "R1", "http://x/api/data")
+      refute_receive {:fake_cdp_recv, ^fake, %{"method" => "Network.getResponseBody"}}, 100
+      finished(fake, "R1")
+      answer_body(fake, "R1", "hello")
+
+      assert {:ok, %{"requestId" => "R1", "response" => %{"status" => 200}, "body" => "hello"}} =
+               Task.await(task)
+    end
+
+    test "a loadingFinished right behind the response is not missed", %{
+      page: page,
+      conn: conn,
+      fake: fake
+    } do
+      task =
+        Task.async(fn -> Page.wait_for_response(page, "/api/data", body: true, timeout: 2_000) end)
+
+      arm_body_wait(conn, fake)
+
+      # Another request finishing first must not count.
+      finished(fake, "R0")
+      response(fake, "R1", "http://x/api/data")
+      finished(fake, "R1")
+      answer_body(fake, "R1", "aGk=", true)
+
+      assert {:ok, %{"requestId" => "R1", "body" => "hi"}} = Task.await(task)
+    end
+
+    test "a failed load is {:error, {:loading_failed, error_text}}", %{
+      page: page,
+      conn: conn,
+      fake: fake
+    } do
+      task =
+        Task.async(fn -> Page.wait_for_response(page, "/api/data", body: true, timeout: 2_000) end)
+
+      arm_body_wait(conn, fake)
+
+      response(fake, "R1", "http://x/api/data")
+
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Network.loadingFailed","params":{"requestId":"R1","timestamp":1,"type":"Fetch","errorText":"net::ERR_CONNECTION_RESET","canceled":false}})
+      )
+
+      assert {:error, {:loading_failed, "net::ERR_CONNECTION_RESET"}} = Task.await(task)
+    end
+
+    test "a request that never finishes is {:error, :timeout}", %{
+      page: page,
+      conn: conn,
+      fake: fake
+    } do
+      task =
+        Task.async(fn -> Page.wait_for_response(page, "/api/data", body: true, timeout: 300) end)
+
+      arm_body_wait(conn, fake)
+      response(fake, "R1", "http://x/api/data")
+      assert {:error, :timeout} = Task.await(task)
+    end
+
+    test "works with :trigger", %{page: page, fake: fake} do
+      test = self()
+
+      task =
+        Task.async(fn ->
+          Page.wait_for_response(page, "/api/data",
+            body: true,
+            timeout: 2_000,
+            trigger: fn -> send(test, :triggered) end
+          )
+        end)
+
+      assert_receive {:fake_cdp_recv, ^fake, %{"id" => nid, "method" => "Network.enable"}}, 2_000
+      FakeCDP.send_text(fake, ~s({"id":#{nid},"result":{}}))
+      assert_receive :triggered, 2_000
+
+      response(fake, "R1", "http://x/api/data")
+      finished(fake, "R1")
+      answer_body(fake, "R1", "ok")
+      assert {:ok, %{"body" => "ok"}} = Task.await(task)
+    end
+
+    test "leaves no waiter behind", %{page: page, conn: conn, fake: fake} do
+      task =
+        Task.async(fn -> Page.wait_for_response(page, "/api/data", body: true, timeout: 2_000) end)
+
+      arm_body_wait(conn, fake)
+      response(fake, "R1", "http://x/api/data")
+      finished(fake, "R1")
+      answer_body(fake, "R1", "x")
+      assert {:ok, _} = Task.await(task)
+      assert :sys.get_state(conn).waiters == []
+    end
+
+    test "a non-boolean :body raises ArgumentError", %{page: page} do
+      assert_raise ArgumentError, ~r/invalid :body/, fn ->
+        Page.wait_for_response(page, "/x", body: :yes)
+      end
+    end
+  end
+
   describe "wait_for_response/3 :trigger (#126)" do
     test "catches a response that arrives while the trigger is still running", %{
       page: page,
@@ -2692,6 +2841,14 @@ defmodule CDPEx.PageTest do
 
   # Poll until at least one await_event waiter is registered on `conn` (waiters are not
   # subscriptions, so they can't be observed via `subscribed?/3`).
+  defp wait_until_waiters(conn, n, retries \\ 100) do
+    cond do
+      length(:sys.get_state(conn).waiters) >= n -> :ok
+      retries == 0 -> flunk("#{n} await_event waiters not registered in time")
+      true -> Process.sleep(10) && wait_until_waiters(conn, n, retries - 1)
+    end
+  end
+
   defp wait_until_waiting(conn, retries \\ 100) do
     cond do
       :sys.get_state(conn).waiters != [] -> :ok

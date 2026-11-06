@@ -1042,6 +1042,23 @@ defmodule CDPEx.IntegrationTest do
       assert {:ok, "fetched-data"} = read_body_eventually(page, req)
     end
 
+    test "wait_for_response body: true returns the body with the response, no retry", %{
+      page: page,
+      fixture: fixture
+    } do
+      {:ok, _} = Page.navigate(page, fixture)
+      :ok = Page.wait_for_selector(page, "#fetch-btn")
+
+      for _ <- 1..5 do
+        assert {:ok, %{"response" => %{"status" => 200}, "body" => "fetched-data"}} =
+                 Page.wait_for_response(page, "/data",
+                   body: true,
+                   timeout: 5_000,
+                   trigger: fn -> Page.click(page, "#fetch-btn") end
+                 )
+      end
+    end
+
     test "wait_for_response :trigger catches the response of the click it runs", %{
       page: page,
       fixture: fixture

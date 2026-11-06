@@ -134,6 +134,7 @@ defmodule CDPEx do
              | :block_resources
              | :subscribe}
           | {:navigate, String.t()}
+          | {:loading_failed, String.t()}
           | {:no_document_response, String.t()}
           | {:connect_discovery_failed, term()}
           | {:capture_failed, term()}
@@ -277,6 +278,13 @@ defmodule CDPEx do
   # navigation was a same-document hop vs a slow miss. Explicit (not the catch-all) so
   # they read as decisions and the coverage test holds them.
   def classify_error({:navigate, _}), do: :unknown
+
+  # A request that failed after its response (wait_for_response/3 with body: true):
+  # the same net::ERR_* text as a failed navigation, bucketed the same way.
+  def classify_error({:loading_failed, error_text}) when is_binary(error_text) do
+    if transient_net_error?(error_text), do: :transient, else: :unknown
+  end
+
   def classify_error({:cdp_error, _, _}), do: :unknown
   def classify_error({:write_failed, _}), do: :unknown
   def classify_error({:launch_failed, _}), do: :unknown

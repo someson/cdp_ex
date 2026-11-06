@@ -1663,6 +1663,16 @@ defmodule CDPEx.Page do
   `Network.enable`, is missed and the call runs to `:timeout`, and on a `:session`
   page so is a detach in that window. Prefer `:trigger`.
 
+  ## The body with the response (`body: true`)
+
+  `body: true` also waits for the matched request to finish loading
+  (`Network.loadingFinished`) and returns its body, decoded, under `"body"` in the
+  params. `response_body/3` called right after the response alone races that event:
+  Chrome answers `"No data found"` until the body has fully arrived. A request that
+  fails after its response returns `{:error, {:loading_failed, error_text}}` (Chrome's
+  `net::ERR_*` text); one that never finishes (a stream, `EventSource`) runs to
+  `:timeout`, which covers the finish and the body read too.
+
   > #### Returns `{:ok, params}`, not a bare `:ok` {: .info}
   >
   > Unlike `wait_for_navigation/2` / `wait_for_selector/3` / `wait_for_network_idle/2`
@@ -1670,6 +1680,8 @@ defmodule CDPEx.Page do
 
   Options:
     * `:trigger` — a 0-arity function that starts the request (see above)
+    * `:body` — `true` waits for the request to finish and returns its body too
+      (see above) (default `false`)
     * `:timeout` — ceiling in ms; a running `trigger` is not interrupted (see
       above) (default 30_000)
   """
@@ -1677,13 +1689,90 @@ defmodule CDPEx.Page do
           {:ok, map()} | {:error, term()}
   def wait_for_response(%__MODULE__{} = page, matcher, opts \\ []) do
     trigger = response_trigger(Keyword.get(opts, :trigger))
+    body? = response_body_opt(Keyword.get(opts, :body, false))
     deadline = System.monotonic_time(:millisecond) + Keyword.get(opts, :timeout, @navigate_timeout)
     predicate = response_url_predicate(matcher)
 
-    if trigger do
-      await_triggered_response(page, predicate, trigger, deadline)
+    if body? do
+      await_response_with_body(page, predicate, trigger, deadline)
     else
-      await_response(page, predicate, deadline)
+      await_matched_response(page, predicate, trigger, deadline)
+    end
+  end
+
+  defp await_matched_response(page, predicate, nil, deadline),
+    do: await_response(page, predicate, deadline)
+
+  defp await_matched_response(page, predicate, trigger, deadline),
+    do: await_triggered_response(page, predicate, trigger, deadline)
+
+  defp response_body_opt(value) when is_boolean(value), do: value
+
+  defp response_body_opt(other),
+    do: raise(ArgumentError, "invalid :body #{inspect(other)} (expected a boolean)")
+
+  # body: true. The matched request's requestId isn't known until its response, and its
+  # loadingFinished can follow at once, before a second wait could be registered. So the
+  # finish waiter is registered up front, and the response matcher records the id in a
+  # table the finish matcher reads: both run in the connection process, in event order,
+  # so the id is there before that request's loadingFinished is matched.
+  defp await_response_with_body(page, predicate, trigger, deadline) do
+    table = :ets.new(:cdp_ex_wait_for_response, [:set, :public])
+
+    recording = fn params ->
+      predicate.(params) and record_request_id(table, params["requestId"])
+    end
+
+    case Connection.await_event_async(page.conn, &finished?(table, &1), remaining(deadline),
+           session_id: page.session_id
+         ) do
+      {:ok, ref} ->
+        mon = Process.monitor(page.conn)
+
+        try do
+          with {:ok, params} <- await_matched_response(page, recording, trigger, deadline),
+               :ok <- await_finished(ref, mon, deadline),
+               {:ok, body} <-
+                 response_body(page, params["requestId"], timeout: max(remaining(deadline), 1)) do
+            {:ok, Map.put(params, "body", body)}
+          end
+        after
+          Process.demonitor(mon, [:flush])
+          Connection.cancel_await(page.conn, ref)
+          :ets.delete(table)
+        end
+
+      {:error, reason} ->
+        :ets.delete(table)
+        await_result({:error, reason})
+    end
+  end
+
+  defp record_request_id(table, request_id) when is_binary(request_id) do
+    :ets.insert_new(table, {:request_id, request_id})
+    true
+  end
+
+  defp record_request_id(_table, _request_id), do: false
+
+  # Network.loadingFinished (encodedDataLength, no dataLength: not dataReceived) or
+  # Network.loadingFailed (errorText) of the recorded request.
+  defp finished?(table, %{"requestId" => id} = params) when is_binary(id) do
+    finish_event?(params) and :ets.lookup(table, :request_id) == [{:request_id, id}]
+  end
+
+  defp finished?(_table, _params), do: false
+
+  defp finish_event?(params) do
+    not Map.has_key?(params, "response") and not Map.has_key?(params, "dataLength") and
+      (Map.has_key?(params, "encodedDataLength") or Map.has_key?(params, "errorText"))
+  end
+
+  defp await_finished(ref, mon, deadline) do
+    case receive_response(ref, mon, deadline) do
+      {:ok, %{"errorText" => error_text}} -> {:error, {:loading_failed, error_text}}
+      {:ok, _finished} -> :ok
+      {:error, _} = error -> error
     end
   end
 

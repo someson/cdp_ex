@@ -150,7 +150,10 @@ frame, then `Network.loadingFinished`, then `Network.getResponseBody`. Add
 `headers` and `request_id` to the returned map so the body can be read with
 `response_body/3`. Estimate: 2–3 hours.
 
-## 12. Read a response body without racing `loadingFinished`
+## 12. Read a response body without racing `loadingFinished` — done
+
+`body: true` on `wait_for_response/3` (see `CHANGELOG.md`). Kept below for the
+original problem statement.
 
 `response_body/3` called between `Network.responseReceived` (what
 `wait_for_response/3` resolves on) and `Network.loadingFinished` returns
