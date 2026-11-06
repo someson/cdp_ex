@@ -275,7 +275,12 @@ defmodule Compare.CDPEx do
       dialog: fn ->
         {:unsupported, @raw <> " (Page.handleJavaScriptDialog); a dialog blocks the page"}
       end,
-      hover: fn -> {:unsupported, "no hover; click/3 and scroll/3 are the only pointer helpers"} end,
+      hover:
+        probe.(fn page ->
+          open(page, url, :load)
+          :ok = Page.hover(page, "#hover")
+          ok!(Page.text(page, "#hover"))
+        end),
       console: fn -> {:unsupported, @raw <> " (Runtime.consoleAPICalled)"} end,
       iframe_content: fn ->
         {:unsupported, "Page functions run in the main frame only; no frame selection"}

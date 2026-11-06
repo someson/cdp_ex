@@ -661,6 +661,30 @@ defmodule CDPEx.IntegrationTest do
       assert [%{"id" => "covered-btn", "trusted" => true}] = clicks(page)
     end
 
+    test "hover/3 moves a trusted pointer over the element, opening a :hover menu", %{
+      page: page,
+      fixture: fixture
+    } do
+      {:ok, _} = Page.navigate(page, fixture <> "interact", wait_until: :load)
+      assert {:error, {:not_clickable, "#hover-item"}} = Page.click(page, "#hover-item")
+
+      assert :ok = Page.hover(page, "#hover-trigger")
+
+      assert {:ok, [%{"id" => "hover-trigger", "trusted" => true}]} =
+               Page.evaluate(page, "window.hovers")
+
+      assert clicks(page) == []
+      assert :ok = Page.click(page, "#hover-item")
+      assert [%{"id" => "hover-item", "trusted" => true}] = clicks(page)
+    end
+
+    test "hover/3 reports the click errors", %{page: page, fixture: fixture} do
+      {:ok, _} = Page.navigate(page, fixture <> "interact", wait_until: :load)
+      assert {:error, {:selector_not_found, "#nope"}} = Page.hover(page, "#nope")
+      assert {:error, {:not_clickable, "#hidden-text-btn"}} = Page.hover(page, "#hidden-text-btn")
+      assert {:error, {:obscured, "#covered-btn"}} = Page.hover(page, "#covered-btn")
+    end
+
     test "click/3 returns :selector_not_found for no match", %{page: page, fixture: fixture} do
       {:ok, _} = Page.navigate(page, fixture)
       assert {:error, {:selector_not_found, "#nope"}} = Page.click(page, "#nope")

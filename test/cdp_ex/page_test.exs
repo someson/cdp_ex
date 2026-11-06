@@ -637,6 +637,44 @@ defmodule CDPEx.PageTest do
     end
   end
 
+  describe "hover/3" do
+    test "dispatches a single mouseMoved with no button at the hit point", %{
+      page: page,
+      fake: fake
+    } do
+      task = Task.async(fn -> Page.hover(page, "#menu") end)
+      reply_evaluate(fake, %{"found" => true, "clickable" => true, "x" => 10, "y" => 20})
+
+      assert_receive {:fake_cdp_recv, ^fake,
+                      %{
+                        "id" => id,
+                        "method" => "Input.dispatchMouseEvent",
+                        "params" => %{
+                          "type" => "mouseMoved",
+                          "x" => 10,
+                          "y" => 20,
+                          "button" => "none",
+                          "buttons" => 0
+                        }
+                      }},
+                     2_000
+
+      FakeCDP.send_text(fake, ~s({"id":#{id},"result":{}}))
+      assert :ok = Task.await(task, 2_000)
+      refute_received {:fake_cdp_recv, ^fake, %{"method" => "Input.dispatchMouseEvent"}}
+    end
+
+    test ":wait retries while the element is covered", %{page: page, fake: fake} do
+      task = Task.async(fn -> Page.hover(page, "#menu", wait: 300) end)
+
+      {result, attempts} =
+        answer_until_done(task, fake, %{"found" => true, "clickable" => false, "obscured" => true})
+
+      assert result == {:error, {:obscured, "#menu"}}
+      assert attempts > 1
+    end
+  end
+
   describe "click_text/3" do
     test "JSON-encodes the text and selector into the locator", %{page: page, fake: fake} do
       task =
