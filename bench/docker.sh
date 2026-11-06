@@ -13,7 +13,7 @@ docker build --build-arg BROWSER=chromium -t cdp_ex-test:chromium "$root/test/do
 docker build -t cdp_ex-bench "$root/bench"
 
 pass=()
-for var in ROUNDS SCENARIOS LIBS ITERATIONS DURATION_S CONCURRENCY CDP_EX_LAUNCH_OPTS CDP_EX_PAGE_OPTS INTERVAL_MS; do
+for var in ROUNDS SCENARIOS LIBS ITERATIONS DURATION_S CONCURRENCY BROWSERS CDP_EX_LAUNCH_OPTS CDP_EX_PAGE_OPTS INTERVAL_MS; do
   [ -n "${!var:-}" ] && pass+=(-e "$var")
 done
 

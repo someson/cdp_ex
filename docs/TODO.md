@@ -108,22 +108,37 @@ moving Chrome off the application host, a farm of browser hosts behind one pool,
 or a cloud browser provider. The remote DevTools endpoint needs TLS and a token
 in front of it, since it gives full control of the browser.
 
-## 8. Several pages per pooled browser — idea
+## 8. Several pages per pooled browser — measured, not built
 
 `CDPEx.Pool` hands a browser to one job at a time, so 8 parallel jobs run 8
-Chromes (an estimated ~3 GB at ~360 MB each). One browser ran 8 concurrent
-isolated pages at ~850 MB peak PSS (`bench/`, 4 CPUs). A `pages_per_browser:`
-option would let `size: 2, pages_per_browser: 4` serve the same 8 jobs on 2
-Chromes. Measure 8×1, 2×4 and 1×8 with `bench/` before building it.
+Chromes. A `pages_per_browser:` option would let `size: 2, pages_per_browser: 4`
+serve the same 8 jobs on 2 Chromes.
 
-Prerequisite: `CDPEx.Browser` opens pages one at a time. `handle_call({:new_page,
-_})` runs the whole setup inside the GenServer (browser context,
-`Target.createTarget`, the per-page WebSocket upgrade, the bootstrap calls,
-proxy auth), so concurrent `new_page/2` calls on one browser queue behind each
-other, and a slow one also delays `close_page/2` for every other page. Moving
-the setup out of the GenServer means reworking how pages, contexts, auth and
-interception are tracked, which today rely on calls being served one at a
-time. Measure how long the queue gets with 4 pages per browser first.
+Measured 2026-11-06 with `bench/` (`concurrent`, 8 workers, isolated pages as in
+`Pool.with_page/3`, `BROWSERS` = 8, 2, 1; Docker on an Apple Silicon host,
+Chrome for Testing 156 arm64, 3 rounds of 20 s, medians):
+
+| Browsers × pages | CPUs | jobs/s | `new_page` p50 / p95 ms | peak PSS MB | procs | CPU s |
+|---|---|---|---|---|---|---|
+| 8 × 1 | 8 | 17.6 | 290 / 436 | 1712 | 86 | 116 |
+| 2 × 4 | 8 | 13.6 | 254 / 395 | 966 | 34 | 120 |
+| 1 × 8 | 8 | 8.6 | 419 / 604 | 831 | 24 | 77 |
+| 8 × 1 | 4 | 8.9 | 589 / 799 | 1716 | 86 | 63 |
+| 2 × 4 | 4 | 7.2 | 471 / 706 | 960 | 34 | 66 |
+| 1 × 8 | 4 | 7.8 | 451 / 664 | 799 | 23 | 67 |
+
+- 2 × 4 takes about 44% less memory than 8 × 1 (≈960 vs ≈1710 MB) for about 20%
+  fewer jobs/s, at 4 and at 8 CPUs.
+- One browser tops out near 8–9 jobs/s whatever the CPUs: at 8 CPUs 1 × 8 uses
+  under 4 of them and its `new_page` p50 rises to ~420 ms. That ceiling is either
+  `CDPEx.Browser` serving page setup one call at a time or Chrome's own browser
+  process; untested which. With two browsers `new_page` is no slower than with
+  eight, so at 4 pages per browser the queue isn't the limit.
+- With CPU to spare, a browser costs ~210 MB and lifts throughput; the option
+  pays off only where memory, not CPU, is short.
+
+Rerun: `CPUS=8 BROWSERS=2 CONCURRENCY=8 SCENARIOS=concurrent LIBS=cdp_ex
+CDP_EX_PAGE_OPTS="[isolated: true]" bench/docker.sh`.
 
 ## 9. Proxy login and request interception on one page — done
 
