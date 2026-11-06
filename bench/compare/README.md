@@ -146,10 +146,10 @@ rounds of 20 samples (`cold`: 10; `concurrent`: 20 s, 8 workers).
 | Read an element's text | ✓ | ✓ | ✗ | ✓ |
 | Click | ✓ | ✓ | ✗ | ✓ |
 | Fill a form (type, select, check) | ✓ | ✓ | ✗ | ✓ |
-| File upload | ✓¹ | ✓ | ✗ | ✓ |
+| File upload | ✓† | ✓ | ✗ | ✓ |
 | Download | ✗ | fail | ✗ | ✗ |
-| Answer a JS dialog | ✗ | ✓ | ✗ | ✓ |
-| Hover | ✓¹ | ✓ | ✗ | ✓ |
+| Answer a JS dialog | ✓† | ✓ | ✗ | ✓ |
+| Hover | ✓† | ✓ | ✗ | ✓ |
 | Evaluate JS, get the value | ✓ | ✓ | partial | ✓ |
 | Console messages | ✗ | ✓ | ✗ | ✓ |
 | Read inside an iframe | ✗ | ✓ | ✗ | ✓ |
@@ -174,7 +174,7 @@ rounds of 20 samples (`cold`: 10; `concurrent`: 20 s, 8 workers).
 | Firefox | ✗ | ✓ | ✗ | partial |
 | WebKit | ✗ | ✓ | ✗ | ✗ |
 
-¹ Added after the reference run (`Page.hover/3`, `Page.set_input_files/4`); the probes pass in the same image (`LIBS=cdp_ex TASKS= ROUNDS=0 bench/compare/run.sh`).
+† Added after the reference run (`Page.hover/3`, `Page.set_input_files/4`, `dialogs:`); the probes pass in the same image (`LIBS=cdp_ex TASKS= ROUNDS=0 bench/compare/run.sh`).
 
 Partial and failed results, with the probe's note:
 

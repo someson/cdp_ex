@@ -17,8 +17,6 @@ defmodule CDPEx.Protocol do
 
   alias Mint.WebSocket
 
-  @prevent_alerts_js "window.alert=function(){};window.confirm=function(){return true};window.prompt=function(){return null};"
-
   @typedoc "A decoded `Mint.WebSocket` frame."
   @type frame :: WebSocket.frame() | {:close, integer() | nil, binary()}
 
@@ -289,11 +287,4 @@ defmodule CDPEx.Protocol do
       {:error, _} -> String.to_charlist(host)
     end
   end
-
-  @doc """
-  JavaScript that neutralises `alert`/`confirm`/`prompt` so modal dialogs can't
-  block automation. Injected via `Page.addScriptToEvaluateOnNewDocument`.
-  """
-  @spec prevent_alerts_js() :: String.t()
-  def prevent_alerts_js, do: @prevent_alerts_js
 end

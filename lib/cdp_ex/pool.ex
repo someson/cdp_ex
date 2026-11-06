@@ -164,7 +164,7 @@ defmodule CDPEx.Pool do
   `isolated: false` to share the browser's default context across jobs (a login
   kept between calls, say).
 
-  `opts` are forwarded to `CDPEx.with_page/3` (e.g. `:prevent_alerts`, or
+  `opts` are forwarded to `CDPEx.with_page/3` (e.g. `:dialogs`, or
   `:deadline`, which closes the page — not the pooled browser — and whose clock
   starts after checkout, so it doesn't cover the wait for a free browser); pass
   `:checkout_timeout` to bound that wait.

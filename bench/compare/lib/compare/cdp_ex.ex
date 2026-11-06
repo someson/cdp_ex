@@ -279,9 +279,12 @@ defmodule Compare.CDPEx do
           ok!(Page.text(page, "#fileName"))
         end),
       download: fn -> {:unsupported, @raw <> " (Browser.setDownloadBehavior)"} end,
-      dialog: fn ->
-        {:unsupported, @raw <> " (Page.handleJavaScriptDialog); a dialog blocks the page"}
-      end,
+      dialog:
+        probe.(fn page ->
+          open(page, url, :load)
+          :ok = Page.click(page, "#alert")
+          ok!(Page.text(page, "#dialog"))
+        end),
       hover:
         probe.(fn page ->
           open(page, url, :load)
