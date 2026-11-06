@@ -503,8 +503,9 @@ defmodule CDPEx.BrowserTest do
       assert {:reply, {:ok, _page}, new_state} =
                new_page_in_task(state, transport: :dedicated, block: ["Image"])
 
+      # Auth already pauses everything, so the block arm needs no second enable.
       assert_received {:sent, "Fetch.enable", %{"handleAuthRequests" => true}}
-      assert_received {:sent, "Fetch.enable", %{"handleAuthRequests" => true}}
+      refute_received {:sent, "Fetch.enable", _}
       assert map_size(new_state.fetchers) == 1
       Connection.close(conn)
     end

@@ -209,9 +209,16 @@ defmodule CDPEx.FetchTest do
       assert Fetch.decide(with_modes(%{}, nil), paused("https://a/")) == :continue
     end
 
-    test "without block or auth every pause is the owner's (Chrome applied its patterns)" do
+    test "with interception alone, the owner gets the pauses matching its patterns" do
       state = with_modes(nil, [%{"resourceType" => "Image"}])
-      assert Fetch.decide(state, paused("https://a/")) == :forward
+      assert Fetch.decide(state, paused("https://a/x.png", "Image")) == :forward
+    end
+
+    test "with interception alone, a pause outside the owner's patterns continues" do
+      # A pause Chrome made under the previous enable (an image while the block set
+      # shrank to nothing) arrives after the state changed: it isn't the owner's.
+      state = with_modes(nil, [%{"resourceType" => "Stylesheet"}])
+      assert Fetch.decide(state, paused("https://a/x.png", "Image")) == :continue
     end
 
     test "with auth only matching Request-stage pauses and every Response-stage pause go" do
@@ -320,7 +327,7 @@ defmodule CDPEx.FetchTest do
       assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
     end
 
-    test "interception alone sends the caller's patterns and forwards every pause", %{
+    test "interception alone sends the caller's patterns and forwards its pauses", %{
       conn: conn,
       fake: fake
     } do
@@ -332,7 +339,7 @@ defmodule CDPEx.FetchTest do
       assert expect_call(fake, "Fetch.enable") == %{"patterns" => patterns}
       assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
 
-      pause(fake, "r1", "https://a.test/", "Document")
+      pause(fake, "r1", "https://a.test/x.png", "Image")
       assert_receive {:cdp_event, ^conn, "Fetch.requestPaused", %{"requestId" => "r1"}, nil}, 2_000
       refute_receive {:fake_cdp_recv, ^fake, %{"method" => "Fetch.continueRequest"}}, 100
 
@@ -577,10 +584,11 @@ defmodule CDPEx.FetchTest do
       pid = start_owner(conn)
       arm(pid, fake, {:auth, @auth})
 
+      # Auth already pauses everything, so block changes no enable param: no CDP call.
       tag = make_ref()
       Fetch.request(pid, tag, {:block, ["Image"], 5_000})
-      assert expect_call(fake, "Fetch.enable") == %{"handleAuthRequests" => true}
       assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+      refute_received {:fake_cdp_recv, ^fake, %{"method" => "Fetch.enable"}}
 
       pause(fake, "img", "https://a.test/x.png", "Image")
       assert %{"requestId" => "img"} = expect_call(fake, "Fetch.failRequest")
@@ -605,6 +613,22 @@ defmodule CDPEx.FetchTest do
 
       assert expect_call(fake, "Fetch.continueRequest") == %{"requestId" => "css"}
       assert expect_call(fake, "Fetch.enable") == Fetch.enable_params(nil, nil, ["Image"])
+    end
+
+    test "a mode change that leaves the enable params as they are sends no Fetch.enable", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+      arm(pid, fake, {:block, ["Image"], 5_000})
+
+      tag = make_ref()
+      Fetch.request(pid, tag, {:block, ["Image"], 5_000})
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+      refute_receive {:fake_cdp_recv, ^fake, %{"method" => "Fetch.enable"}}, 100
+
+      # A real change still re-enables.
+      arm(pid, fake, {:block, ["Image", "Font"], 5_000})
     end
 
     test "terminate disables Fetch when only block is on", %{conn: conn, fake: fake} do

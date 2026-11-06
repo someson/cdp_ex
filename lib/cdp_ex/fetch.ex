@@ -273,12 +273,18 @@ defmodule CDPEx.Fetch do
 
   # Apply `next`'s modes to the page's Fetch domain. On success the state becomes
   # `next`; on failure it stays `prev`, whose enable is still in effect.
+  # A change that leaves the params as they are (block added while auth already pauses
+  # everything, the same block set again) needs no CDP call.
   defp rearm(prev, next, timeout) do
-    case enable_params(next.auth, next.intercept && next.intercept.patterns, next.block) do
-      nil -> disable(prev, next, timeout)
-      params -> enable(prev, next, params, timeout)
+    case {params_of(next), params_of(prev)} do
+      {nil, _} -> disable(prev, next, timeout)
+      {same, same} -> {:ok, next}
+      {params, _} -> enable(prev, next, params, timeout)
     end
   end
+
+  defp params_of(state),
+    do: enable_params(state.auth, state.intercept && state.intercept.patterns, state.block)
 
   defp disable(%__MODULE__{auth: nil, intercept: nil, block: nil}, next, _timeout), do: {:ok, next}
 
@@ -384,10 +390,11 @@ defmodule CDPEx.Fetch do
 
   @doc false
   # What to do with a paused request: fail it (a blocked type at the Request stage),
-  # forward it to the interception owner, or let it through. With auth and block off,
-  # Chrome paused exactly the owner's patterns. Otherwise more requests pause at the
-  # Request stage than the owner asked for, so match them here; the Response stage
-  # only has the owner's patterns.
+  # forward it to the interception owner, or let it through. A Request-stage pause is
+  # matched against the owner's patterns even when Chrome paused only those: with auth
+  # or block on, more requests pause than the owner asked for, and a pause made under
+  # the previous enable can arrive after a mode change (an image while the block set
+  # shrank). The Response stage only has the owner's patterns.
   @spec decide(t(), map()) :: :block | :forward | :continue
   def decide(state, params) do
     cond do
@@ -405,8 +412,6 @@ defmodule CDPEx.Fetch do
         :continue
     end
   end
-
-  defp owners?(%__MODULE__{auth: nil, block: nil}, _params), do: true
 
   defp owners?(%__MODULE__{intercept: %{matchers: matchers}}, params),
     do: response_pause?(params) or matches?(matchers, params)
