@@ -250,7 +250,7 @@ defmodule CDPEx.IntegrationTest do
   end
 
   describe "session transport" do
-    test "closing a session page fails a call blocked on it, and later calls, at once (#121)", %{
+    test "closing a session page fails a call blocked on it, and later calls, at once", %{
       fixture: fixture
     } do
       {:ok, browser} = CDPEx.launch()
@@ -275,7 +275,7 @@ defmodule CDPEx.IntegrationTest do
       assert elapsed_us < 1_000_000
     end
 
-    test "closing a session page ends a wait_for_selector on it promptly (#121)", %{
+    test "closing a session page ends a wait_for_selector on it promptly", %{
       fixture: fixture
     } do
       {:ok, browser} = CDPEx.launch()
@@ -296,7 +296,7 @@ defmodule CDPEx.IntegrationTest do
       assert elapsed_us < 2_000_000
     end
 
-    test "closing a session page ends a navigation or network-idle wait on it promptly (#121)", %{
+    test "closing a session page ends a navigation or network-idle wait on it promptly", %{
       fixture: fixture
     } do
       {:ok, browser} = CDPEx.launch()
@@ -342,7 +342,7 @@ defmodule CDPEx.IntegrationTest do
       end
     end
 
-    test "a with_page deadline on a browser pid's session page returns near the deadline (#121)",
+    test "a with_page deadline on a browser pid's session page returns near the deadline",
          %{fixture: fixture} do
       {:ok, browser} = CDPEx.launch()
       on_exit(fn -> stop_quietly(browser) end)
@@ -363,7 +363,7 @@ defmodule CDPEx.IntegrationTest do
 
       assert Process.get(:waiting), "fun didn't reach its wait within the deadline"
       assert result == {:error, :deadline_exceeded}
-      # Before #121 the in-flight evaluate waited out its 15s call timeout.
+      # Earlier the in-flight evaluate waited out its 15s call timeout.
       assert elapsed_us < 4_500_000
       assert :sys.get_state(browser).sessions == %{}
     end
@@ -1110,7 +1110,7 @@ defmodule CDPEx.IntegrationTest do
       # the main-frame `load` (lifecycle is matched by name, not loaderId, so there is no
       # guaranteed ordering between the two). Gate on document.readyState == "complete" so
       # the no-nav :load wait below starts from a definitively post-load state and cannot
-      # catch a trailing `load` event — the source of the #67 flake (a fresh subscriber
+      # catch a trailing `load` event — the source of an earlier flake (a fresh subscriber
       # only receives future events, so once `load` is in the past the wait must time out).
       assert eventually(fn ->
                match?({:ok, "complete"}, Page.evaluate(page, "document.readyState"))
@@ -2980,7 +2980,7 @@ defmodule CDPEx.IntegrationTest do
       assert {:ok, "Hello"} = result
     end
 
-    test "a pooled browser self-reaps when the pool is hard-killed (#22)" do
+    test "a pooled browser self-reaps when the pool is hard-killed" do
       # The pool adopts a task-launched browser with owner: pool, so the browser's
       # owner-death self-reap (defense-in-depth for a skipped terminate/2) still fires when
       # the pool is :brutal_killed — rather than orphaning Chrome. Trap exits so the pool's

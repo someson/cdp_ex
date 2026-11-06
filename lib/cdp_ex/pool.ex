@@ -375,7 +375,7 @@ defmodule CDPEx.Pool do
 
   # Serve queued waiters: hand out idle browsers, then start launches (concurrently, up to
   # :size) for any still-waiting callers not already covered by an in-flight launch. Launches
-  # run in tasks, so the pool stays responsive while Chrome warms up (#22).
+  # run in tasks, so the pool stays responsive while Chrome warms up.
   defp dispatch(state) do
     state |> serve_available() |> start_launches()
   end

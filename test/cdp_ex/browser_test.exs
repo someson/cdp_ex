@@ -368,7 +368,7 @@ defmodule CDPEx.BrowserTest do
       assert_receive {^tag, {:error, :noproc}}
     end
 
-    test "a departed authenticate/4 caller makes the owner drop that auth (#40)", %{
+    test "a departed authenticate/4 caller makes the owner drop that auth", %{
       fetcher: fetcher
     } do
       caller_ref = make_ref()

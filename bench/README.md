@@ -67,10 +67,9 @@ Each figure is the median over rounds.
 
 ## Comparing against older numbers
 
-The numbers in `CHANGELOG.md` up to #13 came from an earlier harness that was not
-kept: a native 4 vCPU Linux host and Chromium build 1243. This one runs in a
-container with the same CPU cap and a newer Chromium, so its absolute numbers
-differ. Compare a change against a run of this harness on `main`, on the same
+Numbers published up to #13 came from an earlier harness that was not kept: a
+native 4 vCPU Linux host and Chromium build 1243. This one runs in a container
+with the same CPU cap and a newer Chromium, so its absolute numbers differ. Compare a change against a run of this harness on `main`, on the same
 machine.
 
 ## Reference run

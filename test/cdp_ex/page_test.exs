@@ -318,7 +318,7 @@ defmodule CDPEx.PageTest do
       assert :ok = Task.await(task, 2_000)
     end
 
-    test "stops on a closed session but polls through a missing context on one (#121)", %{
+    test "stops on a closed session but polls through a missing context on one", %{
       page: page,
       fake: fake
     } do
@@ -1005,7 +1005,7 @@ defmodule CDPEx.PageTest do
     end
   end
 
-  describe "a :session page whose session detaches mid-wait (#121)" do
+  describe "a :session page whose session detaches mid-wait" do
     setup %{page: page} do
       %{page: %{page | session_id: "S"}}
     end
@@ -1485,7 +1485,7 @@ defmodule CDPEx.PageTest do
          %{page: page, conn: conn, fake: fake} do
       # Client-side redirect with response: true — the successor's networkAlmostIdle ends
       # the wait promptly (not at the deadline), while %{status, url} keeps reporting
-      # THIS navigation's document (L1), the pre-#106 behaviour: the successor is a new
+      # THIS navigation's document (L1), the earlier behaviour: the successor is a new
       # navigation, not a redirect hop of this one.
       task = Task.async(fn -> Page.navigate(page, "http://example.test/start", response: true) end)
 
@@ -1599,7 +1599,7 @@ defmodule CDPEx.PageTest do
       assert reason == :noproc or match?({:ws_closed, _}, reason)
     end
 
-    test "respects :timeout as an overall ceiling — an unanswered Network.enable fails promptly (#49)",
+    test "respects :timeout as an overall ceiling — an unanswered Network.enable fails promptly",
          %{page: page, fake: fake} do
       # One deadline spans enable + subscribe + navigate + the capture wait. With
       # Network.enable never answered, the call surfaces the enable timeout from the shared
@@ -1615,12 +1615,12 @@ defmodule CDPEx.PageTest do
       assert {:error, {:timeout, "Network.enable"}} = Task.await(task, 2_000)
     end
 
-    test "leaves a same-process observe_network/2 subscription and buffered events intact (#42)",
+    test "leaves a same-process observe_network/2 subscription and buffered events intact",
          %{page: page, conn: conn, fake: fake} do
       test = self()
 
       # The caller observes the network AND navigates with response: true on the same
-      # page. Before #42 the navigation tore the observer's subscription down and drained
+      # page. Earlier the navigation tore the observer's subscription down and drained
       # its buffered events; with the isolated capture helper both survive.
       caller =
         spawn_link(fn ->
@@ -2355,7 +2355,7 @@ defmodule CDPEx.PageTest do
     end
   end
 
-  describe "wait_for_response/3 :trigger (#126)" do
+  describe "wait_for_response/3 :trigger" do
     test "catches a response that arrives while the trigger is still running", %{
       page: page,
       conn: conn,
@@ -2964,11 +2964,11 @@ defmodule CDPEx.PageTest do
       for m <- @idle_methods, do: wait_until_no_subscribers(conn, m)
     end
 
-    test "leaves a same-process observe_network/2 subscription and buffered events intact (#48)",
+    test "leaves a same-process observe_network/2 subscription and buffered events intact",
          %{page: page, conn: conn, fake: fake} do
       test = self()
 
-      # The caller observes the network AND waits for idle on the same page. Before #48 the
+      # The caller observes the network AND waits for idle on the same page. Earlier the
       # idle wait tore down the observer's overlapping requestWillBeSent subscription and
       # drained its buffered events; with the isolated helper both survive.
       caller =
@@ -3034,7 +3034,7 @@ defmodule CDPEx.PageTest do
 
   # Like wait_until_subscribed/3 but matches *any* subscriber — used where the subscriber
   # is an internal helper process whose pid the test can't name (e.g. the response-capture
-  # helper in navigate(response: true), #42).
+  # helper in navigate(response: true)).
   defp wait_until_any_subscribed(conn, method, retries \\ 100),
     do: wait_until_subscriber_count(conn, method, 1, retries)
 
@@ -3100,7 +3100,7 @@ defmodule CDPEx.PageTest do
 
   # Every buffered `method` cdp_event already in this process's mailbox, as params maps.
   # `after 0` is sound only where delivery is causally ordered before the caller unblocks —
-  # the navigate/#42 call site, where the helper captures the same fan-out that enqueued the
+  # the navigate(response: true) call site, where the helper captures the same fan-out that enqueued the
   # observer's copy. Where that ordering is not guaranteed, use `await_cdp_events/3`.
   @doc false
   def forward_idle_watching(_event, _measurements, metadata, test_pid) do

@@ -77,6 +77,38 @@ end)
 When you just need the page to settle after hydration (no specific response to match),
 use `wait_for_network_idle/2` instead.
 
+## Download a file
+
+A launched browser saves every download in its profile dir; `wait_for_download/2`
+returns the one the trigger started, once Chrome has written all of it. Pass `:path`
+to keep it: without it, the file goes when the browser stops.
+
+```elixir
+CDPEx.with_page([], fn page ->
+  {:ok, _} = CDPEx.Page.navigate(page, "https://example.com/reports")
+
+  {:ok, %{path: path, suggested_filename: name, size: bytes}} =
+    CDPEx.Page.wait_for_download(page,
+      trigger: fn -> CDPEx.Page.click(page, "#export-csv") end,
+      path: "/data/reports/latest.csv"
+    )
+
+  {:ok, {path, name, bytes}}
+end)
+```
+
+For a file's URL, navigate in the trigger and ignore the result: Chrome ends that
+navigation with `net::ERR_ABORTED` as it turns into a download.
+
+```elixir
+CDPEx.Page.wait_for_download(page,
+  trigger: fn ->
+    _ = CDPEx.Page.navigate(page, "https://example.com/files/report.pdf")
+    :ok
+  end
+)
+```
+
 ## Detect a 403 wall, a 404 or a login redirect
 
 `navigate/3` returns `{:ok, page}` even for a 403 or a redirect-to-login. Pass

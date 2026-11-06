@@ -30,6 +30,7 @@
 | `cookies/2` / `set_cookies/3` / `clear_cookies/2` | Read, set, or clear the cookies of the page's browser context (browser-wide for a page that isn't isolated) |
 | `observe_network/2` / `stop_observing_network/2` | Stream `Network` request/response events to the caller, or stop |
 | `observe_console/2` / `stop_observing_console/2` | Stream the page's `console.*` calls and uncaught exceptions (`Runtime.*` events) to the caller, or stop |
+| `wait_for_download/2` | Wait for a download from the page or its iframes, optionally around a `:trigger`; returns the saved file's path, name, URL and size, `:path` moves it |
 | `response_body/3` | Fetch a response body by requestId (`Network.getResponseBody`) |
 | `enable_request_interception/2` / `disable_request_interception/2` | Pause matching requests for the caller to resolve, or stop; combines with `authenticate/4` and a credentialed `:proxy` |
 | `continue_request/3` / `fulfill_request/3` / `fail_request/3` | Resolve a paused request (proceed / synthetic response / fail) |

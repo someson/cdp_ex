@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the benchmark image and runs bench/run.sh in it, capped to CPUS CPUs
-# (default 4, the setup the numbers in CHANGELOG.md come from). Variables for
+# (default 4, the reference setup). Variables for
 # run.sh (ROUNDS, SCENARIOS, LIBS, ITERATIONS, ...) are passed through.
 #
 #   bench/docker.sh
