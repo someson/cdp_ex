@@ -63,6 +63,9 @@ defmodule CDPEx.Connection do
     # session_id (nil for a dedicated page) => dialog policy; a session with no entry
     # gets :accept (see set_dialogs/4).
     dialogs: %{},
+    # session_id => %{frame_id => execution context id} of each frame's main world, from
+    # Runtime.executionContextCreated (see frame_context/4).
+    contexts: %{},
     ws_send_error: nil
   ]
 
@@ -195,6 +198,25 @@ defmodule CDPEx.Connection do
   catch
     :exit, {:timeout, {GenServer, :call, _}} -> {:error, {:timeout, :set_dialogs}}
     :exit, {{:shutdown, {:ws_closed, reason}}, _} -> {:error, {:ws_closed, reason}}
+    :exit, {reason, {GenServer, :call, _}} when reason != :calling_self -> {:error, :noproc}
+  end
+
+  @doc """
+  Returns the execution context id of `frame_id`'s main world on `session_id`, as
+  last reported by `Runtime.executionContextCreated` (the session must have
+  `Runtime` enabled, which every `CDPEx.Page` does). A frame that navigates gets a
+  new context; between the old one's destruction and the new one's creation there
+  is none.
+
+  Returns `{:ok, context_id}`, `:error` when the connection knows no context for
+  the frame, `{:error, :noproc}`, or `{:error, {:timeout, :frame_context}}`.
+  """
+  @spec frame_context(GenServer.server(), String.t() | nil, String.t(), timeout()) ::
+          {:ok, integer()} | :error | {:error, :noproc | {:timeout, :frame_context}}
+  def frame_context(conn, session_id, frame_id, timeout \\ @default_call_timeout) do
+    GenServer.call(conn, {:frame_context, session_id, frame_id}, timeout)
+  catch
+    :exit, {:timeout, {GenServer, :call, _}} -> {:error, {:timeout, :frame_context}}
     :exit, {reason, {GenServer, :call, _}} when reason != :calling_self -> {:error, :noproc}
   end
 
@@ -450,6 +472,16 @@ defmodule CDPEx.Connection do
     end
   end
 
+  def handle_call({:frame_context, session_id, frame_id}, _from, state) do
+    reply =
+      case state.contexts |> Map.get(session_id, %{}) |> Map.fetch(frame_id) do
+        {:ok, id} -> {:ok, id}
+        :error -> :error
+      end
+
+    {:reply, reply, state}
+  end
+
   def handle_call({:set_dialogs, session_id, policy}, _from, state) do
     {:reply, :ok, %{state | dialogs: Map.put(state.dialogs, session_id, policy)}}
   end
@@ -682,12 +714,38 @@ defmodule CDPEx.Connection do
 
   defp dispatch_event(method, session_id, params, state) do
     state
+    |> track_context(method, session_id, params)
     |> answer_dialog(method, session_id, params)
     |> fail_detached_session(method, params)
     |> notify_waiters(session_id, params)
     |> notify_subscribers(method, session_id, params)
     |> drop_detached_subscriptions(method, params)
   end
+
+  defp track_context(state, "Runtime.executionContextCreated", session_id, %{
+         "context" => %{"id" => id, "auxData" => %{"frameId" => fid, "isDefault" => true}}
+       })
+       when is_binary(fid) do
+    contexts = Map.update(state.contexts, session_id, %{fid => id}, &Map.put(&1, fid, id))
+    %{state | contexts: contexts}
+  end
+
+  defp track_context(state, "Runtime.executionContextDestroyed", session_id, params) do
+    case Map.fetch(state.contexts, session_id) do
+      {:ok, frames} ->
+        id = params["executionContextId"]
+        frames = for {fid, cid} <- frames, cid != id, into: %{}, do: {fid, cid}
+        %{state | contexts: Map.put(state.contexts, session_id, frames)}
+
+      :error ->
+        state
+    end
+  end
+
+  defp track_context(state, "Runtime.executionContextsCleared", session_id, _params),
+    do: %{state | contexts: Map.delete(state.contexts, session_id)}
+
+  defp track_context(state, _method, _session_id, _params), do: state
 
   # Answered from this process, with no caller waiting: the reply comes back under an id
   # with no pending entry and dispatch_reply/3 drops it. A failed write is recorded like
@@ -749,7 +807,8 @@ defmodule CDPEx.Connection do
       state
       | subscribers: Map.new(state.subscribers, fn {m, subs} -> {m, drop_session(subs, sid)} end),
         all_subscribers: drop_session(state.all_subscribers, sid),
-        dialogs: Map.delete(state.dialogs, sid)
+        dialogs: Map.delete(state.dialogs, sid),
+        contexts: Map.delete(state.contexts, sid)
     }
 
     pids |> Enum.uniq() |> Enum.reduce(state, &demonitor_if_orphaned(&2, &1))

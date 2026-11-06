@@ -14,9 +14,13 @@
 | `visible?/3` | Whether the first match is rendered and visible |
 | `click/3` | Real trusted click on the first match (synthetic via `trusted: false`); `wait:` retries until it exists and has a box |
 | `click_text/3` | Click an element by its text content (whitespace-normalized, innermost match) |
+| `hover/3` | Move a trusted pointer over the first match (`mouseover`, CSS `:hover`), hit-tested like `click/3` |
 | `type/4` | Focus an element and enter text (`Input.insertText`) |
 | `press/4` | Press a named key — `Enter`, `Tab`, arrows, … — with real key events |
+| `set_input_files/4` | Set the files of an `<input type="file">`; `[]` clears it |
 | `scroll/3` | Scroll the window to `:top`, `:bottom`, or `{x, y}` |
+| `frame/3` | A handle for an `<iframe>`'s frame, same-site or cross-site, that the element and script functions above accept in place of the page |
+| `set_dialogs/3` / `handle_dialog/3` | How `alert`/`confirm`/`prompt`/`beforeunload` are answered (`:accept` by default, also `dialogs:` on `new_page/2`), or answer one by hand under `:manual` |
 | `html/2` | Full serialized DOM (`document.documentElement.outerHTML`) |
 | `screenshot/2` | PNG bytes, or write to `:path` |
 | `pdf/2` | Render the page to PDF bytes, or write to `:path` |
@@ -30,6 +34,22 @@
 | `continue_request/3` / `fulfill_request/3` / `fail_request/3` | Resolve a paused request (proceed / synthetic response / fail) |
 | `authenticate/4` | Answer a proxy / HTTP Basic auth challenge (call before `navigate/3`) |
 | `block_resources/3` | Fail requests of the given resource types (`:image`, `:font`, ...) before they reach the network; `[]` stops. Also `block:` on `new_page/2` |
+
+## Inside an iframe
+
+```elixir
+{:ok, frame} = CDPEx.Page.frame(page, "iframe#checkout", wait: 5_000)
+{:ok, price} = CDPEx.Page.text(frame, ".total")
+:ok = CDPEx.Page.click(frame, "button[type=submit]")
+```
+
+A frame handle reads, runs script and acts inside the frame: `evaluate/3`,
+`text/3`, the waits on selectors and functions, `click/3`, `hover/3`, `type/4`,
+`press/4`, `set_input_files/4`. Cross-site frames, which Chrome runs in their own
+process, work the same way; mouse events still go to the page, shifted to the
+frame, and fail with `:obscured` when something covers the `<iframe>`. Pass a frame
+handle to `frame/3` for a nested one. Navigation, screenshots, cookies, network and
+other page-wide functions take the page itself.
 
 Every function is documented in full in `CDPEx.Page`; `mix docs` builds the docs.
 Recipes that combine them: [recipes.md](recipes.md).

@@ -198,8 +198,7 @@ the others do and CDPEx doesn't, roughly by how often a scraper needs it:
 - ~~**Click lands in a gap.**~~ Done: a trusted click hits the in-view centre
   of the first client rect whose point lands on the element, else
   `{:error, {:obscured, label}}`.
-- **Inside an iframe.** No way to read or act inside a frame (Wallaby
-  `focus_frame/2`, playwright_ex `internal:control=enter-frame`).
+- ~~**Inside an iframe.**~~ Done: `Page.frame/3`, same-site and cross-site.
 - ~~**Hover, file upload, JS dialogs.**~~ Done: `Page.hover/3`,
   `Page.set_input_files/4`, `dialogs:` / `Page.set_dialogs/3` /
   `Page.handle_dialog/3`.

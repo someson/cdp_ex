@@ -73,7 +73,7 @@ defmodule CDPEx.FixtureServer do
   #     logging what each returned to window.results (dialogs_page/0); /dialogs-frame
   #     is one full-page #confirm, for clicking through an iframe.
   #   /frame?src=URL — a page holding one iframe of URL (percent-encoded), for
-  #     cross-site and nested iframes.
+  #     cross-site and nested iframes; /covered-frame?src=URL lays #frame-cover over it.
   #   /with-assets — a page that loads /pixel.png, /style.css and the font
   #     /font.woff2, for resource blocking (the assets themselves get the default page).
   #   anything else serves the page.
@@ -115,6 +115,10 @@ defmodule CDPEx.FixtureServer do
   defp page_body("/interact" <> rest, _request), do: interact_page(rest =~ "smooth")
   defp page_body("/dialogs-frame" <> _, _request), do: dialogs_frame_page()
   defp page_body("/dialogs" <> _, _request), do: dialogs_page()
+
+  defp page_body("/covered-frame?src=" <> src, _request) do
+    ~s(<!doctype html><html><body><div style="position:relative;width:320px"><iframe src="#{URI.decode_www_form(src)}"></iframe><div id="frame-cover" style="position:absolute;inset:0;background:#fff"></div></div></body></html>)
+  end
 
   defp page_body("/frame?src=" <> src, _request) do
     ~s(<!doctype html><html><body><h1 id="greeting">Frame</h1><iframe src="#{URI.decode_www_form(src)}"></iframe></body></html>)

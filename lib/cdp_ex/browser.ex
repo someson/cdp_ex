@@ -66,6 +66,9 @@ defmodule CDPEx.Browser do
     contexts: %{},
     # target_id => CDPEx.Fetch pid, the page's Fetch domain owner (auth + interception)
     fetchers: %{},
+    # page target_id => %{frame_id => session_id}: the sessions attach_frame/4 opened on
+    # the browser connection for the page's cross-site iframes, reused until they detach.
+    frames: %{},
     # request tag => {from, caller_monitor_ref | nil, fetch_pid}: a caller parked until
     # its page's Fetch owner reports the result of its request
     pending: %{}
@@ -184,7 +187,7 @@ defmodule CDPEx.Browser do
   """
   @spec close_page(GenServer.server(), Page.t()) ::
           :ok | {:error, :unknown_page | :noproc | {:timeout, :close_page}}
-  def close_page(browser, %Page{} = page),
+  def close_page(browser, %Page{frame: nil} = page),
     do: call(browser, {:close_page, page}, 15_000, :close_page)
 
   # Internal hop for `CDPEx.Page.authenticate/4`, which owns the input contract
@@ -251,6 +254,17 @@ defmodule CDPEx.Browser do
   @spec block(GenServer.server(), Page.t(), [String.t()], timeout()) :: :ok | {:error, term()}
   def block(browser, %Page{} = page, types, timeout),
     do: call(browser, {:block, page, types, timeout}, timeout + 5_000, :block_resources)
+
+  # Internal hop for `CDPEx.Page.frame/3`: a session on the browser connection for the
+  # page's out-of-process iframe `frame_id` (its target id), with Runtime enabled.
+  # `{:error, :no_target}` when Chrome has no target by that id (a same-process frame,
+  # or one gone). `timeout` bounds each CDP call; the Browser request gets 5s on top.
+  @doc false
+  @spec attach_frame(GenServer.server(), Page.t(), String.t(), timeout()) ::
+          {:ok, pid(), String.t()} | {:error, term()}
+  def attach_frame(browser, %Page{} = page, frame_id, timeout) do
+    call(browser, {:attach_frame, page, frame_id, timeout}, 2 * timeout + 5_000, :frame)
+  end
 
   @doc false
   @spec release_interception(GenServer.server(), Page.t(), timeout()) :: :ok | {:error, term()}
@@ -613,6 +627,37 @@ defmodule CDPEx.Browser do
     end
   end
 
+  def handle_call(
+        {:attach_frame, %Page{target_id: tid, conn: conn, session_id: sid}, frame_id, timeout},
+        _from,
+        state
+      ) do
+    cond do
+      not own_page?(state, tid, conn, sid) ->
+        {:reply, {:error, :unknown_page}, state}
+
+      frame_sid = get_in(state.frames, [tid, frame_id]) ->
+        {:reply, {:ok, state.browser_conn, frame_sid}, state}
+
+      true ->
+        case attach_frame_session(state.browser_conn, frame_id, timeout) do
+          {:ok, frame_sid} ->
+            frames =
+              Map.update(
+                state.frames,
+                tid,
+                %{frame_id => frame_sid},
+                &Map.put(&1, frame_id, frame_sid)
+              )
+
+            {:reply, {:ok, state.browser_conn, frame_sid}, %{state | frames: frames}}
+
+          {:error, _} = error ->
+            {:reply, error, state}
+        end
+    end
+  end
+
   def handle_call({:release_interception, %Page{target_id: tid}, timeout}, from, state) do
     case Map.get(state.fetchers, tid) do
       nil ->
@@ -683,7 +728,7 @@ defmodule CDPEx.Browser do
     # and a targetId we don't track is simply a no-op delete.
     # An isolated page's context goes with it.
     tid = params["targetId"]
-    state = page_gone(state, tid)
+    state = state |> page_gone(tid) |> forget_frame_session(params["sessionId"])
     {:noreply, %{state | sessions: Map.delete(state.sessions, tid)}}
   end
 
@@ -1116,8 +1161,63 @@ defmodule CDPEx.Browser do
   # Ends one of our pages' targets (see discard_target/3) and forgets its context.
   defp end_target(state, tid) do
     discard_target(state.browser_conn, tid, Map.get(state.contexts, tid))
-    drop_fetcher(%{state | contexts: Map.delete(state.contexts, tid)}, tid)
+
+    state = %{
+      state
+      | contexts: Map.delete(state.contexts, tid),
+        frames: Map.delete(state.frames, tid)
+    }
+
+    drop_fetcher(state, tid)
   end
+
+  # Target.getTargets first: Chrome creates the DevTools host of an out-of-process frame
+  # lazily, and until something lists the targets, attachToTarget answers "No target
+  # with given id found" for a frame that has one (seen under load, for seconds).
+  defp attach_frame_session(browser_conn, frame_id, timeout) do
+    with {:ok, %{"targetInfos" => targets}} <-
+           Connection.call(browser_conn, "Target.getTargets", %{}, timeout) do
+      if Enum.any?(targets, &(&1["targetId"] == frame_id and &1["type"] == "iframe")),
+        do: attach_target(browser_conn, frame_id, timeout),
+        else: {:error, :no_target}
+    end
+  end
+
+  defp attach_target(browser_conn, frame_id, timeout) do
+    params = %{"targetId" => frame_id, "flatten" => true}
+
+    case Connection.call(browser_conn, "Target.attachToTarget", params, timeout) do
+      {:ok, %{"sessionId" => frame_sid}} ->
+        case Connection.call(browser_conn, "Runtime.enable", %{}, timeout, session_id: frame_sid) do
+          {:ok, _} ->
+            {:ok, frame_sid}
+
+          {:error, _} = error ->
+            detach_session(browser_conn, frame_sid)
+            error
+        end
+
+      # crdtp's "No target with given id found" (-32602): not an out-of-process frame.
+      {:error, {:cdp_error, _, %{"code" => -32_602}}} ->
+        {:error, :no_target}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp forget_frame_session(state, frame_sid) when is_binary(frame_sid) do
+    frames =
+      for {tid, by_frame} <- state.frames,
+          by_frame = for({fid, s} <- by_frame, s != frame_sid, into: %{}, do: {fid, s}),
+          by_frame != %{},
+          into: %{},
+          do: {tid, by_frame}
+
+    %{state | frames: frames}
+  end
+
+  defp forget_frame_session(state, _frame_sid), do: state
 
   # The page's target is already gone: dispose its context, if it had one, and forget
   # its Fetch owner. The dispose runs off the Browser process: this is called
@@ -1125,6 +1225,7 @@ defmodule CDPEx.Browser do
   # block every other page op for the call timeout, once per page that went.
   defp page_gone(state, tid) do
     state = drop_fetcher(state, tid)
+    state = %{state | frames: Map.delete(state.frames, tid)}
 
     case Map.pop(state.contexts, tid) do
       {nil, _} ->
