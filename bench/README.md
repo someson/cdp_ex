@@ -57,6 +57,7 @@ Each figure is the median over rounds.
 | `ITERATIONS` | `10` (`cold`), `20` (`spa`) | Samples per round |
 | `DURATION_S` | `20` | Length of a `concurrent` run |
 | `CONCURRENCY` | `8` | Workers in `concurrent` |
+| `BROWSERS` | `1` | Browsers the `concurrent` workers are spread over, round-robin (CDPEx only); the result also carries each job's `new_page/2` p50/p95 |
 | `CDP_EX_LAUNCH_OPTS` | `[]` | Elixir keyword list passed to `CDPEx.launch/1`, e.g. `[pipe: true]` |
 | `CDP_EX_PAGE_OPTS` | `[]` | Elixir keyword list passed to `CDPEx.new_page/2`, e.g. `[isolated: true]` |
 | `INTERVAL_MS` | `100` | Sampler interval |
