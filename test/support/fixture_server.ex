@@ -113,6 +113,8 @@ defmodule CDPEx.FixtureServer do
   #     is one full-page #confirm, for clicking through an iframe.
   #   /frame?src=URL — a page holding one iframe of URL (percent-encoded), for
   #     cross-site and nested iframes; /covered-frame?src=URL lays #frame-cover over it.
+  #   /worker     — starts a dedicated worker whose message ("worker:HOST") replaces
+  #     #greeting, so a test can tell the worker ran.
   #   /with-assets — a page that loads /pixel.png, /style.css and the font
   #     /font.woff2, for resource blocking (the assets themselves get the default page).
   #   /download?name=NAME&size=N — an attachment of N bytes (default 1000) named NAME
@@ -191,6 +193,14 @@ defmodule CDPEx.FixtureServer do
     ~s[<!doctype html><html><body><h1 id="greeting">Console</h1><script>] <>
       ~s[console.log("console:" + location.hostname);] <>
       ~s[setTimeout(() => { throw new Error("boom:" + location.hostname) });] <>
+      ~s[</script></body></html>]
+  end
+
+  defp page_body("/worker", _request) do
+    ~s[<!doctype html><html><body><h1 id="greeting">waiting</h1><script>] <>
+      ~s[const src = "postMessage('worker:" + location.hostname + "')";] <>
+      ~s|const w = new Worker(URL.createObjectURL(new Blob([src], {type: "text/javascript"})));| <>
+      ~s[w.onmessage = e => document.getElementById("greeting").textContent = e.data;] <>
       ~s[</script></body></html>]
   end
 

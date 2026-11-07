@@ -26,11 +26,12 @@ defmodule CDPEx.Fetch do
   `:session` page's session detaches, or on `stop/1`.
 
   Cross-site iframes run as their own Chrome targets. With any mode on, the owner turns
-  on `Target.setAutoAttach` (iframes only, paused on start) for the page's session:
-  each iframe that attaches, nested ones included, gets the page's `Fetch.enable`
-  params on its own session and is then resumed, on every path. Block and auth answer
-  there; interception covers the page's own frames only, so an iframe's other pauses
-  are continued. With every mode off, auto-attach is turned off again.
+  on `Target.setAutoAttach` (iframes and dedicated workers, paused on start) for the
+  page's session: each iframe that attaches, nested ones included, gets the page's
+  `Fetch.enable` params on its own session and is then resumed, on every path. Block
+  and auth answer there; interception covers the page's own frames only, so an
+  iframe's other pauses are continued. A worker is only resumed. With every mode off,
+  auto-attach is turned off again.
 
   The owner also carries the console of those iframes for `CDPEx.Page.observe_console/2`.
   While a process observes, auto-attach stays on even with every mode off: each iframe
@@ -60,11 +61,13 @@ defmodule CDPEx.Fetch do
   @target_events ["Target.attachedToTarget", "Target.detachedFromTarget"]
   @console_events ["Runtime.consoleAPICalled", "Runtime.exceptionThrown"]
   @child_events @events ++ @target_events ++ @console_events
+  # Dedicated workers are attached too, only to be resumed: Chrome pauses a new worker
+  # on start even when the filter leaves it out, and then nothing would ever resume it.
   @auto_attach %{
     "autoAttach" => true,
     "waitForDebuggerOnStart" => true,
     "flatten" => true,
-    "filter" => [%{"type" => "iframe"}]
+    "filter" => [%{"type" => "iframe"}, %{"type" => "worker"}]
   }
 
   defstruct [
@@ -227,6 +230,17 @@ defmodule CDPEx.Fetch do
     {:noreply, drop_observer(state, ref)}
   end
 
+  # A dedicated worker of the page or of one of its iframes: resumed, nothing else.
+  def handle_info(
+        {:cdp_event, conn, "Target.attachedToTarget",
+         %{"sessionId" => child, "targetInfo" => %{"type" => "worker"}} = params, parent},
+        %__MODULE__{conn: conn} = state
+      )
+      when is_binary(child) and (parent == state.session_id or is_map_key(state.children, parent)) do
+    _ = resume(state, child, params)
+    {:noreply, state}
+  end
+
   # A cross-site iframe attached under the page or one of its iframes.
   def handle_info(
         {:cdp_event, conn, "Target.attachedToTarget", %{"sessionId" => child} = params, parent},
@@ -311,10 +325,7 @@ defmodule CDPEx.Fetch do
     receive do
       {:cdp_event, ^conn, "Target.attachedToTarget", %{"sessionId" => child} = params, _parent}
       when is_binary(child) ->
-        _ =
-          if params["waitingForDebugger"] != false,
-            do: call_on(state, child, "Runtime.runIfWaitingForDebugger", %{})
-
+        _ = resume(state, child, params)
         resume_queued_attaches(state)
     after
       0 -> :ok
@@ -561,11 +572,13 @@ defmodule CDPEx.Fetch do
         _ = call_on(state, child, "Target.setAutoAttach", @auto_attach)
       end
 
-    _ =
-      if params["waitingForDebugger"] != false,
-        do: call_on(state, child, "Runtime.runIfWaitingForDebugger", %{})
-
+    _ = resume(state, child, params)
     state
+  end
+
+  defp resume(state, child, params) do
+    if params["waitingForDebugger"] != false,
+      do: call_on(state, child, "Runtime.runIfWaitingForDebugger", %{})
   end
 
   defp enable_child(state, child, params) do
