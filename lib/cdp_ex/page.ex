@@ -3018,6 +3018,10 @@ defmodule CDPEx.Page do
   `:websocket` (Chrome doesn't pause WebSocket handshakes, so it would do nothing). An
   invalid value returns `{:error, {:invalid_args, {:block, value}}}`.
 
+  The type is the one Chrome reports, not the API that made the request: Chrome reports
+  a `fetch()` call as `XHR`, from the page and from its workers alike, so `:xhr` blocks
+  it and `:fetch` does not. A `fetch()` of an image is `XHR` too, not `:image`.
+
   The library fails the requests itself, so no process has to handle them and the
   calling process may exit; blocking lasts until changed or until the page closes.
   It combines with `authenticate/4`, a credentialed `:proxy` and
