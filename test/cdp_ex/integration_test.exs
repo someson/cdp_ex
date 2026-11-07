@@ -1890,6 +1890,32 @@ defmodule CDPEx.IntegrationTest do
       refute served("/pixel.png")
     end
 
+    for transport <- [:dedicated, :session] do
+      test "a dedicated worker runs under observe_console and block: (#{transport})" do
+        {:ok, %{url: url}} = FixtureServer.start()
+        {:ok, browser} = CDPEx.launch()
+        on_exit(fn -> stop_quietly(browser) end)
+
+        {:ok, page} = CDPEx.new_page(browser, transport: unquote(transport), block: [:image])
+        assert :ok = Page.observe_console(page)
+        assert {:ok, _} = Page.navigate(page, url <> "worker", wait_until: :load)
+        assert eventually(fn -> Page.text(page, "#greeting") == {:ok, "worker:127.0.0.1"} end)
+      end
+    end
+
+    test "a dedicated worker of a cross-site iframe runs" do
+      {:ok, %{port: port}} = FixtureServer.start()
+      {:ok, browser} = CDPEx.launch(extra_args: @sites)
+      on_exit(fn -> stop_quietly(browser) end)
+
+      {:ok, page} = CDPEx.new_page(browser)
+      assert :ok = Page.observe_console(page)
+      top = frame_url("a.test", port, "http://b.test:#{port}/worker")
+      assert {:ok, _} = Page.navigate(page, top, wait_until: :load)
+      {:ok, frame} = Page.frame(page, "iframe", wait: 5_000)
+      assert eventually(fn -> Page.text(frame, "#greeting") == {:ok, "worker:b.test"} end)
+    end
+
     test "a console observer that dies leaves new cross-site iframes loading" do
       {:ok, %{port: port}} = FixtureServer.start()
       {:ok, browser} = CDPEx.launch(extra_args: @sites)

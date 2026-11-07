@@ -12,7 +12,7 @@ defmodule CDPEx.FetchTest do
     "autoAttach" => true,
     "waitForDebuggerOnStart" => true,
     "flatten" => true,
-    "filter" => [%{"type" => "iframe"}]
+    "filter" => [%{"type" => "iframe"}, %{"type" => "worker"}]
   }
   @console ["Runtime.consoleAPICalled", "Runtime.exceptionThrown"]
 
@@ -766,6 +766,34 @@ defmodule CDPEx.FetchTest do
       assert log =~ "iframe"
     end
 
+    test "a dedicated worker, of the page or of an iframe, is only resumed", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+      arm(pid, fake, {:block, ["Image"], 5_000})
+      attach(fake, "C1")
+      expect_iframe_armed(fake, "C1")
+
+      for {worker, parent} <- [{"W1", nil}, {"W2", "C1"}] do
+        attach(fake, worker, parent, "worker")
+
+        assert_receive {:fake_cdp_recv, ^fake, %{"id" => id, "sessionId" => ^worker} = frame},
+                       2_000
+
+        assert frame["method"] == "Runtime.runIfWaitingForDebugger"
+        answer(fake, id, :ok)
+      end
+
+      # Not tracked as a child: a mode change reaches the page and the iframe only.
+      tag = make_ref()
+      Fetch.request(pid, tag, {:block, ["Image", "Font"], 5_000})
+      expect_call_on(fake, "Fetch.enable", nil)
+      expect_call_on(fake, "Fetch.enable", "C1")
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+      refute_received {:fake_cdp_recv, ^fake, %{"sessionId" => "W" <> _}}
+    end
+
     test "an attach while every mode is off is resumed, unfiltered", %{conn: conn, fake: fake} do
       pid = start_owner(conn)
       arm(pid, fake, {:block, ["Image"], 5_000})
@@ -1104,13 +1132,13 @@ defmodule CDPEx.FetchTest do
     FakeCDP.send_text(fake, Jason.encode!(frame))
   end
 
-  defp attach(fake, child, parent \\ nil) do
+  defp attach(fake, child, parent \\ nil, type \\ "iframe") do
     event(
       fake,
       "Target.attachedToTarget",
       %{
         "sessionId" => child,
-        "targetInfo" => %{"targetId" => "T-" <> child, "type" => "iframe"},
+        "targetInfo" => %{"targetId" => "T-" <> child, "type" => type},
         "waitingForDebugger" => true
       },
       parent
