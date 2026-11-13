@@ -573,7 +573,20 @@ defmodule CDPEx.Chrome do
         create_temp_profile_dir(tmp)
 
       {dir, _tmp} ->
-        with :ok <- make_profile_dir(dir), do: {:ok, dir, false}
+        with :ok <- make_profile_dir(dir),
+             :ok <- remove_stale_devtools_file(dir),
+             do: {:ok, dir, false}
+    end
+  end
+
+  # stop/1 SIGKILLs Chrome, so a reused profile still holds the previous run's
+  # DevToolsActivePort. The readiness poll would read that dead port before the new
+  # Chrome writes its own, so the file goes before the spawn.
+  defp remove_stale_devtools_file(dir) do
+    case File.rm(Path.join(dir, "DevToolsActivePort")) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, posix} -> {:error, {:launch_failed, {:user_data_dir, posix}}}
     end
   end
 

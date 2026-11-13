@@ -460,6 +460,29 @@ defmodule CDPEx.ChromeTest do
     end
 
     @tag :tmp_dir
+    test "a stale DevToolsActivePort in a reused :user_data_dir is not read as the new port",
+         %{tmp_dir: tmp_dir} do
+      # stop/1 SIGKILLs Chrome, so the previous run's file stays in a caller's
+      # profile. The new Chrome announces itself only after a few poll ticks.
+      profile = mkdir!(tmp_dir, "profile")
+      File.write!(Path.join(profile, "DevToolsActivePort"), "9222\n/devtools/browser/old\n")
+
+      stub =
+        write_stub!(tmp_dir, "stub-slow-announce", """
+        #!/bin/sh
+        sleep 0.5
+        echo 'DevTools listening on ws://127.0.0.1:9333/devtools/browser/0bad-cafe ' 1>&2
+        exec sleep 30
+        """)
+
+      assert {:ok, handle} =
+               Chrome.launch(chrome_binary: stub, user_data_dir: profile, launch_timeout: 5_000)
+
+      assert handle.debug_url == "ws://127.0.0.1:9333/devtools/browser/0bad-cafe"
+      :ok = Chrome.stop(handle)
+    end
+
+    @tag :tmp_dir
     test "returns {:devtools_file_malformed, excerpt} for an unparseable DevToolsActivePort", %{
       tmp_dir: tmp_dir
     } do
