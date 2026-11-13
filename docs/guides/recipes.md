@@ -14,7 +14,7 @@ before that process stops resolving, or the page's next request hangs.
 It combines with `authenticate/4` and a credentialed `:proxy`: the library answers the
 login and lets through the requests outside `:patterns`, so the loop below still sees
 only the ones it asked for. To drop whole resource types (images, fonts), use
-`block:` instead (see "Use a proxy" below); no loop is needed.
+`block:` instead (see "Authenticated proxy" below); no loop is needed.
 
 ```elixir
 defmodule ImageBlocker do
@@ -75,7 +75,13 @@ end)
 ```
 
 When you just need the page to settle after hydration (no specific response to match),
-use `wait_for_network_idle/2` instead.
+use `wait_for_network_idle/2` instead, with the action as its `:trigger` too:
+
+```elixir
+:ok = CDPEx.Page.wait_for_network_idle(page,
+  trigger: fn -> CDPEx.Page.click(page, "#load-more") end
+)
+```
 
 ## Download a file
 

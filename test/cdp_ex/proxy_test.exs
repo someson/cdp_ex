@@ -107,6 +107,70 @@ defmodule CDPEx.ProxyTest do
     end
   end
 
+  describe "credentials never leak (C1, C2)" do
+    test "a scheme-less credentialed string is rejected without its credentials" do
+      assert {:error, {:invalid_proxy, {:malformed_url, redacted}}} =
+               Proxy.parse("user:secret@host:8080")
+
+      refute redacted =~ "secret"
+      refute redacted =~ "user"
+    end
+
+    test "redact_option/1 masks everything up to the last @" do
+      for url <- ["http://user:p@ss@host:8080", "user:p@ss@host:8080"] do
+        redacted = Proxy.redact_option(url)
+        refute redacted =~ "user"
+        refute redacted =~ "ss@"
+        assert redacted =~ "***@host:8080"
+      end
+    end
+
+    test "redact_option/1 masks the map form" do
+      assert Proxy.redact_option(%{server: "h:1", username: "u", password: "secret"}) ==
+               %{server: "h:1", username: "***", password: "***"}
+    end
+
+    test "redact_option/1 masks userinfo inside the keyword form's :server" do
+      refute inspect(Proxy.redact_option(server: "u:secret@h:1")) =~ "secret"
+    end
+  end
+
+  describe "malformed values are rejected, not turned into another proxy (C3)" do
+    test "a URL with a path, query or fragment" do
+      for url <- [
+            "http://user:pa/ss@host:8080",
+            "http://host:8080/path",
+            "http://host:8080?q=1",
+            "http://host:8080#f"
+          ] do
+        assert {:error, {:invalid_proxy, {:malformed_url, redacted}}} = Proxy.parse(url)
+        refute redacted =~ "pa/ss"
+      end
+    end
+
+    test "a non-numeric port" do
+      assert {:error, {:invalid_proxy, {:malformed_url, _}}} = Proxy.parse("http://host:abc")
+    end
+
+    test "credentials inside the keyword form's :server" do
+      assert {:error, {:invalid_proxy, :credentials_in_server}} =
+               Proxy.parse(server: "u:p@host:8080")
+    end
+
+    test "non-string credentials" do
+      assert {:error, {:invalid_proxy, {:invalid_credentials, [:password]}}} =
+               Proxy.parse(server: "host:8080", username: "u", password: 1234)
+
+      assert {:error, {:invalid_proxy, {:invalid_credentials, [:username]}}} =
+               Proxy.parse(%{server: "host:8080", username: :u})
+    end
+
+    test "a list that is not a keyword list, without echoing it" do
+      assert {:error, {:invalid_proxy, {:unsupported, :list}}} =
+               Proxy.parse(["http://u:secret@host:8080"])
+    end
+  end
+
   describe "to_arg/1 and credentials/1" do
     test "to_arg builds the --proxy-server flag" do
       {:ok, proxy} = Proxy.parse("http://host:8080")

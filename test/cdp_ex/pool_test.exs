@@ -205,6 +205,17 @@ defmodule CDPEx.PoolTest do
     assert Process.alive?(pool)
   end
 
+  test ":sys.get_status/1 masks the proxy credentials in every :proxy form" do
+    for proxy <- [
+          "http://user:secret@host:8080",
+          [server: "host:8080", username: "user", password: "secret"],
+          %{server: "host:8080", username: "user", password: "secret"}
+        ] do
+      pool = start_pool(size: 1, launch_opts: [proxy: proxy])
+      refute inspect(:sys.get_status(pool), limit: :infinity) =~ "secret"
+    end
+  end
+
   test "a start_fun returning neither {:ok, _} nor {:error, _} surfaces as a launch failure" do
     pool = start_pool(size: 1, start_fun: fn _ -> :ignore end)
 
@@ -421,6 +432,16 @@ defmodule CDPEx.PoolTest do
       assert {:error, :stub} = Pool.with_page(pool, fn _ -> flunk("fun ran") end, isolated: false)
       assert_receive {:new_page_opts, opts}
       assert opts[:isolated] == false
+    end
+  end
+
+  describe "size" do
+    test "an invalid value raises in the caller" do
+      for bad <- [0, -1, 1.5, "2", nil, :infinity] do
+        assert_raise ArgumentError, ~r/invalid :size/, fn ->
+          Pool.start_link(size: bad, start_fun: &FakeBrowser.start_link/1)
+        end
+      end
     end
   end
 

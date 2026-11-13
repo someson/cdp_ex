@@ -7,11 +7,18 @@ defmodule CDPEx.Page do
   connection, so the OTP properties (supervision, crash isolation) live in the
   connection/browser layer while page calls stay ergonomic.
 
-  Obtain one with `CDPEx.new_page/2`. If the underlying page dies (navigation to
-  a new target, a crash), operations return `{:error, :noproc}` and you should
+  Obtain one with `CDPEx.new_page/2`. If the underlying page goes away (closed, or
+  its connection dropped), operations return `{:error, :noproc}` and you should
   open a fresh page. On a `:session` page, whose connection is the shared browser
   socket and outlives it, a closed or detached target returns
   `{:error, {:session_closed, session_id}}` instead.
+
+  If the page's renderer crashes (out of memory, `chrome://crash`), the calls in
+  flight on it, a `navigate/3` or `wait_for_navigation/2` waiting on it included,
+  return `{:error, :target_crashed}` at once, and so does every later call until
+  the page is navigated again: `navigate/3` (without `response: true`, which first
+  needs the crashed renderer) brings up a new renderer, and the page works as
+  before. Closing it and opening a fresh one works too.
 
   ## Operations
 
@@ -89,6 +96,7 @@ defmodule CDPEx.Page do
 
   @lifecycle_method "Page.lifecycleEvent"
   @target_detached "Target.detachedFromTarget"
+  @target_crashed "Inspector.targetCrashed"
   @request_will_be_sent "Network.requestWillBeSent"
   @response_received "Network.responseReceived"
   @loading_finished "Network.loadingFinished"
@@ -135,8 +143,9 @@ defmodule CDPEx.Page do
   @doc """
   Navigates to `url` and (by default) waits until the network is almost idle.
 
-  Returns `{:ok, page}` so it pipelines with `with`. The readiness wait is
-  best-effort: if it times out, navigation still returns `{:ok, page}` (the page
+  Returns `{:ok, page}` so it pipelines with `with`. A same-document navigation (a
+  `#fragment` of the current URL) loads nothing, so it returns at once. The readiness
+  wait is best-effort: if it times out, navigation still returns `{:ok, page}` (the page
   may simply be slow); a hard navigation error returns `{:error, _}`. The milestone
   is matched to *this* navigation's document (by `loaderId`) — or to a document that
   replaces it before it settles, such as a `<meta http-equiv="refresh">` target — so a
@@ -240,6 +249,9 @@ defmodule CDPEx.Page do
     trigger = fn ->
       case do_call(page, "Page.navigate", %{"url" => url}, remaining(deadline)) do
         {:ok, %{"errorText" => error}} -> {:error, {:navigate, error}}
+        # Chrome gives no loaderId for a same-document navigation (a fragment, a
+        # pushState URL): it is done already, and no lifecycle event will follow.
+        {:ok, result} when not is_map_key(result, "loaderId") -> :same_document
         {:ok, result} -> {:ok, result["loaderId"], result["frameId"]}
         {:error, _} = error -> error
       end
@@ -296,16 +308,99 @@ defmodule CDPEx.Page do
   # `after remaining(deadline) + @helper_grace` is a last-resort net that force-kills a body
   # that ignores the deadline, so the caller never blocks past the ceiling. A helper that
   # crashes before replying (a should-never-happen bug) surfaces as {:error, {on_crash, reason}}.
-  defp run_in_helper(fun, on_crash, deadline, label) when is_function(fun, 0) do
+  #
+  # With a `trigger`, `fun` takes a gate: the helper calls it once it is watching, the
+  # caller then runs the trigger and lets the helper on. A trigger's `{:error, _}` ends
+  # the call with it.
+  defp run_in_helper(fun, on_crash, deadline, label, trigger \\ nil)
+
+  defp run_in_helper(fun, on_crash, deadline, label, trigger) when is_function(fun, 0),
+    do: run_in_helper(fn _gate -> fun.() end, on_crash, deadline, label, trigger)
+
+  defp run_in_helper(fun, on_crash, deadline, label, trigger) when is_function(fun, 1) do
     parent = self()
     tag = make_ref()
+
+    gate =
+      if trigger,
+        do: fn -> helper_gate(parent, tag, deadline) end,
+        else: fn -> :ok end
 
     {helper, mon} =
       spawn_monitor(fn ->
         ProcessLabel.set(label)
-        send(parent, {tag, fun.()})
+        send(parent, {tag, fun.(gate)})
       end)
 
+    case trigger && await_watching(tag, helper, mon, deadline) do
+      nil -> await_helper(tag, helper, mon, on_crash, deadline)
+      :watching -> trigger_helper(trigger, tag, helper, mon, on_crash, deadline)
+      {:done, result} -> result
+      {:down, reason} -> {:error, {on_crash, reason}}
+      :timeout -> stop_helper(tag, helper, mon, {:error, :timeout})
+    end
+  end
+
+  defp helper_gate(parent, tag, deadline) do
+    send(parent, {tag, :watching})
+
+    receive do
+      {^tag, :go} -> :ok
+    after
+      remaining(deadline) -> :ok
+    end
+  end
+
+  defp await_watching(tag, helper, mon, deadline) do
+    receive do
+      {^tag, :watching} ->
+        :watching
+
+      {^tag, result} ->
+        Process.demonitor(mon, [:flush])
+        {:done, result}
+
+      {:DOWN, ^mon, :process, ^helper, reason} ->
+        {:down, reason}
+    after
+      remaining(deadline) + @helper_grace -> :timeout
+    end
+  end
+
+  defp trigger_helper(trigger, tag, helper, mon, on_crash, deadline) do
+    result =
+      try do
+        run_trigger(trigger)
+      catch
+        kind, reason ->
+          _ = stop_helper(tag, helper, mon, :ok)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
+
+    case result do
+      :ok ->
+        send(helper, {tag, :go})
+        await_helper(tag, helper, mon, on_crash, deadline)
+
+      {:error, _} = error ->
+        stop_helper(tag, helper, mon, error)
+    end
+  end
+
+  defp stop_helper(tag, helper, mon, result) do
+    Process.exit(helper, :kill)
+    Process.demonitor(mon, [:flush])
+
+    receive do
+      {^tag, _} -> :ok
+    after
+      0 -> :ok
+    end
+
+    result
+  end
+
+  defp await_helper(tag, helper, mon, on_crash, deadline) do
     receive do
       {^tag, result} ->
         Process.demonitor(mon, [:flush])
@@ -345,7 +440,7 @@ defmodule CDPEx.Page do
   # url}} | {:error, reason}. No before/after drain is needed — the helper's mailbox starts
   # empty and dies with it.
   defp run_capture(page, url, milestone, deadline) do
-    methods = watched(page, [@lifecycle_method, @response_received])
+    methods = watched(page, [@target_crashed, @lifecycle_method, @response_received])
 
     case subscribe_each(page.conn, methods, remaining(deadline), page.session_id) do
       :ok ->
@@ -361,6 +456,10 @@ defmodule CDPEx.Page do
     case do_call(page, "Page.navigate", %{"url" => url}, remaining(deadline)) do
       {:ok, %{"errorText" => error}} ->
         {:error, {:navigate, error}}
+
+      # A same-document navigation loads no document, so there is no response to wait for.
+      {:ok, result} when not is_map_key(result, "loaderId") ->
+        {:error, {:no_document_response, url}}
 
       {:ok, result} ->
         nav = navigation(result["loaderId"], result["frameId"])
@@ -414,6 +513,9 @@ defmodule CDPEx.Page do
       {:cdp_event, ^conn, @target_detached, %{"sessionId" => ^sid}, _parent} ->
         {:down, {:session_closed, sid}}
 
+      {:cdp_event, ^conn, @target_crashed, _params, ^sid} ->
+        {:down, :target_crashed}
+
       {:cdp_event, ^conn, _method, _params, _other_sid} ->
         # Another session's event, or (with milestone nil) a lifecycle we don't wait on.
         await_capture(page, milestone, ref, deadline, nav, captured)
@@ -466,7 +568,8 @@ defmodule CDPEx.Page do
   # `loader` for the whole wait. `wait_loader` is the loader whose milestone ends the
   # wait; it starts as `loader` and track_lifecycle/2 re-pins it to a successor document.
   # `committed` records that our own document has emitted a lifecycle event.
-  defp navigation(lid, fid), do: %{loader: lid, frame: fid, wait_loader: lid, committed: false}
+  defp navigation(lid, fid),
+    do: %{loader: lid, frame: fid, wait_loader: lid, committed: false, exclude: nil}
 
   # Classify a lifecycle event against the pinned navigation. Chrome emits `init` for
   # every new document on a frame, and a document can only be replaced after it has
@@ -480,6 +583,10 @@ defmodule CDPEx.Page do
   # frame's loader before navigating, so we pin to the navigate result and re-pin.
   defp track_lifecycle(params, nav) do
     cond do
+      # The document that was loaded before a wait_for_navigation/2 :trigger ran.
+      nav.exclude != nil and params["loaderId"] == nav.exclude ->
+        {:stale, nav}
+
       own_loader?(params, nav.wait_loader, nav.frame) ->
         {:ours, %{nav | committed: true}}
 
@@ -549,12 +656,14 @@ defmodule CDPEx.Page do
       :ok ->
         drain_events(page.conn, @lifecycle_method)
         ref = Process.monitor(page.conn)
-        watch = watch_detach(page, deadline)
+        watch = watch_target(page, deadline)
         await = &await_lifecycle(page, name, {ref, watch_tag(watch)}, deadline, &1)
 
         try do
           case trigger.() do
             :ok -> await.(navigation(nil, nil))
+            {:after, fid, lid} -> await.(%{navigation(nil, fid) | exclude: lid})
+            :same_document -> :reached
             {:ok, lid, fid} -> await.(navigation(lid, fid))
             {:error, _} = error -> error
           end
@@ -564,6 +673,28 @@ defmodule CDPEx.Page do
           :ok = unsubscribe_each(page.conn, [@lifecycle_method], page.session_id)
           drain_events(page.conn, @lifecycle_method)
         end
+    end
+  end
+
+  # Without a :trigger, any document's milestone ends the wait, the one already loaded
+  # included. With one, the loaded document is noted before the trigger runs, and its
+  # events no longer count. Should the frame tree not answer, the wait goes on as
+  # without a trigger.
+  defp before_wait(page, nil, deadline), do: probe_session(page, deadline)
+
+  defp before_wait(page, trigger, deadline) do
+    with :ok <- probe_session(page, deadline) do
+      loaded =
+        case do_call(page, "Page.getFrameTree", %{}, remaining(deadline)) do
+          {:ok, %{"frameTree" => %{"frame" => %{"id" => fid, "loaderId" => lid}}}} -> {fid, lid}
+          _ -> nil
+        end
+
+      case {run_trigger(trigger), loaded} do
+        {{:error, _} = error, _} -> error
+        {:ok, {fid, lid}} -> {:after, fid, lid}
+        {:ok, nil} -> :ok
+      end
     end
   end
 
@@ -589,26 +720,27 @@ defmodule CDPEx.Page do
   defp watched(%__MODULE__{session_id: nil}, methods), do: methods
   defp watched(_page, methods), do: [@target_detached | methods]
 
-  # The caller-run wait can't subscribe to the detach itself: unsubscribing would drop
-  # a subscription the caller holds on that browser-wide method, and the drain would
-  # eat its queued events. A monitored watcher subscribes instead and sends
-  # `{tag, {:session_closed, sid}}`; Connection prunes its subscription when it exits.
-  # Returns `{pid, monitor, tag}`, or nil for a dedicated page or a failed subscribe:
-  # it is bounded by the wait's own deadline, so a failure means either that deadline
-  # is spent or the connection is dead, which the wait reports by itself.
-  defp watch_detach(%__MODULE__{session_id: nil}, _deadline), do: nil
-
-  defp watch_detach(%__MODULE__{conn: conn, session_id: sid} = page, deadline) do
+  # The caller-run wait can't subscribe to the detach or the crash itself: unsubscribing
+  # would drop a subscription the caller holds on that method, and the drain would eat
+  # its queued events. A monitored watcher subscribes instead and sends
+  # `{tag, {:session_closed, sid}}` (a `:session` page's detach) or
+  # `{tag, :target_crashed}` (the renderer crashed: no milestone will come until the
+  # page is navigated again); Connection prunes its subscriptions when it exits.
+  # Returns `{pid, monitor, tag}`, or nil for a failed subscribe: it is bounded by the
+  # wait's own deadline, so a failure means either that deadline is spent or the
+  # connection is dead, which the wait reports by itself.
+  defp watch_target(%__MODULE__{conn: conn, session_id: sid} = page, deadline) do
     parent = self()
     tag = make_ref()
+    methods = if sid, do: [@target_crashed, @target_detached], else: [@target_crashed]
 
     {pid, mon} =
       spawn_monitor(fn ->
-        ProcessLabel.set({:cdp_page_helper, :detach_watch, page.target_id})
+        ProcessLabel.set({:cdp_page_helper, :target_watch, page.target_id})
         parent_mon = Process.monitor(parent)
 
-        case subscribe_each(conn, [@target_detached], remaining(deadline), sid) do
-          :ok -> report_detach(conn, sid, {parent, parent_mon}, tag)
+        case subscribe_each(conn, methods, remaining(deadline), sid) do
+          :ok -> report_target(conn, sid, {parent, parent_mon}, tag)
           {:error, _reason} -> :ok
         end
       end)
@@ -619,12 +751,15 @@ defmodule CDPEx.Page do
     end
   end
 
-  defp report_detach(conn, sid, {parent, parent_mon}, tag) do
+  defp report_target(conn, sid, {parent, parent_mon}, tag) do
     send(parent, {tag, :watching})
 
     receive do
-      {:cdp_event, ^conn, @target_detached, %{"sessionId" => ^sid}, _parent} ->
+      {:cdp_event, ^conn, @target_detached, %{"sessionId" => ^sid}, _parent} when is_binary(sid) ->
         send(parent, {tag, {:session_closed, sid}})
+
+      {:cdp_event, ^conn, @target_crashed, _params, ^sid} ->
+        send(parent, {tag, :target_crashed})
 
       {:DOWN, ^parent_mon, :process, ^parent, _reason} ->
         :ok
@@ -676,6 +811,9 @@ defmodule CDPEx.Page do
       {^tag, {:session_closed, _sid} = reason} ->
         {:down, reason}
 
+      {^tag, :target_crashed} ->
+        {:error, :target_crashed}
+
       {:cdp_event, ^conn, @lifecycle_method, _params, _session_id} ->
         await_lifecycle(page, name, mons, deadline, nav)
 
@@ -688,6 +826,7 @@ defmodule CDPEx.Page do
         receive do
           {:DOWN, ^ref, :process, ^conn, reason} -> {:down, reason}
           {^tag, {:session_closed, _sid} = reason} -> {:down, reason}
+          {^tag, :target_crashed} -> {:error, :target_crashed}
         after
           0 -> :timeout
         end
@@ -695,6 +834,7 @@ defmodule CDPEx.Page do
   end
 
   defp down_reason({:session_closed, _sid} = reason), do: reason
+  defp down_reason(:target_crashed), do: :target_crashed
   defp down_reason({:shutdown, {:ws_closed, reason}}), do: {:ws_closed, reason}
   defp down_reason(_), do: :noproc
 
@@ -712,9 +852,17 @@ defmodule CDPEx.Page do
   @doc """
   Waits for a navigation lifecycle milestone, without issuing a navigation.
 
-  Useful after a `click/3` (or other in-page action) that triggers navigation.
+  Pass the action that navigates (a `click/3`, a form submit) as `:trigger`:
+
+      :ok = Page.wait_for_navigation(page, trigger: fn -> Page.click(page, "a.next") end)
+
+  The document loaded before the trigger runs is noted first, and its own lifecycle
+  events no longer end the wait. Without `:trigger` any document's milestone does, so a
+  late `networkAlmostIdle` of the page you are leaving can return `:ok` before the
+  navigation commits. A trigger that returns `{:error, _}` ends the call with it.
 
   Options:
+    * `:trigger` — a 0-arity function that starts the navigation (see above)
     * `:wait_until` — `:network_almost_idle` (default), `:load`, or `:none`
     * `:timeout` — ms (default 30_000)
 
@@ -726,9 +874,12 @@ defmodule CDPEx.Page do
   """
   @spec wait_for_navigation(t(), keyword()) :: :ok | {:error, term()}
   def wait_for_navigation(%__MODULE__{frame: nil} = page, opts \\ []) do
+    trigger = trigger_opt(Keyword.get(opts, :trigger))
+
     case Keyword.get(opts, :wait_until, :network_almost_idle) do
-      :none -> :ok
-      wait_until -> await_navigation(page, wait_until, opts)
+      :none when trigger == nil -> :ok
+      :none -> run_trigger(trigger)
+      wait_until -> await_navigation(page, wait_until, trigger, opts)
     end
   end
 
@@ -736,11 +887,11 @@ defmodule CDPEx.Page do
   # the Page.lifecycleEvent method) but without issuing a navigation — the caller
   # already triggered one (e.g. a click). Unlike the previous await_event matcher,
   # this can't be tripped by params from another event method carrying a "name".
-  defp await_navigation(page, wait_until, opts) do
+  defp await_navigation(page, wait_until, trigger, opts) do
     name = lifecycle_name(wait_until)
     deadline = System.monotonic_time(:millisecond) + Keyword.get(opts, :timeout, @navigate_timeout)
 
-    case subscribe_then_await(page, name, deadline, fn -> probe_session(page, deadline) end) do
+    case subscribe_then_await(page, name, deadline, fn -> before_wait(page, trigger, deadline) end) do
       :reached -> :ok
       :timeout -> {:error, :timeout}
       {:down, reason} -> {:error, down_reason(reason)}
@@ -880,9 +1031,11 @@ defmodule CDPEx.Page do
   The check runs inside the page on every DOM mutation, so a matching element is
   seen as soon as it is inserted (see `wait_for_function/3`).
 
-  The selector is `Jason.encode!`-ed into the injected `document.querySelector(...)`
+  The selector is JSON-encoded into the injected `document.querySelector(...)`
   call, so quote characters in attribute selectors (`[id^='ticket-card-']`,
-  `[data-x="foo"]`) reach the page intact — no naive string concatenation.
+  `[data-x="foo"]`) reach the page intact — no naive string concatenation. A
+  selector that is not valid UTF-8 returns `{:error, {:invalid_args, _}}`, here and
+  in every other function that takes a selector or text.
 
   Returns `:ok`, `{:error, :timeout}`, or `{:error, reason}` if a non-transient
   evaluate error occurs — including `{:error, {:evaluate_exception, _}}` when
@@ -895,7 +1048,7 @@ defmodule CDPEx.Page do
   """
   @spec wait_for_selector(t(), String.t(), keyword()) :: :ok | {:error, term()}
   def wait_for_selector(%__MODULE__{} = page, css, opts \\ []) when is_binary(css) do
-    wait_for_function(page, "document.querySelector(#{Jason.encode!(css)}) !== null", opts)
+    wait_for_function(page, "document.querySelector(#{js_value(css)}) !== null", opts)
   end
 
   @doc """
@@ -965,17 +1118,29 @@ defmodule CDPEx.Page do
         {:error, :timeout}
 
       {:error, {:cdp_error, _method, _info}} ->
-        rearm_after_cdp_error(page, js, interval, deadline)
+        rearm(page, js, interval, deadline, {:error, :timeout})
 
       {:error, reason} ->
-        {:error, reason}
+        if frame_moved?(page, reason),
+          do: rearm(page, js, interval, deadline, {:error, reason}),
+          else: {:error, reason}
     end
   end
 
-  defp rearm_after_cdp_error(page, js, interval, deadline) do
+  # A frame handle's document can go away under the wait: a cross-site frame that
+  # navigates back to its parent's site loses its own session, and the new document
+  # has no context for a moment. The frame is looked up again on the next try (see
+  # route/2); at the deadline the last such error stands. The top page's own session
+  # closing is final.
+  defp frame_moved?(%__MODULE__{frame: nil}, _reason), do: false
+  defp frame_moved?(_frame, {:frame_unavailable, _css}), do: true
+  defp frame_moved?(frame, {:session_closed, sid}), do: sid != top(frame).session_id
+  defp frame_moved?(_frame, _reason), do: false
+
+  defp rearm(page, js, interval, deadline, at_deadline) do
     case deadline - System.monotonic_time(:millisecond) do
       left when left <= 0 ->
-        {:error, :timeout}
+        at_deadline
 
       left ->
         Process.sleep(min(interval, left))
@@ -1021,7 +1186,7 @@ defmodule CDPEx.Page do
   """
   @spec text(t(), String.t(), keyword()) :: {:ok, String.t() | nil} | {:error, term()}
   def text(%__MODULE__{} = page, css, opts \\ []) when is_binary(css) do
-    sel = Jason.encode!(css)
+    sel = js_value(css)
 
     js = """
     (() => {
@@ -1041,8 +1206,8 @@ defmodule CDPEx.Page do
           {:ok, String.t() | nil} | {:error, term()}
   def attribute(%__MODULE__{} = page, css, name, opts \\ [])
       when is_binary(css) and is_binary(name) do
-    sel = Jason.encode!(css)
-    attr = Jason.encode!(name)
+    sel = js_value(css)
+    attr = js_value(name)
 
     js = """
     (() => {
@@ -1061,7 +1226,7 @@ defmodule CDPEx.Page do
   """
   @spec visible?(t(), String.t(), keyword()) :: {:ok, boolean()} | {:error, term()}
   def visible?(%__MODULE__{} = page, css, opts \\ []) when is_binary(css) do
-    sel = Jason.encode!(css)
+    sel = js_value(css)
 
     js = """
     (() => {
@@ -1125,7 +1290,7 @@ defmodule CDPEx.Page do
   """
   @spec click(t(), String.t(), keyword()) :: :ok | {:error, term()}
   def click(%__MODULE__{} = page, css, opts \\ []) when is_binary(css) do
-    locator = "document.querySelector(#{Jason.encode!(css)})"
+    locator = "document.querySelector(#{js_value(css)})"
     click_with_wait(page, locator, {:selector_not_found, css}, css, opts)
   end
 
@@ -1218,7 +1383,7 @@ defmodule CDPEx.Page do
   """
   @spec hover(t(), String.t(), keyword()) :: :ok | {:error, term()}
   def hover(%__MODULE__{} = page, css, opts \\ []) when is_binary(css) do
-    locator = "document.querySelector(#{Jason.encode!(css)})"
+    locator = "document.querySelector(#{js_value(css)})"
     not_found = {:selector_not_found, css}
     with_wait(opts, fn -> trusted_mouse(page, locator, not_found, css, :hover, opts) end)
   end
@@ -1252,7 +1417,7 @@ defmodule CDPEx.Page do
   end
 
   def scroll(%__MODULE__{} = page, {x, y}, opts) when is_number(x) and is_number(y),
-    do: scroll_to(page, Jason.encode!(x), Jason.encode!(y), opts)
+    do: scroll_to(page, js_value(x), js_value(y), opts)
 
   defp scroll_to(page, left, top, opts) do
     js = """
@@ -1336,7 +1501,7 @@ defmodule CDPEx.Page do
   defp do_set_input_files(page, css, files, timeout) do
     js = """
     (function () {
-      var el = document.querySelector(#{Jason.encode!(css)});
+      var el = document.querySelector(#{js_value(css)});
       if (!el) { return "not_found"; }
       if (!(el instanceof HTMLInputElement) || el.type !== "file") { return "not_file_input"; }
       if (#{length(files)} > 1 && !el.multiple) { return "not_multiple"; }
@@ -1442,7 +1607,9 @@ defmodule CDPEx.Page do
   The handle names the frame, not its document: where its script runs is looked up
   on every call, so it keeps working after the frame navigates, to another site
   (another process) included. While the new document has no context yet, and once
-  the frame is removed, calls return `{:error, {:frame_unavailable, css}}`. Handles
+  the frame is removed, calls return `{:error, {:frame_unavailable, css}}`; a
+  `wait_for_selector/3` or `wait_for_function/3` on the handle keeps waiting through
+  such a move and returns that error only at its timeout. Handles
   need no closing; a cross-site frame's session on the browser connection is reused
   for the same frame and ends with it or with the page.
 
@@ -1492,7 +1659,7 @@ defmodule CDPEx.Page do
   defp find_frame(page, css, timeout) do
     js = """
     (function () {
-      var el = document.querySelector(#{Jason.encode!(css)});
+      var el = document.querySelector(#{js_value(css)});
       if (!el) { return "not_found"; }
       if (!(el instanceof HTMLIFrameElement || el instanceof HTMLFrameElement)) { return "not_frame"; }
       return el;
@@ -1732,8 +1899,8 @@ defmodule CDPEx.Page do
     """
     (function () {
       var norm = function (s) { return s.replace(/[ \\t\\r\\n]+/g, " ").replace(/^ | $/g, ""); };
-      var target = norm(#{Jason.encode!(text)});
-      var selector = #{Jason.encode!(selector)};
+      var target = norm(#{js_value(text)});
+      var selector = #{js_value(selector)};
       var matches = [];
       var boxed = function (el) {
         var r = el.getBoundingClientRect();
@@ -1807,13 +1974,40 @@ defmodule CDPEx.Page do
 
   defp synthetic_phase(_reason), do: :dispatch
 
+  # Scrolls `el` to the centre of the viewport unless it is already wholly in view,
+  # instantly: scrollIntoViewIfNeeded() and a default scrollIntoView() follow CSS
+  # `scroll-behavior: smooth`, and the hit test right after it would still see the
+  # element off screen. "In view" also means not clipped by a scrolling ancestor, which
+  # scrollIntoViewIfNeeded() took care of.
+  @scroll_into_view """
+  var vr = el.getBoundingClientRect();
+      var hidden = vr.top < 0 || vr.left < 0 || vr.bottom > window.innerHeight || vr.right > window.innerWidth;
+      for (var sp = el.parentElement; sp && !hidden; sp = sp.parentElement) {
+        var ss = getComputedStyle(sp);
+        if (ss.overflowX === "visible" && ss.overflowY === "visible") { continue; }
+        var pr = sp.getBoundingClientRect();
+        hidden = vr.top < pr.top || vr.left < pr.left || vr.bottom > pr.bottom || vr.right > pr.right;
+      }
+      if (hidden) { el.scrollIntoView({block: "center", inline: "center", behavior: "instant"}); }\
+  """
+
+  # A caller's value as a JS literal for injected code. A string that is not valid
+  # UTF-8 has none: it stays raw, so the CDP call carrying the code fails to encode and
+  # returns `{:error, {:invalid_args, _}}` (see `CDPEx.Connection.call/5`) instead of
+  # raising here.
+  defp js_value(value) do
+    case Jason.encode(value) do
+      {:ok, json} -> json
+      {:error, _} -> value
+    end
+  end
+
   defp trusted_mouse(page, locator, not_found, label, action, opts) do
     js = """
     (function () {
       var el = #{locator};
       if (!el) { return {found: false}; }
-      if (el.scrollIntoViewIfNeeded) { el.scrollIntoViewIfNeeded(); }
-      else { el.scrollIntoView({block: "center", inline: "center"}); }
+      #{@scroll_into_view}
       var root = el.getRootNode();
       var probe = typeof root.elementFromPoint === "function" ? root : document;
       var owns = function (hit) {
@@ -1873,7 +2067,7 @@ defmodule CDPEx.Page do
     arm =
       "(function (k) { window[k] = false; window.addEventListener('mousemove', " <>
         "function (e) { if (e.isTrusted) { window[k] = true; } }, {capture: true, once: true}); " <>
-        "return true; })(#{Jason.encode!(key)})"
+        "return true; })(#{js_value(key)})"
 
     case evaluate(page, arm, timeout: timeout) do
       {:ok, true} -> await_pointer(page, x, y, key, label, deadline)
@@ -1885,7 +2079,7 @@ defmodule CDPEx.Page do
   defp await_pointer(page, x, y, key, label, deadline) do
     seen =
       "(function (k) { var seen = window[k]; if (seen) { delete window[k]; } return seen; })" <>
-        "(#{Jason.encode!(key)})"
+        "(#{js_value(key)})"
 
     timeout = max(remaining(deadline), 1)
 
@@ -1933,7 +2127,7 @@ defmodule CDPEx.Page do
   end
 
   defp focus(page, css, opts) do
-    selector = Jason.encode!(css)
+    selector = js_value(css)
 
     js = """
     (function () {
@@ -2754,10 +2948,16 @@ defmodule CDPEx.Page do
   Blocks until the network has been idle — at most `:max_inflight` in-flight requests —
   for `:idle_time` ms continuously, or `timeout`.
 
-  The Puppeteer "networkidle" primitive: use it after a `click/3` (or other action)
-  that kicks off XHR/`fetch` hydration to wait for the page to settle. Idleness is
-  measured **from the call onward** — requests already in flight when you call are not
-  counted — so call it right after triggering the work.
+  The Puppeteer "networkidle" primitive: pass the `click/3` (or other action) that
+  kicks off XHR/`fetch` hydration as `:trigger` to wait for the page to settle:
+
+      :ok = Page.wait_for_network_idle(page, trigger: fn -> Page.click(page, "#more") end)
+
+  Idleness is measured **from the call onward**: the trigger runs once the wait is
+  watching, so every request it starts is counted. Without `:trigger`, requests already
+  in flight when you call are not counted, so one a click started just before can still
+  be loading when this returns `:ok`. A trigger that returns `{:error, _}` ends the call
+  with it.
 
   Returns `:ok` once idle, `{:error, :timeout}` if it never settles within `timeout`
   (e.g. a streaming / SSE / long-poll connection that never closes), or
@@ -2771,6 +2971,7 @@ defmodule CDPEx.Page do
   internal helper returns `{:error, {:idle_wait_failed, reason}}`.
 
   Options:
+    * `:trigger` — a 0-arity function that starts the work (see above)
     * `:idle_time` — ms of continuous idleness required (default 500)
     * `:max_inflight` — in-flight requests still considered idle (default 0; 2 is
       Puppeteer's `networkidle2`)
@@ -2782,11 +2983,14 @@ defmodule CDPEx.Page do
     max_inflight = Keyword.get(opts, :max_inflight, 0)
     deadline = System.monotonic_time(:millisecond) + Keyword.get(opts, :timeout, @navigate_timeout)
 
+    trigger = trigger_opt(Keyword.get(opts, :trigger))
+
     run_in_helper(
-      fn -> run_network_idle(page, idle_time, max_inflight, deadline) end,
+      fn gate -> run_network_idle(page, idle_time, max_inflight, deadline, gate) end,
       :idle_wait_failed,
       deadline,
-      {:cdp_page_helper, :idle_wait, page.target_id}
+      {:cdp_page_helper, :idle_wait, page.target_id},
+      trigger
     )
   end
 
@@ -2797,7 +3001,7 @@ defmodule CDPEx.Page do
   # :timeout is a true overall ceiling. Returns :ok | {:error, reason}. No try/after teardown:
   # the helper's subscriptions are pruned by Connection on its :DOWN and its idle-tick timers
   # die with it (an enable failure likewise just exits the helper and is auto-pruned).
-  defp run_network_idle(page, idle_time, max_inflight, deadline) do
+  defp run_network_idle(page, idle_time, max_inflight, deadline, gate) do
     methods = watched(page, @idle_events)
 
     with :ok <- subscribe_each(page.conn, methods, remaining(deadline), page.session_id),
@@ -2809,6 +3013,8 @@ defmodule CDPEx.Page do
       # to the wait. Announce the boundary — it is the only way a caller (or a
       # test) can know the helper is watching rather than still setting up.
       Telemetry.network_idle_watching(page.session_id)
+      # With a :trigger, the caller runs it now; the wait counts what it starts.
+      gate.()
 
       ref = Process.monitor(page.conn)
 
@@ -3011,16 +3217,22 @@ defmodule CDPEx.Page do
   the first navigation, pass `block:` to `CDPEx.Browser.new_page/2` instead (also
   accepted by `CDPEx.with_page/3` and `CDPEx.Pool.with_page/3`).
 
-  Types: `:image`, `:font`, `:media`, `:stylesheet`, `:script`, `:xhr`, `:fetch`,
-  `:text_track`, `:manifest`, `:prefetch`, `:ping`, `:event_source`, `:other`.
+  Types, by what Chrome reports for each request:
+
+    * `:image`, `:font`, `:stylesheet`, `:script`
+    * `:media` — `<audio>`/`<video>` sources and `<track>` text tracks
+    * `:xhr` — every `XMLHttpRequest`, `fetch()` and `EventSource` of the page and
+      of its workers, whatever they fetch (a `fetch()` of an image is `:xhr`, not
+      `:image`)
+    * `:prefetch` — `<link rel=prefetch>`
+    * `:ping` — `navigator.sendBeacon()`
+    * `:other` — web app manifests, worker scripts, `<link rel=preload as=fetch>`
+      and the rest
+
   `:document` is not accepted (it would fail the page's own navigation; iframes share
   the type, so block those by URL with `enable_request_interception/2`), nor is
   `:websocket` (Chrome doesn't pause WebSocket handshakes, so it would do nothing). An
   invalid value returns `{:error, {:invalid_args, {:block, value}}}`.
-
-  The type is the one Chrome reports, not the API that made the request: Chrome reports
-  a `fetch()` call as `XHR`, from the page and from its workers alike, so `:xhr` blocks
-  it and `:fetch` does not. A `fetch()` of an image is `XHR` too, not `:image`.
 
   The library fails the requests itself, so no process has to handle them and the
   calling process may exit; blocking lasts until changed or until the page closes.
@@ -3031,6 +3243,14 @@ defmodule CDPEx.Page do
 
   Cross-site iframes are covered too, nested ones included: Chrome runs each as its
   own target, which the library attaches, filters and resumes before it loads.
+
+  A service worker would answer the page's requests from its own target, out of
+  reach of the block, so while blocking is on the page and its iframes bypass service
+  workers (`Network.setBypassServiceWorker`): their requests go to the network, and
+  the network domain stays enabled on them. A page that relies on its service worker
+  (offline caches, synthesized responses) behaves as on a first visit. A
+  `SharedWorker` is not covered: Chrome runs it outside the page's targets, so its
+  requests are not blocked.
 
   Unblocking doesn't reload what was already blocked, and navigating the page to the
   same document again may reuse Chrome's in-memory result for it without a request.
@@ -3086,8 +3306,9 @@ defmodule CDPEx.Page do
         {"requestStage", _} ->
           {:halt, :error}
 
+        # Not valid UTF-8, a urlPattern would crash the matcher and Chrome reject it.
         {name, value} when is_binary(name) and is_binary(value) ->
-          {:cont, {:ok, Map.put(acc, name, value)}}
+          put_valid(acc, name, value)
 
         _ ->
           {:halt, :error}
@@ -3096,6 +3317,12 @@ defmodule CDPEx.Page do
   end
 
   defp normalize_pattern(_pattern), do: :error
+
+  defp put_valid(acc, name, value) do
+    if String.valid?(value),
+      do: {:cont, {:ok, Map.put(acc, name, value)}},
+      else: {:halt, :error}
+  end
 
   @doc """
   Lets a paused request proceed (`Fetch.continueRequest`), optionally rewriting it.
@@ -3458,8 +3685,7 @@ defmodule CDPEx.Page do
     shift = """
     function (x, y) {
       var el = this;
-      if (el.scrollIntoViewIfNeeded) { el.scrollIntoViewIfNeeded(); }
-      else { el.scrollIntoView({block: "center", inline: "center"}); }
+      #{@scroll_into_view}
       var r = el.getBoundingClientRect(), s = getComputedStyle(el);
       var px = r.left + el.clientLeft + parseFloat(s.paddingLeft) + x;
       var py = r.top + el.clientTop + parseFloat(s.paddingTop) + y;

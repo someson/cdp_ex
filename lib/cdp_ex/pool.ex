@@ -31,7 +31,7 @@ defmodule CDPEx.Pool do
 
   ## Options
 
-    * `:size` — maximum number of browsers (default `1`)
+    * `:size` — maximum number of browsers, a positive integer (default `1`)
     * `:pages_per_browser` — how many checkouts share one browser at a time (default
       `1`). `size: 2, pages_per_browser: 4` serves 8 parallel jobs on 2 Chromes, for
       less memory and fewer jobs per second than 8 × 1. Sharing jobs should use
@@ -87,6 +87,7 @@ defmodule CDPEx.Pool do
     if !Keyword.has_key?(pool_opts, :start_fun),
       do: Browser.validate_launch_opts!(Keyword.get(pool_opts, :launch_opts, []))
 
+    validate_size!(Keyword.get(pool_opts, :size, @default_size))
     validate_pages_per_browser!(Keyword.get(pool_opts, :pages_per_browser, 1))
 
     GenServer.start_link(__MODULE__, pool_opts, gen_opts)
@@ -547,6 +548,13 @@ defmodule CDPEx.Pool do
       nil -> :error
     end
   end
+
+  # A non-integer crashes the pool on the first checkout; 0 or less makes every checkout
+  # time out.
+  defp validate_size!(n) when is_integer(n) and n > 0, do: :ok
+
+  defp validate_size!(other),
+    do: raise(ArgumentError, "invalid :size #{inspect(other)} (expected a positive integer)")
 
   defp validate_pages_per_browser!(n) when is_integer(n) and n > 0, do: :ok
 

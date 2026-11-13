@@ -313,4 +313,28 @@ defmodule CDPEx.Protocol do
       {:error, _} -> String.to_charlist(host)
     end
   end
+
+  @doc """
+  The socket family option for connecting to `host`: `[inet6: true]` for an IPv6
+  literal (`:gen_tcp` takes it for a name to resolve otherwise, and fails with
+  `:nxdomain`), else none.
+
+  ## Examples
+
+      iex> CDPEx.Protocol.family_opts("::1")
+      [inet6: true]
+
+      iex> CDPEx.Protocol.family_opts("127.0.0.1")
+      []
+
+      iex> CDPEx.Protocol.family_opts("localhost")
+      []
+  """
+  @spec family_opts(String.t()) :: keyword()
+  def family_opts(host) do
+    case :inet.parse_ipv6strict_address(String.to_charlist(host)) do
+      {:ok, _ip} -> [inet6: true]
+      {:error, _} -> []
+    end
+  end
 end

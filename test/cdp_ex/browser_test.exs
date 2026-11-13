@@ -61,6 +61,96 @@ defmodule CDPEx.BrowserTest do
     end
   end
 
+  describe "Chrome's own exit" do
+    # The OS reaps an exited Chrome, so its pid may belong to another process by the
+    # time terminate/2 runs Chrome.stop/1: the handle must no longer name it.
+    test "forgets the OS pid it reported dead (port)" do
+      port = make_ref()
+      state = %Browser{chrome: %{port: port, os_pid: 4242, user_data_dir: "/x"}}
+
+      capture_log(fn ->
+        assert {:stop, {:chrome_exited, 9}, %Browser{chrome: chrome}} =
+                 Browser.handle_info({port, {:exit_status, 9}}, state)
+
+        assert chrome.os_pid == nil
+        assert chrome.port == port
+      end)
+    end
+
+    test "forgets the OS pid it reported dead (pipe)" do
+      conn = self()
+      state = %Browser{browser_conn: conn, pipe: true, chrome: %{port: nil, os_pid: 4242}}
+      reason = {:shutdown, {:ws_closed, {:chrome_exited, 137}}}
+
+      capture_log(fn ->
+        assert {:stop, {:chrome_exited, 137}, %Browser{chrome: %{os_pid: nil}}} =
+                 Browser.handle_info({:EXIT, conn, reason}, state)
+      end)
+    end
+  end
+
+  describe "error reasons stay in the taxonomy (E4)" do
+    test "a caller parked on a Fetch owner that crashed gets :noproc, not the crash term" do
+      owner = spawn(fn -> :ok end)
+      tag = make_ref()
+      from = {self(), make_ref()}
+      state = %Browser{pending: %{tag => {from, nil, owner}}, fetchers: %{"T" => owner}}
+
+      assert {:noreply, _} = Browser.handle_info({:EXIT, owner, {:badarg, []}}, state)
+      {_, ref} = from
+      assert_received {^ref, {:error, :noproc}}
+    end
+
+    test "Browser requests with an :infinity timeout don't raise" do
+      browser =
+        spawn(fn ->
+          receive do
+            {:"$gen_call", from, _request} -> GenServer.reply(from, :ok)
+          end
+        end)
+
+      page = %Page{browser: browser, conn: self(), target_id: "T"}
+      assert :ok = Browser.intercept(browser, page, [], :infinity)
+    end
+
+    test "launch/1 with a :name already taken is {:already_started, pid}" do
+      Process.register(self(), :cdp_ex_taken_name)
+      assert {:error, {:already_started, pid}} = CDPEx.launch(name: :cdp_ex_taken_name)
+      assert pid == self()
+    end
+  end
+
+  describe "validate_launch_opts!/1 unknown options" do
+    test "rejects a key no launch reads, before any I/O" do
+      for opts <- [[extra_arg: ["--x"]], [headles: false], [proxy_url: "http://h:1"]] do
+        assert_raise ArgumentError, ~r/unknown launch option/, fn ->
+          Browser.validate_launch_opts!(opts)
+        end
+      end
+
+      assert_raise ArgumentError, ~r/unknown launch option :extra_arg/, fn ->
+        CDPEx.launch(extra_arg: ["--proxy-server=http://h:1"])
+      end
+    end
+
+    test "accepts every documented key" do
+      assert :ok =
+               Browser.validate_launch_opts!(
+                 chrome_binary: nil,
+                 user_data_dir: nil,
+                 headless: true,
+                 window_size: {800, 600},
+                 extra_args: [],
+                 launch_timeout: 1_000,
+                 pipe: false,
+                 block_background_hosts: true,
+                 proxy: "http://h:1",
+                 owner: self(),
+                 name: :some_browser
+               )
+    end
+  end
+
   describe "launch/1 :proxy validation" do
     test "a malformed :proxy fails the launch with {:invalid_proxy, _} (no Chrome launched)" do
       # apply_proxy runs before Chrome.launch in init/1, so a bad proxy stops init early.
@@ -354,7 +444,7 @@ defmodule CDPEx.BrowserTest do
       assert new_state.fetchers == %{"T2" => self()}
       assert [{_, {^other, nil, _}}] = Map.to_list(new_state.pending)
 
-      for {_, tag} <- [from1, from2], do: assert_receive({^tag, {:error, :boom}})
+      for {_, tag} <- [from1, from2], do: assert_receive({^tag, {:error, :noproc}})
     end
 
     test "an owner that stopped :normal (its page went) fails callers with :noproc", %{
@@ -524,6 +614,38 @@ defmodule CDPEx.BrowserTest do
       assert_received {:sent, "Fetch.enable", %{"handleAuthRequests" => true}}
       refute_received {:sent, "Fetch.enable", _}
       assert map_size(new_state.fetchers) == 1
+      Connection.close(conn)
+    end
+
+    test "block: makes the page bypass service workers, with the Network domain on" do
+      {state, conn} = fake_browser_state()
+
+      assert {:reply, {:ok, _page}, _} =
+               new_page_in_task(state, transport: :session, block: ["Image"])
+
+      assert_received {:sent, "Network.enable", _}
+      assert_received {:sent, "Network.setBypassServiceWorker", %{"bypass" => true}}
+      Connection.close(conn)
+    end
+
+    test "a proxied page with block: bypasses service workers although Fetch is not re-enabled" do
+      {state, conn} = fake_browser_state()
+      state = %{state | proxy_auth: fn -> {"u", "p"} end}
+
+      assert {:reply, {:ok, _page}, _} =
+               new_page_in_task(state, transport: :dedicated, block: ["Image"])
+
+      assert_received {:sent, "Network.setBypassServiceWorker", %{"bypass" => true}}
+      Connection.close(conn)
+    end
+
+    test "a proxied page without block: leaves service workers alone" do
+      {state, conn} = fake_browser_state()
+      state = %{state | proxy_auth: fn -> {"u", "p"} end}
+      assert {:reply, {:ok, _page}, _} = new_page_in_task(state, transport: :dedicated)
+
+      assert_received {:sent, "Fetch.enable", _}
+      refute_received {:sent, "Network.setBypassServiceWorker", _}
       Connection.close(conn)
     end
 

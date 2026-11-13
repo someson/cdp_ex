@@ -113,8 +113,12 @@ defmodule CDPEx.Telemetry do
     * metadata — `%{reason, context}`:
       * `:chrome_exited` — `reason` is the integer OS exit status
       * `:browser_connection_down` — `reason` is the connection's exit reason
-      * `:ws_closed` — `reason` is the WebSocket close reason (e.g. `:closed`, or a
-        `{code, binary}` peer close)
+      * `:ws_closed` — `reason` is why a connection to Chrome closed:
+        `{:peer_closed, code, reason}` (Chrome sent a close frame), a
+        `%Mint.TransportError{}` (the socket dropped, e.g. `reason: :closed`),
+        `{:ws_decode, _}` (a frame that did not decode), `{:ws_send, _}` or
+        `{:ws_encode, _}` (a write failed), and on a `pipe: true` browser
+        `{:chrome_exited, status}` or `:closed` (Chrome's pipe ended)
 
   > #### One fault can emit several events {: .info}
   >

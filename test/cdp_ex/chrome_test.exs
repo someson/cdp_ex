@@ -125,6 +125,21 @@ defmodule CDPEx.ChromeTest do
     end
   end
 
+  describe "validate_opts!/2 :launch_timeout" do
+    test "accepts up to the longest wait the VM supports" do
+      assert :ok = Chrome.validate_opts!(launch_timeout: 0)
+      assert :ok = Chrome.validate_opts!(launch_timeout: 4_294_967_295)
+    end
+
+    test "rejects a negative value, a non-integer, or one past that" do
+      for bad <- [-1, 1.5, :infinity, 4_294_967_296, 5_000_000_000] do
+        assert_raise ArgumentError, ~r/invalid :launch_timeout/, fn ->
+          Chrome.validate_opts!(launch_timeout: bad)
+        end
+      end
+    end
+  end
+
   describe "validate_opts!/2 :block_background_hosts" do
     test "takes a boolean" do
       assert :ok = Chrome.validate_opts!(block_background_hosts: false)
@@ -297,6 +312,18 @@ defmodule CDPEx.ChromeTest do
       refute Enum.any?(dirs, &File.exists?/1)
     end
 
+    test "removes a dead pid's Chrome socket dir with its profile", %{tmp_dir: tmp} do
+      dead = dead_os_pid()
+      dir = owned_dir!(tmp, "cdp_ex-#{dead}-1", Chrome.owner_id())
+      socket_dir = mkdir!(tmp, "org.chromium.Chromium.XyZ789")
+      File.write!(Path.join(socket_dir, "SingletonSocket"), "")
+      File.ln_s!(Path.join(socket_dir, "SingletonSocket"), Path.join(dir, "SingletonSocket"))
+
+      assert Chrome.sweep_stale_profile_dirs(tmp) == :ok
+      refute File.exists?(dir)
+      refute File.exists?(socket_dir)
+    end
+
     test "keeps a dead pid's dir made on another host or in another pid namespace", %{
       tmp_dir: tmp
     } do
@@ -319,11 +346,28 @@ defmodule CDPEx.ChromeTest do
       refute File.exists?(dir)
     end
 
-    test "keeps the profile dirs of this VM", %{tmp_dir: tmp} do
-      dir = owned_dir!(tmp, "cdp_ex-#{System.pid()}-1", Chrome.owner_id())
+    test "keeps the profile dirs of this VM whose Chrome is unknown or alive", %{tmp_dir: tmp} do
+      # No Chrome recorded yet: a launch still setting up.
+      starting = owned_dir!(tmp, "cdp_ex-#{System.pid()}-1", Chrome.owner_id())
+
+      port = Port.open({:spawn_executable, "/bin/sleep"}, [:exit_status, args: ["30"]])
+      {:os_pid, live} = Port.info(port, :os_pid)
+      on_exit(fn -> System.cmd("kill", ["-9", to_string(live)]) end)
+      running = owned_dir!(tmp, "cdp_ex-#{System.pid()}-2", Chrome.owner_id())
+      File.write!(Path.join(running, ".cdp_ex_chrome"), to_string(live))
 
       assert Chrome.sweep_stale_profile_dirs(tmp) == :ok
-      assert File.dir?(dir)
+      assert File.dir?(starting)
+      assert File.dir?(running)
+    end
+
+    test "removes a profile dir of this VM whose Chrome is gone", %{tmp_dir: tmp} do
+      # A Browser killed outright: its Chrome died with it, terminate/2 never ran.
+      dir = owned_dir!(tmp, "cdp_ex-#{System.pid()}-3", Chrome.owner_id())
+      File.write!(Path.join(dir, ".cdp_ex_chrome"), to_string(dead_os_pid()))
+
+      assert Chrome.sweep_stale_profile_dirs(tmp) == :ok
+      refute File.exists?(dir)
     end
 
     test "keeps the profile dirs of another live OS process", %{tmp_dir: tmp} do
@@ -457,6 +501,69 @@ defmodule CDPEx.ChromeTest do
 
       :ok = Chrome.stop(handle)
       refute File.dir?(handle.user_data_dir)
+    end
+
+    # Like Chrome: a socket dir of its own, linked from the profile, and a ready
+    # DevToolsActivePort. `extra` adds a file to the socket dir.
+    defp socket_dir_stub!(tmp_dir, socket_dir, extra) do
+      write_stub!(tmp_dir, "stub-socket-dir", """
+      #!/bin/sh
+      dir=""
+      for arg in "$@"; do
+        case "$arg" in
+          --user-data-dir=*) dir="${arg#--user-data-dir=}" ;;
+        esac
+      done
+      sock="#{socket_dir}"
+      mkdir -p "$sock"
+      : > "$sock/SingletonSocket"
+      ln -s 1234 "$sock/SingletonCookie"
+      #{if extra, do: ~s(: > "$sock/#{extra}"), else: ""}
+      ln -s "$sock/SingletonSocket" "$dir/SingletonSocket"
+      printf '9222\\n/devtools/browser/0bad\\n' > "$dir/DevToolsActivePort"
+      exec sleep 30
+      """)
+    end
+
+    @tag :tmp_dir
+    test "stop/1 removes Chrome's singleton socket dir", %{tmp_dir: tmp_dir} do
+      socket_dir = Path.join(tmp_dir, "org.chromium.Chromium.AbC123")
+
+      for profile <- [nil, mkdir!(tmp_dir, "own-profile")] do
+        stub = socket_dir_stub!(tmp_dir, socket_dir, nil)
+        opts = if profile, do: [user_data_dir: profile], else: []
+        assert {:ok, handle} = Chrome.launch([chrome_binary: stub, launch_timeout: 5_000] ++ opts)
+        assert File.dir?(socket_dir)
+
+        :ok = Chrome.stop(handle)
+        refute File.exists?(socket_dir)
+      end
+    end
+
+    @tag :tmp_dir
+    test "stop/1 keeps a linked dir that holds anything else", %{tmp_dir: tmp_dir} do
+      socket_dir = Path.join(tmp_dir, "not-chromes")
+      stub = socket_dir_stub!(tmp_dir, socket_dir, "precious")
+      assert {:ok, handle} = Chrome.launch(chrome_binary: stub, launch_timeout: 5_000)
+
+      :ok = Chrome.stop(handle)
+      assert File.exists?(Path.join(socket_dir, "precious"))
+    end
+
+    @tag :tmp_dir
+    test "a DevTools line split inside the browser id is read whole", %{tmp_dir: tmp_dir} do
+      stub =
+        write_stub!(tmp_dir, "stub-split-line", """
+        #!/bin/sh
+        printf 'DevTools listening on ws://127.0.0.1:9333/devtools/browser/0bad' 1>&2
+        sleep 0.4
+        printf 'cafe\\n' 1>&2
+        exec sleep 30
+        """)
+
+      assert {:ok, handle} = Chrome.launch(chrome_binary: stub, launch_timeout: 5_000)
+      assert handle.debug_url == "ws://127.0.0.1:9333/devtools/browser/0badcafe"
+      :ok = Chrome.stop(handle)
     end
 
     @tag :tmp_dir

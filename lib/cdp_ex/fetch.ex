@@ -12,7 +12,9 @@ defmodule CDPEx.Fetch do
       interception owner's patterns to that owner, as the original event tuple;
     * **block** — fails Request-stage pauses of the blocked resource types with
       `Fetch.failRequest` (`BlockedByClient`). It needs no owner process, and it wins
-      over interception: a blocked type never reaches the interception owner.
+      over interception: a blocked type never reaches the interception owner. While
+      it is on, the page and its iframes bypass service workers, which would
+      otherwise answer the requests out of the page's reach.
 
   Every other paused request is let through with `Fetch.continueRequest`. With auth
   on, `Fetch.enable` pauses **every** request (Chrome raises `Fetch.authRequired` only
@@ -26,11 +28,11 @@ defmodule CDPEx.Fetch do
   `:session` page's session detaches, or on `stop/1`.
 
   Cross-site iframes run as their own Chrome targets. With any mode on, the owner turns
-  on `Target.setAutoAttach` (iframes and dedicated workers, paused on start) for the
+  on `Target.setAutoAttach` (iframes, dedicated workers and worklets, paused on start) for the
   page's session: each iframe that attaches, nested ones included, gets the page's
   `Fetch.enable` params on its own session and is then resumed, on every path. Block
   and auth answer there; interception covers the page's own frames only, so an
-  iframe's other pauses are continued. A worker is only resumed. With every mode off,
+  iframe's other pauses are continued. A worker or a worklet is only resumed. With every mode off,
   auto-attach is turned off again.
 
   The owner also carries the console of those iframes for `CDPEx.Page.observe_console/2`.
@@ -61,13 +63,15 @@ defmodule CDPEx.Fetch do
   @target_events ["Target.attachedToTarget", "Target.detachedFromTarget"]
   @console_events ["Runtime.consoleAPICalled", "Runtime.exceptionThrown"]
   @child_events @events ++ @target_events ++ @console_events
-  # Dedicated workers are attached too, only to be resumed: Chrome pauses a new worker
-  # on start even when the filter leaves it out, and then nothing would ever resume it.
+  # Dedicated workers and worklets are attached too, only to be resumed: Chrome pauses
+  # a new one on start even when the filter leaves it out, and then nothing would ever
+  # resume it (audioWorklet/paintWorklet addModule() would never settle).
+  @resume_only ["worker", "worklet", "shared_storage_worklet", "auction_worklet"]
   @auto_attach %{
     "autoAttach" => true,
     "waitForDebuggerOnStart" => true,
     "flatten" => true,
-    "filter" => [%{"type" => "iframe"}, %{"type" => "worker"}]
+    "filter" => [%{"type" => "iframe"} | Enum.map(@resume_only, &%{"type" => &1})]
   }
 
   defstruct [
@@ -86,6 +90,8 @@ defmodule CDPEx.Fetch do
     subscribed: false,
     # Target.setAutoAttach is on for the page's session.
     auto_attach: false,
+    # Network.setBypassServiceWorker is on for the page's session (while blocking).
+    bypass_sw: false,
     # Child sessions of attached cross-site iframes (session id => true).
     children: %{},
     # {session_id, requestId} => answers given, for the bad-credentials guard.
@@ -230,13 +236,15 @@ defmodule CDPEx.Fetch do
     {:noreply, drop_observer(state, ref)}
   end
 
-  # A dedicated worker of the page or of one of its iframes: resumed, nothing else.
+  # A dedicated worker or a worklet of the page or of one of its iframes: resumed,
+  # nothing else.
   def handle_info(
         {:cdp_event, conn, "Target.attachedToTarget",
-         %{"sessionId" => child, "targetInfo" => %{"type" => "worker"}} = params, parent},
+         %{"sessionId" => child, "targetInfo" => %{"type" => type}} = params, parent},
         %__MODULE__{conn: conn} = state
       )
-      when is_binary(child) and (parent == state.session_id or is_map_key(state.children, parent)) do
+      when is_binary(child) and type in @resume_only and
+             (parent == state.session_id or is_map_key(state.children, parent)) do
     _ = resume(state, child, params)
     {:noreply, state}
   end
@@ -428,7 +436,7 @@ defmodule CDPEx.Fetch do
   defp rearm(prev, next, timeout) do
     case {params_of(next), params_of(prev)} do
       {nil, _} -> disable(prev, next, timeout)
-      {same, same} -> {:ok, next}
+      {same, same} -> {:ok, sync_bypass(next, timeout)}
       {params, _} -> enable(prev, next, params, timeout)
     end
   end
@@ -441,6 +449,7 @@ defmodule CDPEx.Fetch do
   defp disable(_prev, next, timeout) do
     result = disable_all(next, timeout)
     next = if next.console == %{}, do: %{next | auto_attach: false}, else: next
+    next = sync_bypass(next, timeout)
 
     case result do
       {:ok, _} -> {:ok, next}
@@ -500,7 +509,7 @@ defmodule CDPEx.Fetch do
         case call(next, "Fetch.enable", params, timeout) do
           {:ok, _} ->
             Enum.each(Map.keys(next.children), &enable_child(next, &1, params))
-            {:ok, next}
+            {:ok, sync_bypass(next, timeout)}
 
           {:error, reason} ->
             arm_failed(reason, %{prev | subscribed: true, auto_attach: next.auto_attach})
@@ -510,6 +519,43 @@ defmodule CDPEx.Fetch do
         arm_failed(reason, prev)
     end
   end
+
+  # A service worker answers the page's requests from its own target, out of reach of
+  # the page's Fetch domain, so a blocked type fetched through it would get through.
+  # While blocking, the page's requests (and its iframes') skip service workers and go
+  # to the network, where Fetch fails them. Chrome applies the bypass only with the
+  # Network domain on; CDPEx.Page enables it lazily too and never disables it.
+  defp sync_bypass(%__MODULE__{block: block, bypass_sw: on} = state, _timeout)
+       when block != nil == on, do: state
+
+  defp sync_bypass(state, timeout) do
+    bypass = state.block != nil
+    Enum.each(Map.keys(state.children), &set_bypass(state, &1, bypass, timeout))
+
+    case set_bypass(state, state.session_id, bypass, timeout) do
+      :ok -> %{state | bypass_sw: bypass}
+      :error -> state
+    end
+  end
+
+  defp set_bypass(state, sid, bypass, timeout) do
+    with {:ok, _} <- maybe_enable_network(state, sid, bypass, timeout),
+         {:ok, _} <-
+           call_on(state, sid, "Network.setBypassServiceWorker", %{"bypass" => bypass}, timeout) do
+      :ok
+    else
+      {:error, reason} ->
+        if not benign?(reason),
+          do: Logger.warning("[CDPEx.Fetch] service worker bypass failed: #{inspect(reason)}")
+
+        :error
+    end
+  end
+
+  defp maybe_enable_network(state, sid, true, timeout),
+    do: call_on(state, sid, "Network.enable", %{}, timeout)
+
+  defp maybe_enable_network(_state, _sid, false, _timeout), do: {:ok, %{}}
 
   defp arm_failed(reason, state) do
     if not benign?(reason), do: Logger.warning("[CDPEx.Fetch] arming failed: #{inspect(reason)}")
@@ -568,6 +614,7 @@ defmodule CDPEx.Fetch do
       if is_map_key(state.children, child) and attaching?(state) do
         enable = params_of(state)
         _ = if enable, do: enable_child(state, child, enable)
+        _ = if state.block, do: set_bypass(state, child, true, @call_timeout)
         _ = if state.console != %{}, do: enable_runtime(state, child)
         _ = call_on(state, child, "Target.setAutoAttach", @auto_attach)
       end
@@ -627,6 +674,10 @@ defmodule CDPEx.Fetch do
 
   # ── pure helpers ────────────────────────────────────────────────────────────
 
+  # Only types the Fetch domain both accepts in a filter and reports on a pause. It
+  # rejects TextTrack, Manifest and Prefetch filters (a track is reported as Media, a
+  # manifest as Other), and reports fetch() and EventSource as XHR. What it reports
+  # as Fetch is a <link rel=prefetch>, hence :prefetch.
   @block_types %{
     image: "Image",
     font: "Font",
@@ -634,12 +685,8 @@ defmodule CDPEx.Fetch do
     stylesheet: "Stylesheet",
     script: "Script",
     xhr: "XHR",
-    fetch: "Fetch",
-    text_track: "TextTrack",
-    manifest: "Manifest",
-    prefetch: "Prefetch",
+    prefetch: "Fetch",
     ping: "Ping",
-    event_source: "EventSource",
     other: "Other"
   }
 

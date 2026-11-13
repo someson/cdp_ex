@@ -82,6 +82,16 @@ defmodule CDPEx.PageTest do
     }
   end
 
+  describe "enable_request_interception/2 patterns" do
+    test "a urlPattern that is not valid UTF-8 is {:invalid_args, _}" do
+      page = %Page{browser: self(), conn: self(), target_id: "T"}
+      patterns = [%{"urlPattern" => <<0xFF>>}]
+
+      assert {:error, {:invalid_args, {:patterns, ^patterns}}} =
+               Page.enable_request_interception(page, patterns: patterns)
+    end
+  end
+
   describe "keymap/1" do
     test "every supported key maps to its standard windows virtual key code" do
       # Guards against a transposed keyCode (e.g. ArrowUp/ArrowDown), which Chrome
@@ -2927,7 +2937,10 @@ defmodule CDPEx.PageTest do
       conn: conn,
       fake: fake
     } do
-      task = Task.async(fn -> Page.wait_for_network_idle(page, idle_time: 200, timeout: 5_000) end)
+      # A long idle_time, so R2 surely lands while the timer armed by R1 still runs.
+      task =
+        Task.async(fn -> Page.wait_for_network_idle(page, idle_time: 1_000, timeout: 5_000) end)
+
       enable_network_idle(fake, conn)
 
       # Request then complete → the idle timer arms (in-flight 0).
@@ -2937,7 +2950,7 @@ defmodule CDPEx.PageTest do
 
       # A new request before idle_time elapses must cancel the armed timer (busy again).
       send_network_event(fake, "Network.requestWillBeSent", "R2")
-      refute Task.yield(task, 300), "resolved despite a new request before idle_time"
+      refute Task.yield(task, 1_200), "resolved despite a new request before idle_time"
 
       # Complete it → rearm → resolve.
       send_network_event(fake, "Network.loadingFinished", "R2")

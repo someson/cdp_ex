@@ -45,6 +45,7 @@ defmodule CDPEx.Chrome do
       `15_000`). A *ceiling*, not a fixed wait: readiness is polled and returns
       as soon as Chrome is reachable, so a generous value is free. Raise it for
       slow cold-start hosts (e.g. headless Chrome in a constrained container).
+      At most `4_294_967_295`, the longest wait the VM supports.
 
   An invalid value for any of these raises `ArgumentError` in the caller (except the
   options a full `:args` list replaces, which are never read).
@@ -92,6 +93,9 @@ defmodule CDPEx.Chrome do
   alias CDPEx.Protocol
 
   @launch_timeout 15_000
+  # The longest `receive ... after` the VM accepts; a longer :launch_timeout would raise
+  # in the wait, with Chrome running and its profile dir left behind.
+  @max_timeout 4_294_967_295
 
   # On Unix, Chrome is started through this /bin/sh script rather than directly, so
   # it can't outlive the VM. `terminate/2` reaps Chrome on every exit path inside a
@@ -134,6 +138,9 @@ defmodule CDPEx.Chrome do
 
   # The file in a temp profile dir that names its creator (see owner_id/0).
   @owner_marker ".cdp_ex_owner"
+  # The OS pid of the Chrome launched on a temp profile, for the sweep of this VM's
+  # own dirs (see sweep_stale_profile_dirs/2).
+  @chrome_marker ".cdp_ex_chrome"
 
   # How often to poll the DevToolsActivePort file while waiting for readiness, so
   # a fast-ready Chrome returns promptly and @launch_timeout acts as a ceiling.
@@ -185,6 +192,22 @@ defmodule CDPEx.Chrome do
   end
 
   @doc false
+  # Every option launch/1 reads.
+  @spec option_keys() :: [atom()]
+  def option_keys,
+    do: [
+      :chrome_binary,
+      :user_data_dir,
+      :headless,
+      :window_size,
+      :extra_args,
+      :args,
+      :launch_timeout,
+      :pipe,
+      :block_background_hosts
+    ]
+
+  @doc false
   # `os_type` is `:os.type()`; a test passes another to check the Windows rules on Unix.
   @spec validate_opts!(keyword(), {atom(), atom()}) :: :ok
   def validate_opts!(opts, os_type \\ :os.type()) do
@@ -213,7 +236,10 @@ defmodule CDPEx.Chrome do
   defp valid_opt?(:pipe, value), do: value == false
   defp valid_opt?(:chrome_binary, value), do: value in [nil, false] or string?(value)
   defp valid_opt?(:user_data_dir, value), do: is_nil(value) or string?(value)
-  defp valid_opt?(:launch_timeout, value), do: is_integer(value) and value >= 0
+
+  defp valid_opt?(:launch_timeout, value),
+    do: is_integer(value) and value >= 0 and value <= @max_timeout
+
   defp valid_opt?(:extra_args, value), do: strings?(value)
   defp valid_opt?(:args, value), do: is_nil(value) or strings?(value)
 
@@ -231,7 +257,7 @@ defmodule CDPEx.Chrome do
   defp expected(key) when key in [:headless, :block_background_hosts], do: "a boolean"
   defp expected(:pipe), do: "a boolean; true needs /bin/sh, so not on Windows"
   defp expected(key) when key in [:chrome_binary, :user_data_dir], do: "a string"
-  defp expected(:launch_timeout), do: "a non-negative integer"
+  defp expected(:launch_timeout), do: "an integer from 0 to #{@max_timeout}"
   defp expected(key) when key in [:extra_args, :args], do: "a list of strings"
   defp expected(:window_size), do: "{width, height} as positive integers"
 
@@ -306,6 +332,8 @@ defmodule CDPEx.Chrome do
         _ -> nil
       end
 
+    _ = if owns? and os_pid, do: File.write(Path.join(user_data_dir, @chrome_marker), "#{os_pid}")
+
     ready =
       if pipe?,
         do: await_pipe(port, deadline(timeout)),
@@ -330,14 +358,16 @@ defmodule CDPEx.Chrome do
         kill(os_pid)
         close_port(port)
         await_exit(os_pid, deadline(@stop_exit_timeout))
+        remove_socket_dir(user_data_dir)
         if owns?, do: remove_dir(user_data_dir)
         {:error, reason}
     end
   end
 
   @doc """
-  Stops Chrome: kills the OS process, closes the port, and removes the temp
-  profile dir (only when `cdp_ex` created it). Idempotent and crash-safe — it is
+  Stops Chrome: kills the OS process, closes the port, and removes Chrome's
+  singleton socket dir from the temp dir and the temp profile dir (only when
+  `cdp_ex` created it). Idempotent and crash-safe — it is
   the cleanup run from `CDPEx.Browser`'s `terminate/2` callback.
   """
   @spec stop(handle()) :: :ok
@@ -350,6 +380,7 @@ defmodule CDPEx.Chrome do
     # and failed cleanup on Linux CI. Wait for the process to actually exit, then
     # remove the dir, retrying until it's gone (covers a child's final flush).
     await_exit(os_pid, deadline(@stop_exit_timeout))
+    remove_socket_dir(handle.user_data_dir)
     if Map.get(handle, :owns_data_dir, false), do: remove_dir(handle.user_data_dir)
     :ok
   end
@@ -653,9 +684,10 @@ defmodule CDPEx.Chrome do
   # `cdp_ex-<os_pid>-<n>` (see temp_profile_name/0), it is a real dir (not a
   # symlink), `kill -0` says no process `<os_pid>` exists, and its owner marker
   # (see owner_id/0) says it was made on this host in this pid namespace, where that
-  # `kill -0` means something. A live pid, this VM's own, a missing or foreign marker,
-  # or any doubt (`kill` missing, `EPERM`, Windows) keeps the dir. If the OS has reused
-  # a dead VM's pid, its dir is kept too: safe, but incomplete. `owner` is injectable
+  # `kill -0` means something. A live pid, a missing or foreign marker, or any doubt
+  # (`kill` missing, `EPERM`, Windows) keeps the dir. If the OS has reused a dead VM's
+  # pid, its dir is kept too: safe, but incomplete. A dir of this VM goes only once
+  # the Chrome recorded in it is gone (see remove_if_gone/4). `owner` is injectable
   # for tests.
   #
   # Best-effort: always returns `:ok`, so a dir that can't be listed or removed
@@ -668,9 +700,9 @@ defmodule CDPEx.Chrome do
         own = System.pid()
 
         names
-        |> Enum.flat_map(&stale_candidate(&1, own))
+        |> Enum.flat_map(&stale_candidate/1)
         |> Enum.group_by(fn {pid, _name} -> pid end, fn {_pid, name} -> name end)
-        |> Enum.each(fn {pid, pid_names} -> remove_if_gone(tmp, pid, pid_names, owner) end)
+        |> Enum.each(fn {pid, pid_names} -> remove_if_gone(tmp, {pid, own}, pid_names, owner) end)
       end
 
     :ok
@@ -678,16 +710,31 @@ defmodule CDPEx.Chrome do
     _ -> :ok
   end
 
-  defp stale_candidate(name, own) do
+  defp stale_candidate(name) do
     case Regex.run(~r/\Acdp_ex-([1-9][0-9]*)-[1-9][0-9]*\z/, name) do
-      [_, ^own] -> []
       [_, pid] -> [{pid, name}]
       nil -> []
     end
   end
 
-  defp remove_if_gone(tmp, pid, names, owner) do
+  # This VM's own dirs: a Browser killed outright (`Process.exit(browser, :kill)`, a
+  # supervisor's shutdown timeout) never ran terminate/2. Its Chrome died with its
+  # port, but its profile stays. Such a dir goes once the Chrome recorded in it is
+  # gone; one with no Chrome recorded yet is a launch still in progress and stays.
+  defp remove_if_gone(tmp, {own, own}, names, owner) do
+    for name <- names, chrome_gone?(Path.join(tmp, name)), do: remove_stale_dir(tmp, name, owner)
+    :ok
+  end
+
+  defp remove_if_gone(tmp, {pid, _own}, names, owner) do
     if os_pid_gone?(pid), do: Enum.each(names, &remove_stale_dir(tmp, &1, owner)), else: :ok
+  end
+
+  defp chrome_gone?(dir) do
+    case File.read(Path.join(dir, @chrome_marker)) do
+      {:ok, pid} -> Regex.match?(~r/\A[1-9][0-9]*\z/, pid) and os_pid_gone?(pid)
+      {:error, _} -> false
+    end
   end
 
   defp remove_stale_dir(tmp, name, owner) do
@@ -696,6 +743,7 @@ defmodule CDPEx.Chrome do
     _ =
       with {:ok, %File.Stat{type: :directory}} <- File.lstat(dir),
            {:ok, ^owner} <- File.read(Path.join(dir, @owner_marker)) do
+        remove_socket_dir(dir)
         File.rm_rf(dir)
       end
 
@@ -720,7 +768,8 @@ defmodule CDPEx.Chrome do
         {^port, {:data, data}} ->
           buffer = buffer <> data
 
-          case Regex.run(~r{(ws://[^\s]+/devtools/browser/[0-9a-fA-F-]+)}, buffer) do
+          # The trailing whitespace proves the id is whole: a read can end inside it.
+          case Regex.run(~r{(ws://[^\s]+/devtools/browser/[0-9a-fA-F-]+)\s}, buffer) do
             [_, url] -> {:ok, url}
             nil -> await_debug_url(port, dir, buffer, deadline)
           end
@@ -880,6 +929,25 @@ defmodule CDPEx.Chrome do
     end
   rescue
     _ -> false
+  end
+
+  # Chrome keeps its singleton socket in a dir of its own under the temp dir
+  # (`org.chromium.Chromium.XXXXXX`, `com.google.Chrome.XXXXXX`), linked from the
+  # profile's SingletonSocket, and removes it only on a clean exit, which a SIGKILL
+  # never is: one dir per launch would pile up. The linked dir goes only if it is a
+  # real dir holding nothing but Chrome's two singleton entries. Best-effort.
+  defp remove_socket_dir(profile) do
+    _ =
+      with {:ok, target} <- File.read_link(Path.join(profile, "SingletonSocket")),
+           :absolute <- Path.type(target),
+           dir = Path.dirname(target),
+           {:ok, %File.Stat{type: :directory}} <- File.lstat(dir),
+           {:ok, entries} <- File.ls(dir),
+           [] <- entries -- ["SingletonSocket", "SingletonCookie"] do
+        File.rm_rf(dir)
+      end
+
+    :ok
   end
 
   # Remove the profile dir, retrying until it's actually gone (a child process

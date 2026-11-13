@@ -20,13 +20,14 @@ if [ "$browser" = chrome ]; then
 fi
 
 image="cdp_ex-test:$browser"
-docker build "${platform[@]}" --build-arg BROWSER="$browser" -t "$image" "$root/test/docker"
+# ${a[@]+"${a[@]}"}: bash 3.2 (macOS) treats an empty array as unset under set -u.
+docker build ${platform[@]+"${platform[@]}"} --build-arg BROWSER="$browser" -t "$image" "$root/test/docker"
 
-docker run --rm "${platform[@]}" "${erl_flags[@]}" \
+docker run --rm ${platform[@]+"${platform[@]}"} ${erl_flags[@]+"${erl_flags[@]}"} \
   --shm-size=1g \
   --cpus "${CPUS:-0}" \
   --cap-add SYS_PTRACE \
-  -e RUNS -e TEST -e TRACE \
+  -e RUNS -e TEST -e ONLY -e TRACE \
   -v "$root:/app" \
   -v "cdp_ex-deps-$browser:/app/deps" \
   -v "cdp_ex-build-$browser:/app/_build" \

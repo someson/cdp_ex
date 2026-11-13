@@ -93,8 +93,8 @@ to Google instead of 14 in the first 20 seconds (Google Chrome 157, Linux). See
 ### Running on a server or in a container
 
 CDPEx is validated on macOS and on Linux: CI runs the integration suite against
-Chrome stable on Ubuntu 24.04, and `test/docker/` runs it on Ubuntu 26.04 against
-Chromium or Google Chrome. `--no-sandbox`, `--disable-dev-shm-usage` and
+Chrome stable on Ubuntu 24.04, and `test/docker/` repeats a launch test on Ubuntu
+26.04 against Chromium or Google Chrome, checking for leftovers. `--no-sandbox`, `--disable-dev-shm-usage` and
 `--disable-setuid-sandbox` are on by default, so headless Chrome starts out of the
 box on a constrained host (e.g. 2 vCPU / 2 GB).
 
@@ -154,8 +154,9 @@ mix ci                           # the full gate: format, deps audit, docs, cred
 Integration tests are tagged `:integration` and excluded by default; they launch a
 real Chrome and drive it against a local fixture HTTP server.
 
-- `test/docker/` runs them on Ubuntu 26.04 against Chromium or Google Chrome, and
-  reports any Chrome process or profile dir a run leaves behind.
+- `test/docker/` repeats one of them (a launch cut short by `:launch_timeout`, or
+  any you pick) on Ubuntu 26.04 against Chromium or Google Chrome, and reports any
+  Chrome process or profile dir a run leaves behind.
 - `bench/` compares CDPEx with Playwright on the same Chromium build (cold start,
   an SPA wait, 8 concurrent pages; time, memory and CPU). See `bench/README.md`.
 - Design notes live in `docs/design/`.

@@ -107,6 +107,68 @@ defmodule CDPEx.IntegrationTest do
     end
   end
 
+  describe "stop/1 against a Chrome that stopped reading" do
+    for transport <- [:dedicated, :session] do
+      test "returns promptly and reaps Chrome (#{transport})", %{fixture: fixture} do
+        {:ok, browser} = CDPEx.launch()
+        on_exit(fn -> stop_quietly(browser) end)
+        {:ok, page} = CDPEx.new_page(browser, transport: unquote(transport))
+        assert {:ok, _} = Page.navigate(page, fixture, wait_until: :load)
+        os_pid = :sys.get_state(browser).chrome.os_pid
+
+        # A frozen Chrome reads nothing, so a large write wedges the connection in its
+        # socket send.
+        {_, 0} = System.cmd("kill", ["-STOP", to_string(os_pid)])
+        big = "'" <> String.duplicate("x", 64 * 1024 * 1024) <> "'.length"
+        spawn(fn -> Page.evaluate(page, big, timeout: 60_000) end)
+        Process.sleep(1_000)
+
+        stopper = Task.async(fn -> CDPEx.stop(browser) end)
+
+        case Task.yield(stopper, 15_000) do
+          {:ok, :ok} ->
+            assert eventually(fn -> not os_alive?(os_pid) end)
+
+          nil ->
+            System.cmd("kill", ["-KILL", to_string(os_pid)])
+            flunk("stop/1 did not return within 15 s with Chrome frozen")
+        end
+      end
+    end
+  end
+
+  describe "a browser killed outright" do
+    test "leaves a profile dir that this VM's next launch removes" do
+      {:ok, browser} = CDPEx.launch()
+      Process.unlink(browser)
+      %{user_data_dir: dir, os_pid: os_pid} = :sys.get_state(browser).chrome
+
+      Process.exit(browser, :kill)
+      assert eventually(fn -> not os_alive?(os_pid) end)
+      assert File.dir?(dir)
+
+      {:ok, next} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(next) end)
+      refute File.exists?(dir)
+    end
+  end
+
+  describe "an explicit :owner" do
+    test "its death reaps the browser and Chrome, without a link to it" do
+      owner = spawn(fn -> Process.sleep(:infinity) end)
+      {:ok, browser} = CDPEx.launch(owner: owner)
+      Process.unlink(browser)
+      on_exit(fn -> stop_quietly(browser) end)
+      os_pid = :sys.get_state(browser).chrome.os_pid
+      ref = Process.monitor(browser)
+
+      Process.exit(owner, :kill)
+
+      assert_receive {:DOWN, ^ref, :process, ^browser, _reason}, 10_000
+      assert eventually(fn -> not os_alive?(os_pid) end)
+    end
+  end
+
   describe "browser lifecycle" do
     test "launch/1 returns a live pid and stop/1 shuts it down" do
       assert {:ok, browser} = CDPEx.launch()
@@ -958,6 +1020,140 @@ defmodule CDPEx.IntegrationTest do
       assert {:ok, 1234} = Page.evaluate(page, "window.scrollY")
     end
 
+    test "click/3 and hover/3 reach an off-screen element under CSS smooth scrolling", %{
+      page: page,
+      fixture: fixture
+    } do
+      {:ok, _} = Page.navigate(page, fixture <> "interact?smooth", wait_until: :load)
+      assert :ok = Page.hover(page, "#footer")
+      assert :ok = Page.scroll(page, :top)
+      assert :ok = Page.click(page, "#footer")
+      assert {:ok, [%{"id" => "footer", "trusted" => true}]} = Page.evaluate(page, "window.clicks")
+    end
+
+    test "click/3 scrolls a button clipped by a scrolling container into view", %{
+      page: page,
+      fixture: fixture
+    } do
+      {:ok, _} = Page.navigate(page, fixture, wait_until: :load)
+
+      {:ok, _} =
+        Page.evaluate(page, """
+        const box = Object.assign(document.createElement('div'), {style: 'height:100px;overflow:auto'});
+        box.innerHTML = '<div style="height:2000px"></div><button id="deep" ' +
+          'onclick="document.getElementById(\\'greeting\\').textContent = \\'deep\\'">Deep</button>';
+        document.body.prepend(box);
+        1
+        """)
+
+      assert :ok = Page.click(page, "#deep")
+      assert {:ok, "deep"} = Page.text(page, "#greeting")
+    end
+
+    test "a selector or text that is not valid UTF-8 is {:invalid_args, _}, not a raise", %{
+      page: page,
+      fixture: fixture
+    } do
+      {:ok, _} = Page.navigate(page, fixture, wait_until: :load)
+      bad = <<0xFF, 0xFE>>
+
+      calls = [
+        fn -> Page.wait_for_selector(page, bad, timeout: 2_000) end,
+        fn -> Page.text(page, bad) end,
+        fn -> Page.attribute(page, bad, "id") end,
+        fn -> Page.attribute(page, "#greeting", bad) end,
+        fn -> Page.visible?(page, bad) end,
+        fn -> Page.click(page, bad) end,
+        fn -> Page.click(page, bad, trusted: false) end,
+        fn -> Page.click_text(page, bad) end,
+        fn -> Page.hover(page, bad) end,
+        fn -> Page.type(page, bad, "x") end,
+        fn -> Page.type(page, "#name", bad) end,
+        fn -> Page.press(page, bad, "Enter") end,
+        fn -> Page.set_input_files(page, bad, []) end,
+        fn -> Page.frame(page, bad, timeout: 2_000) end
+      ]
+
+      for {call, i} <- Enum.with_index(calls) do
+        assert {^i, {:error, {:invalid_args, _}}} = {i, call.()}
+      end
+    end
+
+    test "navigate/3 to a same-document URL returns at once", %{page: page, fixture: fixture} do
+      assert {:ok, _} = Page.navigate(page, fixture, wait_until: :load)
+
+      for {opts, expected} <- [
+            {[], {:ok, page}},
+            {[wait_until: :load], {:ok, page}},
+            {[response: true], {:error, {:no_document_response, fixture <> "#b"}}}
+          ] do
+        url = if opts[:response], do: fixture <> "#b", else: fixture <> "#a"
+
+        {elapsed_us, result} =
+          :timer.tc(fn -> Page.navigate(page, url, [timeout: 10_000] ++ opts) end)
+
+        assert result == expected
+        assert elapsed_us < 2_000_000
+      end
+
+      assert {:ok, "#b"} = Page.evaluate(page, "location.hash")
+    end
+
+    test "wait_for_navigation/2 with :trigger waits for the navigation it starts", %{
+      page: page,
+      fixture: fixture
+    } do
+      assert {:ok, _} = Page.navigate(page, fixture, wait_until: :load)
+
+      assert :ok =
+               Page.wait_for_navigation(page,
+                 trigger: fn ->
+                   Page.evaluate(page, "setTimeout(() => location.href = '/?next', 1000); 1")
+                 end
+               )
+
+      assert {:ok, "?next"} = Page.evaluate(page, "location.search")
+    end
+
+    test "wait_for_navigation/2 returns the :trigger's error without waiting", %{page: page} do
+      assert {:error, :boom} =
+               Page.wait_for_navigation(page, trigger: fn -> {:error, :boom} end, timeout: 10_000)
+
+      assert_raise ArgumentError, ~r/invalid :trigger/, fn ->
+        Page.wait_for_navigation(page, trigger: :nope)
+      end
+    end
+
+    test "wait_for_network_idle/2 with :trigger counts the requests it starts", %{
+      page: page,
+      fixture: fixture
+    } do
+      assert {:ok, _} = Page.navigate(page, fixture, wait_until: :load)
+
+      trigger = fn ->
+        Page.evaluate(page, "fetch('/slow').then(r => r.text()).then(t => window.got = t); 1")
+      end
+
+      assert :ok = Page.wait_for_network_idle(page, trigger: trigger, timeout: 10_000)
+      assert {:ok, "slow-data"} = Page.evaluate(page, "window.got")
+
+      assert {:error, :boom} =
+               Page.wait_for_network_idle(page, trigger: fn -> {:error, :boom} end)
+    end
+
+    test "a float :timeout is an error for that call, not the end of the connection", %{
+      page: page,
+      fixture: fixture
+    } do
+      {:ok, _} = Page.navigate(page, fixture, wait_until: :load)
+
+      assert {:error, {:invalid_args, {:timeout, _}}} =
+               Page.wait_for_response(page, "x", timeout: 30.0, body: true)
+
+      assert {:error, {:invalid_args, {:timeout, 30.0}}} = Page.evaluate(page, "1", timeout: 30.0)
+      assert {:ok, 2} = Page.evaluate(page, "1 + 1")
+    end
+
     test "type/4 enters text into a field and fires input events", %{page: page, fixture: fixture} do
       {:ok, _} = Page.navigate(page, fixture)
       assert :ok = Page.type(page, "#name", "Ada")
@@ -1197,15 +1393,14 @@ defmodule CDPEx.IntegrationTest do
       {:ok, _} = Page.navigate(page, fixture)
       :ok = Page.wait_for_selector(page, "#fetch-btn")
 
-      # Idleness is measured from the call onward, so arm it (in a task) and let it
-      # subscribe BEFORE the click kicks off the fetch.
-      waiter =
-        Task.async(fn -> Page.wait_for_network_idle(page, idle_time: 300, timeout: 5_000) end)
+      # The click runs as the trigger, once the wait is watching.
+      assert :ok =
+               Page.wait_for_network_idle(page,
+                 idle_time: 300,
+                 timeout: 5_000,
+                 trigger: fn -> Page.click(page, "#fetch-btn") end
+               )
 
-      Process.sleep(200)
-      assert :ok = Page.click(page, "#fetch-btn")
-
-      assert :ok = Task.await(waiter, 10_000)
       # The fetch resolved during the idle wait — its handler writes the body into #greeting.
       assert {:ok, "fetched-data"} = Page.text(page, "#greeting")
     end
@@ -1214,13 +1409,12 @@ defmodule CDPEx.IntegrationTest do
       {:ok, _} = Page.navigate(page, fixture)
       :ok = Page.wait_for_selector(page, "#fetch-btn")
 
-      # Arm the waiter (it enables Network + registers) before triggering the fetch.
-      waiter = Task.async(fn -> Page.wait_for_response(page, "/data", timeout: 5_000) end)
-      Process.sleep(200)
-      assert :ok = Page.click(page, "#fetch-btn")
-
+      # The click runs as the trigger, once the wait is registered.
       assert {:ok, %{"requestId" => req, "response" => %{"status" => 200, "url" => url}}} =
-               Task.await(waiter, 10_000)
+               Page.wait_for_response(page, "/data",
+                 timeout: 5_000,
+                 trigger: fn -> Page.click(page, "#fetch-btn") end
+               )
 
       assert url =~ "/data"
       assert {:ok, "fetched-data"} = read_body_eventually(page, req)
@@ -1291,16 +1485,15 @@ defmodule CDPEx.IntegrationTest do
       {:ok, _} = Page.navigate(page, fixture)
       :ok = Page.wait_for_selector(page, "#redirect-fetch-btn")
 
-      waiter =
-        Task.async(fn -> Page.wait_for_network_idle(page, idle_time: 300, timeout: 5_000) end)
-
-      Process.sleep(200)
-      assert :ok = Page.click(page, "#redirect-fetch-btn")
-
       # The fetch hits /redirect (302 → /). The redirect hop must not leave a phantom
       # in-flight request, or this hangs to the timeout — regression guard for the
       # requestWillBeSent-per-hop overcount.
-      assert :ok = Task.await(waiter, 10_000)
+      assert :ok =
+               Page.wait_for_network_idle(page,
+                 idle_time: 300,
+                 timeout: 5_000,
+                 trigger: fn -> Page.click(page, "#redirect-fetch-btn") end
+               )
     end
 
     test "screenshot returns PNG bytes and can write a file", %{page: page, fixture: fixture} do
@@ -1697,6 +1890,71 @@ defmodule CDPEx.IntegrationTest do
     end
   end
 
+  describe "a crashed renderer" do
+    for transport <- [:dedicated, :session] do
+      test "fails the page's calls with :target_crashed until it is navigated (#{transport})", %{
+        fixture: fixture
+      } do
+        {:ok, browser} = CDPEx.launch()
+        on_exit(fn -> stop_quietly(browser) end)
+        {:ok, page} = CDPEx.new_page(browser, transport: unquote(transport))
+        assert {:ok, _} = Page.navigate(page, fixture, wait_until: :load)
+
+        hung =
+          Task.async(fn ->
+            Page.evaluate(page, "new Promise(() => {})", await_promise: true, timeout: 20_000)
+          end)
+
+        Process.sleep(200)
+
+        spawn(fn ->
+          Connection.call(page.conn, "Page.crash", %{}, 5_000, session_id: page.session_id)
+        end)
+
+        assert {:error, :target_crashed} = Task.await(hung, 5_000)
+
+        {elapsed_us, result} = :timer.tc(fn -> Page.evaluate(page, "1", timeout: 10_000) end)
+        assert result == {:error, :target_crashed}
+        assert elapsed_us < 1_000_000
+
+        assert {:ok, _} = Page.navigate(page, fixture, wait_until: :load)
+        assert {:ok, 2} = Page.evaluate(page, "1 + 1")
+      end
+
+      test "navigate/3 cut by a crash returns :target_crashed, not {:ok, page} at the timeout (#{transport})",
+           %{fixture: fixture} do
+        {:ok, browser} = CDPEx.launch()
+        on_exit(fn -> stop_quietly(browser) end)
+        {:ok, page} = CDPEx.new_page(browser, transport: unquote(transport))
+        assert {:ok, _} = Page.navigate(page, fixture, wait_until: :load)
+
+        for opts <- [[], [response: true]] do
+          nav =
+            Task.async(fn ->
+              :timer.tc(fn ->
+                Page.navigate(
+                  page,
+                  fixture <> "slow-load",
+                  [wait_until: :load, timeout: 12_000] ++ opts
+                )
+              end)
+            end)
+
+          Process.sleep(1_000)
+
+          spawn(fn ->
+            Connection.call(page.conn, "Page.crash", %{}, 5_000, session_id: page.session_id)
+          end)
+
+          {elapsed_us, result} = Task.await(nav, 15_000)
+          assert result == {:error, :target_crashed}
+          assert elapsed_us < 5_000_000
+          assert {:ok, _} = Page.navigate(page, fixture, wait_until: :load)
+        end
+      end
+    end
+  end
+
   describe "resource blocking" do
     defp assets_server do
       {:ok, %{url: url}} = FixtureServer.start(report: self())
@@ -1784,6 +2042,113 @@ defmodule CDPEx.IntegrationTest do
       assert :ok = Page.block_resources(page, [])
       {:ok, _} = Page.evaluate(page, "new Image().src = '/pixel.png?after'; 1")
       assert eventually(fn -> served("/pixel.png?after") end)
+    end
+
+    # One request per kind Chrome classifies differently, each to its own /p-* path.
+    # The comment on each line is the type Chrome reports for it.
+    @block_probe ~S"""
+    (() => {
+      const add = (parent, tag, attrs) => parent.appendChild(Object.assign(document.createElement(tag), attrs));
+      new Image().src = '/p-image';                                     // Image
+      new FontFace('P', 'url(/p-font)').load().catch(() => {});         // Font
+      new Audio('/p-media').load();                                     // Media
+      const video = add(document.body, 'video', {src: '/p-video'});     // Media
+      add(video, 'track', {default: true, kind: 'subtitles', src: '/p-track'}); // Media
+      add(document.head, 'link', {rel: 'stylesheet', href: '/p-css'});  // Stylesheet
+      add(document.head, 'script', {src: '/p-script'});                 // Script
+      const xhr = new XMLHttpRequest(); xhr.open('GET', '/p-xhr'); xhr.send(); // XHR
+      fetch('/p-fetch').catch(() => {});                                // XHR
+      new EventSource('/p-es');                                         // XHR
+      add(document.head, 'link', {rel: 'prefetch', href: '/p-prefetch'}); // Fetch
+      navigator.sendBeacon('/p-beacon', 'x');                           // Ping
+      add(document.head, 'link', {rel: 'manifest', href: '/p-manifest'}); // Other
+      new Worker('/p-worker');                                          // Other
+      return true;
+    })()
+    """
+
+    @block_probe_paths ~w(/p-image /p-font /p-media /p-video /p-track /p-css /p-script
+                          /p-xhr /p-fetch /p-es /p-prefetch /p-beacon /p-manifest /p-worker)
+
+    for {type, blocked} <- [
+          image: ~w(/p-image),
+          font: ~w(/p-font),
+          media: ~w(/p-media /p-video /p-track),
+          stylesheet: ~w(/p-css),
+          script: ~w(/p-script),
+          xhr: ~w(/p-xhr /p-fetch /p-es),
+          prefetch: ~w(/p-prefetch),
+          ping: ~w(/p-beacon),
+          other: ~w(/p-manifest /p-worker)
+        ] do
+      test "block: [#{inspect(type)}] fails exactly #{Enum.join(blocked, ", ")}" do
+        {:ok, %{url: url}} = FixtureServer.start(report: self())
+        {:ok, browser} = CDPEx.launch()
+        on_exit(fn -> stop_quietly(browser) end)
+
+        {:ok, page} = CDPEx.new_page(browser, block: [unquote(type)])
+        assert {:ok, _} = Page.navigate(page, url, wait_until: :load)
+        assert {:ok, true} = Page.evaluate(page, @block_probe)
+
+        blocked = unquote(blocked)
+        let_through = @block_probe_paths -- blocked
+        served = await_served(MapSet.new(), let_through, 5_000)
+
+        assert Enum.all?(let_through, &(&1 in served)),
+               "not served: #{inspect(let_through -- MapSet.to_list(served))}"
+
+        assert blocked -- MapSet.to_list(served) == blocked
+      end
+    end
+
+    for launch_opts <- [[], [pipe: true]] do
+      test "block holds on a page whose service worker forwards its requests (#{inspect(launch_opts)})" do
+        {:ok, %{url: url}} = FixtureServer.start(report: self())
+        {:ok, browser} = CDPEx.launch(unquote(launch_opts))
+        on_exit(fn -> stop_quietly(browser) end)
+
+        {:ok, page} = CDPEx.new_page(browser, block: [:image, :xhr])
+        assert {:ok, _} = Page.navigate(page, url <> "sw-page", wait_until: :load)
+        assert :ok = Page.wait_for_function(page, "navigator.serviceWorker.controller !== null")
+
+        {:ok, _} =
+          Page.evaluate(page, """
+          new Image().src = '/p-image';
+          fetch('/p-fetch').catch(() => {});
+          fetch('/data').catch(() => {});
+          document.head.appendChild(Object.assign(document.createElement('link'),
+            {rel: 'stylesheet', href: '/p-css'}));
+          1
+          """)
+
+        # The stylesheet is not blocked: once it is in, the probe has run.
+        served = await_served(MapSet.new(), ["/p-css"], 5_000)
+        assert "/p-css" in served
+        Process.sleep(500)
+        served = await_served(served, ["never"], 0)
+
+        refute "/p-image" in served
+        refute "/p-fetch" in served
+        refute "/data" in served
+      end
+    end
+
+    for launch_opts <- [[], [pipe: true]] do
+      test "worklets load on a page with block on (#{inspect(launch_opts)})" do
+        {:ok, %{url: url}} = FixtureServer.start()
+        {:ok, browser} = CDPEx.launch(unquote(launch_opts))
+        on_exit(fn -> stop_quietly(browser) end)
+
+        {:ok, page} = CDPEx.new_page(browser, block: [:image])
+        assert {:ok, _} = Page.navigate(page, url, wait_until: :load)
+
+        for js <- [
+              "new AudioContext().audioWorklet.addModule('/module.js').then(() => 'ok')",
+              "CSS.paintWorklet.addModule('/module.js').then(() => 'ok')"
+            ] do
+          assert {:ok, "ok"} = Page.evaluate(page, js, await_promise: true, timeout: 5_000)
+        end
+      end
     end
 
     test "Pool.with_page(pool, fun, block: [:image])" do
@@ -2279,6 +2644,23 @@ defmodule CDPEx.IntegrationTest do
 
         assert {:ok, [%{"id" => "subscribe-btn", "trusted" => true} | _]} =
                  Page.evaluate(inner, "window.clicks")
+      end
+    end
+
+    for {kind, launch_opts} <- [{"dedicated", []}, {"pipe", [pipe: true]}] do
+      test "a wait on a cross-site frame outlives its move back to the parent's site (#{kind})" do
+        {:ok, %{port: port}} = FixtureServer.start()
+        page = open_framed(unquote(launch_opts), frame_page(port, "a.test", "b.test", "/"))
+        {:ok, frame} = Page.frame(page, "iframe", wait: 5_000)
+        assert {:ok, "Hello"} = Page.text(frame, "#greeting")
+
+        back = "http://a.test:#{port}/interact"
+
+        {:ok, _} =
+          Page.evaluate(frame, "setTimeout(() => location.href = #{Jason.encode!(back)}, 500); 1")
+
+        assert :ok = Page.wait_for_selector(frame, "#footer", timeout: 10_000)
+        assert {:ok, ^back} = Page.evaluate(frame, "location.href")
       end
     end
 
@@ -2941,6 +3323,8 @@ defmodule CDPEx.IntegrationTest do
                end)
     end
 
+    # test/docker/leak_loop.sh runs this one by its tag.
+    @tag :leak_loop
     test "a real launch cut short by the capped launch_timeout" do
       {elapsed_us, result} =
         :timer.tc(fn -> CDPEx.with_page([], fn _ -> :ran end, deadline: 50) end)
@@ -3125,6 +3509,22 @@ defmodule CDPEx.IntegrationTest do
       assert_receive {:telemetry, [:cdp_ex, :page, :stop], _, %{transport: :dedicated}}, 5_000
 
       # A clean close is not a fault — no [:cdp_ex, :error].
+      refute_received {:telemetry, [:cdp_ex, :error], _, _}
+    end
+
+    test "closing an isolated dedicated page emits no error", %{fixture: fixture} do
+      attach_telemetry([[:cdp_ex, :page, :stop], [:cdp_ex, :error]])
+      {:ok, browser} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(browser) end)
+
+      for _ <- 1..5 do
+        {:ok, page} = CDPEx.new_page(browser, isolated: true)
+        {:ok, _} = Page.navigate(page, fixture, wait_until: :load)
+        :ok = CDPEx.close_page(browser, page)
+        assert_receive {:telemetry, [:cdp_ex, :page, :stop], _, %{isolated: true}}, 5_000
+      end
+
+      Process.sleep(500)
       refute_received {:telemetry, [:cdp_ex, :error], _, _}
     end
 
@@ -3525,6 +3925,20 @@ defmodule CDPEx.IntegrationTest do
 
   # Poll until `fun` is true or the deadline passes — for event-driven state (e.g.
   # a CDP event pruning a map) that settles asynchronously after the triggering call.
+  # Collects {:fixture_served, path} reports until every path in `wanted` is in, or
+  # `timeout` ms pass without one.
+  defp await_served(served, wanted, timeout) do
+    if Enum.all?(wanted, &MapSet.member?(served, &1)) do
+      served
+    else
+      receive do
+        {:fixture_served, path} -> await_served(MapSet.put(served, path), wanted, timeout)
+      after
+        timeout -> served
+      end
+    end
+  end
+
   defp eventually(fun, retries \\ 50) do
     cond do
       fun.() ->

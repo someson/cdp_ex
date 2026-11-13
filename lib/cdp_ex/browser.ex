@@ -39,6 +39,9 @@ defmodule CDPEx.Browser do
   require Logger
 
   @create_timeout 10_000
+  # The launch options CDPEx.Browser reads itself; the rest are CDPEx.Chrome's. :conn_opts
+  # is internal (CDPEx.connect/2 passes it, with :connect).
+  @browser_launch_keys [:proxy, :owner, :name, :connect, :conn_opts]
   @bootstrap_timeout 10_000
   # Ceiling for the synchronous Fetch arm (proxy auth and/or block) during new_page, shared
   # by every request it sends (see reply_armed_page).
@@ -53,6 +56,8 @@ defmodule CDPEx.Browser do
     :port,
     :opts,
     :parent,
+    # Monitor of an explicit `:owner` (see init/1), nil without one.
+    :owner_ref,
     :proxy_auth,
     # connect-mode (attached to a Chrome we didn't launch): drives the :session
     # default + the :dedicated rejection in new_page. Distinct from `chrome: nil`,
@@ -87,8 +92,9 @@ defmodule CDPEx.Browser do
   Starts a browser. See `CDPEx.Chrome` for launch options.
 
   Pass `:owner` (a pid) to set the process whose death triggers the browser's cleanup,
-  overriding the default (the calling process). `CDPEx.Pool` uses this when adopting a
-  browser it launched in a short-lived task.
+  overriding the default (the calling process). The browser monitors it, so it need not
+  be linked. `CDPEx.Pool` uses this when adopting a browser it launched in a
+  short-lived task.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -102,7 +108,16 @@ defmodule CDPEx.Browser do
   @doc false
   @spec validate_launch_opts!(keyword()) :: :ok
   def validate_launch_opts!(opts) when is_list(opts) do
-    if Keyword.get(opts, :connect), do: :ok, else: Chrome.validate_opts!(opts)
+    if Keyword.get(opts, :connect) do
+      :ok
+    else
+      # A misspelled key would be ignored, and the launch would go on without it (a
+      # proxy in a misspelled :extra_args, say).
+      case Keyword.keys(opts) -- (Chrome.option_keys() ++ @browser_launch_keys) do
+        [] -> Chrome.validate_opts!(opts)
+        [key | _] -> raise ArgumentError, "unknown launch option #{inspect(key)}"
+      end
+    end
   end
 
   def validate_launch_opts!(opts) do
@@ -248,7 +263,7 @@ defmodule CDPEx.Browser do
     call(
       browser,
       {:intercept, page, patterns, timeout},
-      timeout + 5_000,
+      with_margin(timeout),
       :enable_request_interception
     )
   end
@@ -258,7 +273,7 @@ defmodule CDPEx.Browser do
   @doc false
   @spec block(GenServer.server(), Page.t(), [String.t()], timeout()) :: :ok | {:error, term()}
   def block(browser, %Page{} = page, types, timeout),
-    do: call(browser, {:block, page, types, timeout}, timeout + 5_000, :block_resources)
+    do: call(browser, {:block, page, types, timeout}, with_margin(timeout), :block_resources)
 
   # Internal hops for `CDPEx.Page.observe_console/2` and `stop_observing_console/2`: the
   # page's `CDPEx.Fetch` owner auto-attaches its cross-site iframes and sends the calling
@@ -268,7 +283,12 @@ defmodule CDPEx.Browser do
   @spec observe_console(GenServer.server(), Page.t(), [String.t()], timeout()) ::
           :ok | {:error, term()}
   def observe_console(browser, %Page{} = page, methods, timeout) do
-    call(browser, {:observe_console, page, methods, timeout}, timeout + 5_000, :observe_console)
+    call(
+      browser,
+      {:observe_console, page, methods, timeout},
+      with_margin(timeout),
+      :observe_console
+    )
   end
 
   @doc false
@@ -284,7 +304,7 @@ defmodule CDPEx.Browser do
   @spec attach_frame(GenServer.server(), Page.t(), String.t(), timeout()) ::
           {:ok, pid(), String.t()} | {:error, term()}
   def attach_frame(browser, %Page{} = page, frame_id, timeout) do
-    call(browser, {:attach_frame, page, frame_id, timeout}, 2 * timeout + 5_000, :frame)
+    call(browser, {:attach_frame, page, frame_id, timeout}, with_margin(timeout, 2), :frame)
   end
 
   # Internal hop for `CDPEx.Page.wait_for_download/2`: the browser connection, which
@@ -303,7 +323,7 @@ defmodule CDPEx.Browser do
     call(
       browser,
       {:release_interception, page, timeout},
-      timeout + 5_000,
+      with_margin(timeout),
       :disable_request_interception
     )
   end
@@ -324,6 +344,11 @@ defmodule CDPEx.Browser do
   end
 
   # A Browser that is gone, or stops before replying, took its pages with it.
+  # The Browser request's own timeout: `steps` CDP calls of `timeout` each, plus 5s.
+  defp with_margin(timeout, steps \\ 1)
+  defp with_margin(:infinity, _steps), do: :infinity
+  defp with_margin(timeout, steps), do: steps * timeout + 5_000
+
   defp call(browser, request, timeout, op) do
     GenServer.call(browser, request, timeout)
   catch
@@ -345,7 +370,21 @@ defmodule CDPEx.Browser do
     # when adopting a browser launched in a throwaway task, so the owner-death self-reap
     # (the {:EXIT, parent, _} clause) still targets the real owner (the pool) rather than
     # the already-dead task — otherwise a hard-killed pool would orphan the browser.
+    #
+    # The link alone does not cover it: the owner is not linked to us until it links
+    # itself (the pool does so only on adoption, after the task unlinked), so its death
+    # in that window, or the death of an owner that never links, would reap nothing.
+    # A monitor does.
     {owner, launch_opts} = Keyword.pop(launch_opts, :owner)
+    owner_ref = if is_pid(owner), do: Process.monitor(owner)
+
+    case start(owner, launch_opts) do
+      {:ok, state} -> {:ok, %{state | owner_ref: owner_ref}}
+      other -> other
+    end
+  end
+
+  defp start(owner, launch_opts) do
     {connect_ws, launch_opts} = Keyword.pop(launch_opts, :connect)
     {conn_opts, launch_opts} = Keyword.pop(launch_opts, :conn_opts, [])
 
@@ -600,12 +639,14 @@ defmodule CDPEx.Browser do
   def handle_call({:close_page, %Page{target_id: tid, conn: conn}}, _from, state) do
     case Map.get(state.pages, tid) do
       ^conn ->
-        # Close the target on the browser connection first (a page connection can't
-        # cleanly close its own target), then stop the page connection — best-effort,
-        # since either may already be gone.
+        # Stop the page connection first, then close the target on the browser
+        # connection (a page connection can't cleanly close its own target) —
+        # best-effort, since either may already be gone. In the other order Chrome
+        # drops the page's socket under it (at once for an isolated page, whose context
+        # goes with it), which reads as a dropped connection and emits [:cdp_ex, :error].
         isolated = Map.has_key?(state.contexts, tid)
-        state = end_target(state, tid)
         safe_close(conn)
+        state = end_target(state, tid)
         Telemetry.page(:stop, %{target_id: tid, transport: :dedicated, isolated: isolated})
         {:reply, :ok, %{state | pages: Map.delete(state.pages, tid)}}
 
@@ -785,7 +826,7 @@ defmodule CDPEx.Browser do
   def handle_info({port, {:exit_status, status}}, %{chrome: %{port: port}} = state) do
     Logger.warning("[CDPEx.Browser] Chrome exited with status #{status}")
     Telemetry.error(status, :chrome_exited)
-    {:stop, {:chrome_exited, status}, state}
+    {:stop, {:chrome_exited, status}, forget_os_pid(state)}
   end
 
   # A pipe browser's connection owns Chrome's Port, so Chrome's exit status reaches
@@ -796,7 +837,7 @@ defmodule CDPEx.Browser do
       ) do
     Logger.warning("[CDPEx.Browser] Chrome exited with status #{status}")
     Telemetry.error(status, :chrome_exited)
-    {:stop, {:chrome_exited, status}, state}
+    {:stop, {:chrome_exited, status}, forget_os_pid(state)}
   end
 
   def handle_info({:EXIT, pid, reason}, %{browser_conn: pid} = state) do
@@ -808,6 +849,12 @@ defmodule CDPEx.Browser do
     # Our owner (supervisor or the process that called CDPEx.launch) died. Shut
     # down with the same reason so `terminate/2` reaps Chrome — otherwise a
     # supervisor `:shutdown` would leave an orphaned browser and OS process.
+    {:stop, reason, state}
+  end
+
+  # An explicit `:owner` died (see init/1); the same as its EXIT above.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{owner_ref: ref} = state)
+      when is_reference(ref) do
     {:stop, reason, state}
   end
 
@@ -924,9 +971,10 @@ defmodule CDPEx.Browser do
     %{state | pending: pending}
   end
 
-  # An owner that stops :normal does so because its page went away.
-  defp fetch_exit_reason(:normal), do: :noproc
-  defp fetch_exit_reason(reason), do: reason
+  # An owner that stops :normal does so because its page went away; one that crashed is
+  # gone just the same (its crash report says why), and the next request starts a fresh
+  # one. Either way the caller gets :noproc, not the raw exit term.
+  defp fetch_exit_reason(_reason), do: :noproc
 
   @impl true
   def terminate(_reason, state) do
@@ -944,11 +992,22 @@ defmodule CDPEx.Browser do
         end)
       end
 
+    # A launched Chrome goes first: a connection wedged in a write to a Chrome that
+    # stopped reading only returns once that Chrome is gone, so closing first could
+    # hang here forever with Chrome alive.
+    if state.chrome, do: Chrome.stop(state.chrome)
     Enum.each(state.pages, fn {_tid, conn} -> safe_close(conn) end)
     safe_close(state.browser_conn)
-    if state.chrome, do: Chrome.stop(state.chrome)
     :ok
   end
+
+  # Chrome exited and the OS reaped it, so its pid is free for another process by the
+  # time terminate/2 runs: Chrome.stop/1 must not `kill -9` it. It still closes the port
+  # and removes the dirs.
+  defp forget_os_pid(%{chrome: %{} = chrome} = state),
+    do: %{state | chrome: %{chrome | os_pid: nil}}
+
+  defp forget_os_pid(state), do: state
 
   # The browser connection went down. A clean close — `{:shutdown, {:ws_closed, _}}`,
   # the Connection's own graceful-stop contract when its socket drops (e.g. Chrome
@@ -1064,7 +1123,7 @@ defmodule CDPEx.Browser do
       {:fetch_reply, ^pid, ^tag, result} -> result
       {:EXIT, ^pid, reason} -> {:error, fetch_exit_reason(reason)}
     after
-      timeout -> {:error, :timeout}
+      timeout -> {:error, {:timeout, :new_page}}
     end
   end
 
