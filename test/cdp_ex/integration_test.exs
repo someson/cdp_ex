@@ -200,6 +200,46 @@ defmodule CDPEx.IntegrationTest do
              "Chrome (os pid #{os_pid}) outlived the VM that launched it"
     end
 
+    test "Chrome dies with a VM killed by SIGKILL, and the next launch removes its files" do
+      # The VM runs on until `kill -9`: no code of it runs after that, so only the
+      # watchdog kills Chrome, and only the next launch's sweep can remove the profile
+      # and the singleton socket dir it links to.
+      script = """
+      {:ok, _} = Application.ensure_all_started(:cdp_ex)
+      {:ok, browser} = CDPEx.launch()
+      {:ok, _page} = CDPEx.new_page(browser)
+      %{os_pid: os_pid, user_data_dir: dir} = :sys.get_state(browser).chrome
+      IO.puts("beam=\#{System.pid()} chrome=\#{os_pid} dir=\#{dir}")
+      Process.sleep(:infinity)
+      """
+
+      code_path = Enum.flat_map(:code.get_path(), &["-pa", to_string(&1)])
+
+      port =
+        Port.open({:spawn_executable, System.find_executable("elixir")}, [
+          :binary,
+          :exit_status,
+          :stderr_to_stdout,
+          args: code_path ++ ["-e", script]
+        ])
+
+      [_, beam, os_pid, dir] = await_line(port, ~r/beam=(\d+) chrome=(\d+) dir=(\S+)/, "")
+      on_exit(fn -> remove_orphaned_profile(dir) end)
+      {:ok, socket} = File.read_link(Path.join(dir, "SingletonSocket"))
+
+      {_, 0} = System.cmd("kill", ["-9", beam])
+      assert_receive {^port, {:exit_status, _}}, 10_000
+
+      assert eventually(fn -> not os_alive?(os_pid) end, 250),
+             "Chrome (os pid #{os_pid}) outlived the VM that launched it"
+
+      {:ok, browser} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(browser) end)
+
+      refute File.exists?(dir), "the profile of the killed VM was not swept"
+      refute File.exists?(Path.dirname(socket)), "its singleton socket dir was not swept"
+    end
+
     test "launch/1 returns well under the timeout ceiling (readiness is polled)" do
       {elapsed_us, {:ok, browser}} = :timer.tc(fn -> CDPEx.launch() end)
       on_exit(fn -> stop_quietly(browser) end)
@@ -3657,6 +3697,22 @@ defmodule CDPEx.IntegrationTest do
 
   defp os_alive?(os_pid) do
     match?({_, 0}, System.cmd("kill", ["-0", to_string(os_pid)], stderr_to_stdout: true))
+  end
+
+  # Reads a port's output until `regex` matches it; returns the match.
+  defp await_line(port, regex, acc) do
+    case Regex.run(regex, acc) do
+      nil ->
+        receive do
+          {^port, {:data, data}} -> await_line(port, regex, acc <> data)
+          {^port, {:exit_status, status}} -> flunk("the VM exited (#{status}): #{acc}")
+        after
+          30_000 -> flunk("no #{inspect(regex)} in: #{acc}")
+        end
+
+      match ->
+        match
+    end
   end
 
   # A profile left by a VM that halted: nothing there reaped it or Chrome's singleton
