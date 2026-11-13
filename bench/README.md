@@ -8,7 +8,12 @@ libraries (playwright_ex, ChromicPDF, Wallaby), see `compare/README.md`.
 ```bash
 bench/docker.sh                    # Linux container, 4 CPUs, Chromium: the reference setup
 CDP_EX_CHROME_BINARY=... bench/run.sh   # on the host, with the browser you point it at
+docker compose -f bench/docker-compose.yml run --rm bench   # docker.sh from a container
 ```
+
+The Compose service runs `docker.sh` from a container with the Docker CLI and
+the host's Docker socket, for a host that has Docker and nothing else; run it
+from the repository root. Variables pass through as for `docker.sh`.
 
 `docker.sh` builds the `test/docker` Chromium image, adds `playwright-core` on
 top, and runs `run.sh` in it. Both libraries then drive the same Chromium build
