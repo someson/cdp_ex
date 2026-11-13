@@ -2543,6 +2543,16 @@ defmodule CDPEx.IntegrationTest do
 
       {:ok, _} = Page.navigate(page, fixture <> "dialogs", wait_until: :load)
       assert :ok = Page.click(page, "#arm-unload")
+
+      # Chrome shows beforeunload only for a page with a handler and a user activation:
+      # fail here, not at the dialog, when the click gave it neither.
+      assert {:ok, %{"armed" => true, "active" => true}} =
+               Page.evaluate(
+                 page,
+                 "({armed: window.results.includes('armed=true'), " <>
+                   "active: navigator.userActivation.hasBeenActive})"
+               )
+
       assert {:ok, _} = Page.navigate(page, fixture, wait_until: :load)
       assert {:ok, "Hello"} = Page.text(page, "#greeting")
 
