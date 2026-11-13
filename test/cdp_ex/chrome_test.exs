@@ -72,8 +72,10 @@ defmodule CDPEx.ChromeTest do
       assert "--window-size=800,600" in Chrome.default_args("/tmp/p", window_size: {800, 600})
     end
 
-    test "ends with the about:blank initial target" do
-      assert List.last(Chrome.default_args("/tmp/p")) == "about:blank"
+    test "starts Chrome without a tab" do
+      args = Chrome.default_args("/tmp/p")
+      assert "--no-startup-window" in args
+      refute "about:blank" in args
     end
 
     test "disables the field-trial testing config" do
