@@ -74,18 +74,24 @@ machine.
 
 ## Reference run
 
-`bench/docker.sh` on `main` after #13, 2026-11-05: Apple Silicon host, Docker
-Desktop, 4 CPUs, Chrome for Testing 156.0.8078.4 (arm64), Elixir 1.20.5 / OTP 27,
-Node 22, 3 rounds.
+`bench/docker.sh` on 2026-11-13, after #53 with `--no-startup-window`: Apple
+Silicon host, Docker Desktop, 4 CPUs, Chrome for Testing 156.0.8078.4 (arm64),
+Elixir 1.20.5 / OTP 27, Node 22, 3 rounds.
 
 | Scenario | Library | p50 ms | p95 ms | jobs/s | peak PSS MB | peak procs | CPU s |
 |---|---|---|---|---|---|---|---|
-| cold | cdp_ex | 269 | 286 | – | 380 | 11 | 5.1 |
-| cold | playwright | 224 | 257 | – | 350 | 9 | 3.6 |
-| spa | cdp_ex | 69 | 74 | – | 396 | 11 | 2.9 |
-| spa | playwright | 132 | 143 | – | 373 | 9 | 5.7 |
-| concurrent | cdp_ex | – | – | 23.8 | 503 | 17 | 48.7 |
-| concurrent | playwright | – | – | 7.4 | 807 | 23 | 60.5 |
+| cold | cdp_ex | 192 | 218 | – | 332 | 9 | 2.9 |
+| cold | playwright | 227 | 265 | – | 347 | 9 | 3.9 |
+| spa | cdp_ex | 56 | 87 | – | 409 | 10 | 2.8 |
+| spa | playwright | 131 | 143 | – | 375 | 9 | 6.1 |
+| concurrent | cdp_ex | – | – | 30.3 | 478 | 16 | 52.0 |
+| concurrent | playwright | – | – | 6.9 | 799 | 23 | 60.9 |
 
 `concurrent` compares different page setups (see Scenarios): Playwright opens a
 context per page, CDPEx here doesn't.
+
+The same run on `main` before `--no-startup-window` (the start tab was an
+`about:blank` page), for cdp_ex: `cold` 222 / 237 ms, 355 MB, 10 processes,
+3.8 CPU s; `spa` 61 / 72 ms, 387 MB; `concurrent` 26.3 jobs/s, 468 MB. With 3
+rounds each, `cold` improved on every measure; `spa` and `concurrent` moved in
+both directions, so take them as unchanged until a longer run says otherwise.

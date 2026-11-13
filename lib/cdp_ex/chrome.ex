@@ -58,6 +58,8 @@ defmodule CDPEx.Chrome do
   config would otherwise turn on (the same default Puppeteer and Playwright use),
   and `--disable-component-extensions-with-background-pages`, so built-in
   extensions don't keep an extension process alive (Playwright's default too).
+  `--no-startup-window` starts Chrome without a tab: every page is one
+  `CDPEx.new_page/2` opened.
 
   They also turn off the browser's own background services, which otherwise call
   Google at startup and after a navigation, through the `:proxy` when one is set:
@@ -478,12 +480,16 @@ defmodule CDPEx.Chrome do
       "--disable-features=" <> Enum.join(@disabled_features, ","),
       "--window-size=#{width},#{height}",
       "--user-data-dir=#{user_data_dir}",
-      debugging_flag(Keyword.get(opts, :pipe, false))
+      debugging_flag(Keyword.get(opts, :pipe, false)),
+      # No start tab: every page is opened by new_page/2. An about:blank start tab kept
+      # a renderer nobody used: without it an idle browser had 5 processes instead of
+      # 8, about half the resident memory and launched in about half the time
+      # (Google Chrome 157, macOS; headless and headed, both transports).
+      "--no-startup-window"
     ]
 
     headless_flag(headless?) ++
-      base ++
-      background_hosts_flags(Keyword.get(opts, :block_background_hosts, true)) ++ ["about:blank"]
+      base ++ background_hosts_flags(Keyword.get(opts, :block_background_hosts, true))
   end
 
   # Bypassing the proxy makes Chrome resolve the hosts itself, and the resolver rule

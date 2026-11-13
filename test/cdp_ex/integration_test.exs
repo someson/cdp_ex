@@ -240,6 +240,28 @@ defmodule CDPEx.IntegrationTest do
       refute File.exists?(Path.dirname(socket)), "its singleton socket dir was not swept"
     end
 
+    for launch_opts <- [[], [pipe: true]] do
+      test "a launched browser has no page until new_page/2 (#{inspect(launch_opts)})" do
+        {:ok, browser} = CDPEx.launch(unquote(launch_opts))
+        on_exit(fn -> stop_quietly(browser) end)
+        %{browser_conn: conn} = :sys.get_state(browser)
+
+        pages = fn ->
+          {:ok, %{"targetInfos" => infos}} = Connection.call(conn, "Target.getTargets", %{})
+          Enum.count(infos, &(&1["type"] == "page"))
+        end
+
+        assert pages.() == 0
+        {:ok, page} = CDPEx.new_page(browser)
+        assert pages.() == 1
+
+        # Closing the only page leaves Chrome running, ready for the next one.
+        assert :ok = CDPEx.close_page(browser, page)
+        assert {:ok, _} = CDPEx.new_page(browser)
+        assert pages.() == 1
+      end
+    end
+
     test "launch/1 returns well under the timeout ceiling (readiness is polled)" do
       {elapsed_us, {:ok, browser}} = :timer.tc(fn -> CDPEx.launch() end)
       on_exit(fn -> stop_quietly(browser) end)
@@ -2543,6 +2565,16 @@ defmodule CDPEx.IntegrationTest do
 
       {:ok, _} = Page.navigate(page, fixture <> "dialogs", wait_until: :load)
       assert :ok = Page.click(page, "#arm-unload")
+
+      # Chrome shows beforeunload only for a page with a handler and a user activation:
+      # fail here, not at the dialog, when the click gave it neither.
+      assert {:ok, %{"armed" => true, "active" => true}} =
+               Page.evaluate(
+                 page,
+                 "({armed: window.results.includes('armed=true'), " <>
+                   "active: navigator.userActivation.hasBeenActive})"
+               )
+
       assert {:ok, _} = Page.navigate(page, fixture, wait_until: :load)
       assert {:ok, "Hello"} = Page.text(page, "#greeting")
 
