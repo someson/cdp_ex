@@ -1,0 +1,53 @@
+# Runs the benchmarks on any machine with Docker and nothing else installed.
+# From the repository root:
+#
+#   docker compose -f bench/docker-compose.yml run --rm compare   # CDPEx, playwright_ex, ChromicPDF, Wallaby
+#   docker compose -f bench/docker-compose.yml run --rm bench     # CDPEx and Playwright (Node)
+#   ROUNDS=1 PROBE=0 docker compose -f bench/docker-compose.yml run --rm compare
+#
+# Each service runs the same script as on the host (bench/compare/run.sh,
+# bench/docker.sh) from a container with the Docker CLI. The scripts start their
+# own containers, one per run, through the host's Docker socket, so that no two
+# libraries share a container. They bind-mount the repository by its host path,
+# so it is mounted here under the same path: run from the repository root.
+# Results land in bench/results/ on the host. The variables in `environment`
+# are passed through when set; see bench/README.md and bench/compare/README.md.
+name: cdp_ex-bench
+
+x-runner: &runner
+  build:
+    context: .
+    dockerfile_inline: |
+      FROM docker:29-cli
+      RUN apk add --no-cache bash coreutils
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    - ${PWD}:${PWD}
+  working_dir: ${PWD}
+  environment:
+    - ROUNDS
+    - CPUS
+    - ITERATIONS
+    - DURATION_S
+    - CONCURRENCY
+    - INTERVAL_MS
+    # bench/compare/run.sh
+    - LIBS
+    - TASKS
+    - PROBE
+    - PROBE_BROWSERS
+    - DELAY_MS
+    # bench/docker.sh
+    - SCENARIOS
+    - BROWSERS
+    - CDP_EX_LAUNCH_OPTS
+    - CDP_EX_PAGE_OPTS
+
+services:
+  compare:
+    <<: *runner
+    command: ["bench/compare/run.sh"]
+
+  bench:
+    <<: *runner
+    command: ["bench/docker.sh"]

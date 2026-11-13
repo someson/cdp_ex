@@ -12,6 +12,18 @@ ROUNDS=0 bench/compare/run.sh                         # probes only
 PROBE=0 ROUNDS=1 TASKS="screenshot:js" LIBS="cdp_ex wallaby" bench/compare/run.sh
 ```
 
+Only Docker is needed on the host. Without bash on it, or to keep the host
+clean, run the same script from a container through Compose, from the
+repository root, with the same variables:
+
+```bash
+docker compose -f bench/docker-compose.yml run --rm compare
+ROUNDS=1 PROBE=0 docker compose -f bench/docker-compose.yml run --rm compare
+```
+
+That container gets the host's Docker socket: the script starts its run
+containers next to it, not inside it, so the setup below is the same either way.
+
 Results land in `bench/results/compare-<timestamp>/` (ignored by git):
 `report.md` (both tables), `results.jsonl` (one line per run),
 `capabilities-<lib>.json`, `env.txt` (versions), and each run's stdout and stderr.

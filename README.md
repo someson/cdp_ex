@@ -157,8 +157,11 @@ real Chrome and drive it against a local fixture HTTP server.
 - `test/docker/` repeats one of them (a launch cut short by `:launch_timeout`, or
   any you pick) on Ubuntu 26.04 against Chromium or Google Chrome, and reports any
   Chrome process or profile dir a run leaves behind.
-- `bench/` compares CDPEx with Playwright on the same Chromium build (cold start,
-  an SPA wait, 8 concurrent pages; time, memory and CPU). See `bench/README.md`.
+- `bench/compare/` probes and times CDPEx, playwright_ex, ChromicPDF and Wallaby
+  on the same pages and Chromium; `bench/` compares CDPEx with Playwright (cold
+  start, an SPA wait, 8 concurrent pages; time, memory and CPU). Docker is all they
+  need: `docker compose -f bench/docker-compose.yml run --rm compare` (or `bench`).
+  See `bench/compare/README.md` and `bench/README.md`.
 - Design notes live in `docs/design/`.
 
 ## Acknowledgements
