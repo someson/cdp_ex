@@ -194,7 +194,7 @@ defmodule CDPEx.IntegrationTest do
       elixir = System.find_executable("elixir")
       {out, 1} = System.cmd(elixir, code_path ++ ["-e", script], stderr_to_stdout: true)
       [_, os_pid, dir] = Regex.run(~r/chrome=(\d+) dir=(\S+)/, out)
-      on_exit(fn -> File.rm_rf(dir) end)
+      on_exit(fn -> remove_orphaned_profile(dir) end)
 
       assert eventually(fn -> not os_alive?(os_pid) end, 250),
              "Chrome (os pid #{os_pid}) outlived the VM that launched it"
@@ -3659,6 +3659,15 @@ defmodule CDPEx.IntegrationTest do
     match?({_, 0}, System.cmd("kill", ["-0", to_string(os_pid)], stderr_to_stdout: true))
   end
 
+  # A profile left by a VM that halted: nothing there reaped it or Chrome's singleton
+  # socket dir it links to, and with the profile gone no later sweep finds that dir.
+  defp remove_orphaned_profile(dir) do
+    with {:ok, socket} <- File.read_link(Path.join(dir, "SingletonSocket")),
+         do: File.rm_rf(Path.dirname(socket))
+
+    File.rm_rf(dir)
+  end
+
   # The Browser holds its own detach subscription; count only the wait's.
   defp detach_watched?(page) do
     page.conn
@@ -3897,7 +3906,7 @@ defmodule CDPEx.IntegrationTest do
       elixir = System.find_executable("elixir")
       {out, 1} = System.cmd(elixir, code_path ++ ["-e", script], stderr_to_stdout: true)
       [_, os_pid, dir] = Regex.run(~r/chrome=(\d+) dir=(\S+)/, out)
-      on_exit(fn -> File.rm_rf(dir) end)
+      on_exit(fn -> remove_orphaned_profile(dir) end)
 
       assert eventually(fn -> not os_alive?(os_pid) end, 250),
              "Chrome (os pid #{os_pid}) outlived the VM that launched it"
