@@ -541,6 +541,13 @@ defmodule CDPEx.IntegrationTest do
       assert html =~ "CDPEx Fixture" or html =~ "greeting"
     end
 
+    test "evaluate/3 returns a string with a lone surrogate instead of timing out", %{page: page} do
+      # Chrome sends the lone surrogate as a `\ud83d` escape that strict JSON
+      # decoders reject; it must come back as U+FFFD, not as a lost reply.
+      assert {:ok, "ok �"} = Page.evaluate(page, ~S('ok \uD83D'), timeout: 5_000)
+      assert {:ok, "�"} = Page.evaluate(page, "'😀'.slice(0, 1)", timeout: 5_000)
+    end
+
     test "navigate/3 with wait_until: :load resolves (race-free) on a fast page", %{
       page: page,
       fixture: fixture

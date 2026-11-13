@@ -79,6 +79,30 @@ defmodule CDPEx.ProtocolTest do
       assert Protocol.classify({:pong, "p"}) == :ignore
     end
 
+    test "a lone UTF-16 surrogate escape becomes U+FFFD instead of dropping the reply" do
+      frame = {:text, ~S({"id":7,"result":{"result":{"type":"string","value":"ok \ud83d"}}})}
+
+      assert Protocol.classify(frame) ==
+               {:reply, 7, nil, {:ok, %{"result" => %{"type" => "string", "value" => "ok \uFFFD"}}}}
+    end
+
+    test "a lone low surrogate in an event becomes U+FFFD" do
+      frame = {:text, ~S({"method":"Runtime.consoleAPICalled","params":{"t":"\uDE00 x"}})}
+
+      assert Protocol.classify(frame) ==
+               {:event, "Runtime.consoleAPICalled", nil, %{"t" => "\uFFFD x"}}
+    end
+
+    test "a valid surrogate pair next to a lone one survives" do
+      frame = {:text, ~S({"method":"E","params":{"t":"\ud83d\ude00\ud83d\ud83d"}})}
+      assert Protocol.classify(frame) == {:event, "E", nil, %{"t" => "😀\uFFFD\uFFFD"}}
+    end
+
+    test "an escaped backslash before u is not read as a surrogate escape" do
+      frame = {:text, ~S({"method":"E","params":{"a":"\\ud83d","b":"\ud83d"}})}
+      assert Protocol.classify(frame) == {:event, "E", nil, %{"a" => ~S(\ud83d), "b" => "\uFFFD"}}
+    end
+
     test "malformed JSON is ignored, not raised" do
       assert Protocol.classify({:text, "{not json"}) == :ignore
     end
