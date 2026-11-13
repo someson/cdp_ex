@@ -241,24 +241,27 @@ defmodule CDPEx.IntegrationTest do
     end
 
     for launch_opts <- [[], [pipe: true]] do
-      test "a launched browser has no page until new_page/2 (#{inspect(launch_opts)})" do
+      test "a session cookie outlives the last page on the default context (#{inspect(launch_opts)})",
+           %{fixture: fixture} do
+        # With no tab of its own open, Chrome on Linux ends the default context's session
+        # when the last page closes, and its session cookies go: the about:blank start
+        # tab is what keeps it. It raced (about 1 in 3 per cycle), so check a few cycles.
         {:ok, browser} = CDPEx.launch(unquote(launch_opts))
         on_exit(fn -> stop_quietly(browser) end)
-        %{browser_conn: conn} = :sys.get_state(browser)
 
-        pages = fn ->
-          {:ok, %{"targetInfos" => infos}} = Connection.call(conn, "Target.getTargets", %{})
-          Enum.count(infos, &(&1["type"] == "page"))
+        for i <- 1..5 do
+          {:ok, page} = CDPEx.new_page(browser)
+          {:ok, _} = Page.navigate(page, fixture)
+          {:ok, _} = Page.evaluate(page, "document.cookie = 'job=#{i}'")
+          :ok = CDPEx.close_page(browser, page)
+
+          {:ok, page} = CDPEx.new_page(browser)
+          {:ok, _} = Page.navigate(page, fixture)
+          {:ok, cookies} = Page.cookies(page)
+          assert %{"value" => value} = Enum.find(cookies, &(&1["name"] == "job"))
+          assert value == "#{i}", "cycle #{i}: the session cookie was lost"
+          :ok = CDPEx.close_page(browser, page)
         end
-
-        assert pages.() == 0
-        {:ok, page} = CDPEx.new_page(browser)
-        assert pages.() == 1
-
-        # Closing the only page leaves Chrome running, ready for the next one.
-        assert :ok = CDPEx.close_page(browser, page)
-        assert {:ok, _} = CDPEx.new_page(browser)
-        assert pages.() == 1
       end
     end
 
