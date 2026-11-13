@@ -74,24 +74,23 @@ machine.
 
 ## Reference run
 
-`bench/docker.sh` on 2026-11-13, after #53 with `--no-startup-window`: Apple
-Silicon host, Docker Desktop, 4 CPUs, Chrome for Testing 156.0.8078.4 (arm64),
-Elixir 1.20.5 / OTP 27, Node 22, 3 rounds.
+`bench/docker.sh` on `main` after #53, 2026-11-13: Apple Silicon host, Docker
+Desktop, 4 CPUs, Chrome for Testing 156.0.8078.4 (arm64), Elixir 1.20.5 / OTP 27,
+Node 22, 3 rounds.
 
 | Scenario | Library | p50 ms | p95 ms | jobs/s | peak PSS MB | peak procs | CPU s |
 |---|---|---|---|---|---|---|---|
-| cold | cdp_ex | 192 | 218 | – | 332 | 9 | 2.9 |
-| cold | playwright | 227 | 265 | – | 347 | 9 | 3.9 |
-| spa | cdp_ex | 56 | 87 | – | 409 | 10 | 2.8 |
-| spa | playwright | 131 | 143 | – | 375 | 9 | 6.1 |
-| concurrent | cdp_ex | – | – | 30.3 | 478 | 16 | 52.0 |
-| concurrent | playwright | – | – | 6.9 | 799 | 23 | 60.9 |
+| cold | cdp_ex | 222 | 237 | – | 355 | 10 | 3.8 |
+| cold | playwright | 231 | 297 | – | 353 | 9 | 3.9 |
+| spa | cdp_ex | 61 | 72 | – | 387 | 11 | 2.5 |
+| spa | playwright | 131 | 140 | – | 373 | 9 | 5.6 |
+| concurrent | cdp_ex | – | – | 26.3 | 468 | 16 | 48.2 |
+| concurrent | playwright | – | – | 6.8 | 801 | 23 | 59.4 |
 
 `concurrent` compares different page setups (see Scenarios): Playwright opens a
 context per page, CDPEx here doesn't.
 
-The same run on `main` before `--no-startup-window` (the start tab was an
-`about:blank` page), for cdp_ex: `cold` 222 / 237 ms, 355 MB, 10 processes,
-3.8 CPU s; `spa` 61 / 72 ms, 387 MB; `concurrent` 26.3 jobs/s, 468 MB. With 3
-rounds each, `cold` improved on every measure; `spa` and `concurrent` moved in
-both directions, so take them as unchanged until a longer run says otherwise.
+Starting Chrome without its `about:blank` tab (`--no-startup-window`) made
+`cold` about 14% faster with one process less, but it was reverted: on Linux,
+closing the last page then ends the default context's session and drops its
+session cookies (see `CDPEx.Chrome`).

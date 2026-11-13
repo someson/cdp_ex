@@ -76,14 +76,12 @@ default. For reproducible setups, point it at a
 > start in many CI/container environments. If you run as root or drive untrusted
 > pages, re-enable it by overriding `:args` — see `CDPEx.Chrome`.
 
-The default flags are neutral (stability and headless), not scraping-tuned. Three
-of them are there for measured reasons: `--disable-field-trial-config` keeps
+The default flags are neutral (stability and headless), not scraping-tuned. Two of
+them are there for measured reasons: `--disable-field-trial-config` keeps
 Chromium and Chrome for Testing builds from switching on experimental features
 (about 30% less memory with 8 concurrent pages; a no-op on branded Google Chrome),
-`--disable-component-extensions-with-background-pages` saves one Chrome
-process per browser, and `--no-startup-window` starts Chrome without a tab, since
-every page is one `new_page/2` opens (one renderer process less per browser; a
-launch-to-stop cycle about 14% faster in `bench/`).
+and `--disable-component-extensions-with-background-pages` saves one Chrome
+process per browser.
 
 They also turn off Chrome's own background calls to Google (sync, metrics, network
 time, optimization hints, Safe Browsing real-time lookups, the search preconnect),
