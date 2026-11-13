@@ -971,6 +971,9 @@ defmodule CDPEx.PageTest do
         )
       end
 
+      # Our document asks for the next one (Chrome reports renderer-initiated navigations).
+      FakeCDP.send_text(fake, requested_navigation("F"))
+
       for name <- ["init", "load", "networkAlmostIdle"] do
         FakeCDP.send_text(
           fake,
@@ -979,6 +982,39 @@ defmodule CDPEx.PageTest do
       end
 
       assert {:ok, %Page{}} = Task.await(task, 2_000)
+    end
+
+    test "a document the page it left asked for is not a successor: the navigation failed", %{
+      page: page,
+      conn: conn,
+      fake: fake
+    } do
+      # The page being left asked for a navigation before ours committed; Chrome can
+      # commit that one right after ours. Its document replaces ours, but it is no
+      # redirect of ours, so its milestone must not end the wait as if ours loaded.
+      task = Task.async(fn -> Page.navigate(page, "http://example.test/", wait_until: :load) end)
+      wait_until_subscribed(conn, task.pid)
+
+      assert_receive {:fake_cdp_recv, ^fake, %{"id" => navid, "method" => "Page.navigate"}}, 2_000
+      FakeCDP.send_text(fake, ~s({"id":#{navid},"result":{"frameId":"F","loaderId":"L1"}}))
+      FakeCDP.send_text(fake, requested_navigation("F"))
+
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Page.lifecycleEvent","params":{"name":"init","loaderId":"L1","frameId":"F"}})
+      )
+
+      # A sub-frame's request is not our document's.
+      FakeCDP.send_text(fake, requested_navigation("CHILD"))
+
+      for name <- ["init", "load"] do
+        FakeCDP.send_text(
+          fake,
+          ~s({"method":"Page.lifecycleEvent","params":{"name":"#{name}","loaderId":"L2","frameId":"F"}})
+        )
+      end
+
+      assert {:error, {:navigate, "net::ERR_ABORTED"}} = Task.await(task, 2_000)
     end
 
     test "a predecessor's init + milestone before our document commits is still stale", %{
@@ -1518,6 +1554,8 @@ defmodule CDPEx.PageTest do
         ~s({"method":"Page.lifecycleEvent","params":{"name":"init","loaderId":"L1","frameId":"F"}})
       )
 
+      FakeCDP.send_text(fake, requested_navigation("F"))
+
       # The successor's document response precedes its init (headers, then commit).
       FakeCDP.send_text(
         fake,
@@ -1533,6 +1571,28 @@ defmodule CDPEx.PageTest do
 
       assert {:ok, %Page{}, %{status: 200, url: "http://example.test/start"}} =
                Task.await(task, 2_000)
+    end
+
+    test "a document the page it left asked for ends the capture with the navigation failed",
+         %{page: page, conn: conn, fake: fake} do
+      task = Task.async(fn -> Page.navigate(page, "http://example.test/start", response: true) end)
+
+      assert_receive {:fake_cdp_recv, ^fake, %{"id" => nid, "method" => "Network.enable"}}, 2_000
+      FakeCDP.send_text(fake, ~s({"id":#{nid},"result":{}}))
+
+      wait_until_any_subscribed(conn, "Page.frameRequestedNavigation")
+
+      assert_receive {:fake_cdp_recv, ^fake, %{"id" => navid, "method" => "Page.navigate"}}, 2_000
+      FakeCDP.send_text(fake, ~s({"id":#{navid},"result":{"frameId":"F","loaderId":"L1"}}))
+
+      for loader <- ["L1", "L2"] do
+        FakeCDP.send_text(
+          fake,
+          ~s({"method":"Page.lifecycleEvent","params":{"name":"init","loaderId":"#{loader}","frameId":"F"}})
+        )
+      end
+
+      assert {:error, {:navigate, "net::ERR_ABORTED"}} = Task.await(task, 2_000)
     end
 
     test "the default navigate/3 still returns a bare {:ok, page} (no response capture)", %{
@@ -3027,6 +3087,11 @@ defmodule CDPEx.PageTest do
 
   # Poll until `pid` is registered as a `method` subscriber on `conn`, so events sent
   # afterward are guaranteed to be delivered to it (no send/subscribe race).
+  # Chrome's notice that a frame's document asked for a navigation (a meta refresh here).
+  defp requested_navigation(frame_id) do
+    ~s({"method":"Page.frameRequestedNavigation","params":{"frameId":"#{frame_id}","reason":"metaTagRefresh","url":"http://example.test/next","disposition":"currentTab"}})
+  end
+
   defp wait_until_subscribed(conn, pid, method \\ "Page.lifecycleEvent", retries \\ 100) do
     cond do
       subscribed?(conn, pid, method) ->

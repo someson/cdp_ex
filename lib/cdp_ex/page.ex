@@ -95,6 +95,12 @@ defmodule CDPEx.Page do
   }
 
   @lifecycle_method "Page.lifecycleEvent"
+  # Chrome's notice that a frame's document asked for a navigation (a script, a meta
+  # refresh, a form): tells a successor document from one the page being left asked for.
+  @requested_navigation "Page.frameRequestedNavigation"
+  @navigation_events [@lifecycle_method, @requested_navigation]
+  # What Chrome reports for a navigation another one superseded.
+  @replaced_error "net::ERR_ABORTED"
   @target_detached "Target.detachedFromTarget"
   @target_crashed "Inspector.targetCrashed"
   @request_will_be_sent "Network.requestWillBeSent"
@@ -151,7 +157,11 @@ defmodule CDPEx.Page do
   replaces it before it settles, such as a `<meta http-equiv="refresh">` target — so a
   late lifecycle event from the page's previous document (e.g. the `about:blank` a
   fresh page starts on) can't end the wait early, and a client-side redirect doesn't
-  stall it until the deadline.
+  stall it until the deadline. Only a document that the navigated one asked for counts as
+  its replacement: when the page being left had already asked for a navigation of its
+  own (a script's `location.href`) and Chrome commits that one right after this one,
+  before the milestone, `navigate/3` returns `{:error, {:navigate, "net::ERR_ABORTED"}}`,
+  as for a navigation Chrome aborts for a newer one.
 
   ## Capturing the document response
 
@@ -440,7 +450,7 @@ defmodule CDPEx.Page do
   # url}} | {:error, reason}. No before/after drain is needed — the helper's mailbox starts
   # empty and dies with it.
   defp run_capture(page, url, milestone, deadline) do
-    methods = watched(page, [@target_crashed, @lifecycle_method, @response_received])
+    methods = watched(page, [@target_crashed, @response_received | @navigation_events])
 
     case subscribe_each(page.conn, methods, remaining(deadline), page.session_id) do
       :ok ->
@@ -468,6 +478,7 @@ defmodule CDPEx.Page do
           {:ok, nil} -> {:error, {:no_document_response, url}}
           {:ok, resp} -> {:ok, page, resp}
           {:down, reason} -> {:error, down_reason(reason)}
+          {:error, _} = error -> error
         end
 
       {:error, _} = error ->
@@ -507,8 +518,12 @@ defmodule CDPEx.Page do
       when not is_nil(milestone) ->
         case track_lifecycle(params, nav) do
           {:ours, _nav} when name == milestone -> {:ok, captured}
+          {:replaced, _nav} -> {:error, {:navigate, @replaced_error}}
           {_, nav} -> await_capture(page, milestone, ref, deadline, nav, captured)
         end
+
+      {:cdp_event, ^conn, @requested_navigation, params, ^sid} ->
+        await_capture(page, milestone, ref, deadline, track_request(params, nav), captured)
 
       {:cdp_event, ^conn, @target_detached, %{"sessionId" => ^sid}, _parent} ->
         {:down, {:session_closed, sid}}
@@ -567,9 +582,17 @@ defmodule CDPEx.Page do
   # result's (nil when absent — see own_loader?/3): the response capture correlates on
   # `loader` for the whole wait. `wait_loader` is the loader whose milestone ends the
   # wait; it starts as `loader` and track_lifecycle/2 re-pins it to a successor document.
-  # `committed` records that our own document has emitted a lifecycle event.
+  # `committed` records that our own document has emitted a lifecycle event, `requested`
+  # that the document waited on has since asked for a navigation of its frame.
   defp navigation(lid, fid),
-    do: %{loader: lid, frame: fid, wait_loader: lid, committed: false, exclude: nil}
+    do: %{
+      loader: lid,
+      frame: fid,
+      wait_loader: lid,
+      committed: false,
+      requested: false,
+      exclude: nil
+    }
 
   # Classify a lifecycle event against the pinned navigation. Chrome emits `init` for
   # every new document on a frame, and a document can only be replaced after it has
@@ -581,6 +604,12 @@ defmodule CDPEx.Page do
   # own_loader?/3) and stays stale. Puppeteer's LifecycleWatcher gets the same result
   # by accepting any loader other than the pre-navigation one; we don't track the
   # frame's loader before navigating, so we pin to the navigate result and re-pin.
+  #
+  # Only a document that our document asked for is its successor (track_request/2).
+  # The page being left can ask for a navigation (a script's `location.href`) before
+  # ours commits, and Chrome may still commit that one right after ours: such a
+  # document replaces ours before its milestone, so this navigation failed, as when
+  # Chrome aborts a navigation another one supersedes.
   defp track_lifecycle(params, nav) do
     cond do
       # The document that was loaded before a wait_for_navigation/2 :trigger ran.
@@ -591,12 +620,22 @@ defmodule CDPEx.Page do
         {:ours, %{nav | committed: true}}
 
       nav.committed and params["name"] == "init" and correlates?(params["frameId"], nav.frame) ->
-        {:successor, %{nav | wait_loader: params["loaderId"]}}
+        if nav.requested,
+          do: {:successor, %{nav | wait_loader: params["loaderId"], requested: false}},
+          else: {:replaced, nav}
 
       true ->
         {:stale, nav}
     end
   end
+
+  # A navigation request of our frame counts once the document waited on has
+  # committed: before that, the frame still shows the page being left.
+  defp track_request(params, %{committed: true} = nav) do
+    if correlates?(params["frameId"], nav.frame), do: %{nav | requested: true}, else: nav
+  end
+
+  defp track_request(_params, nav), do: nav
 
   # Does this lifecycle event belong to the document we are waiting on? A fresh page's
   # about:blank document emits networkAlmostIdle ~500ms after the target is created (its
@@ -649,12 +688,12 @@ defmodule CDPEx.Page do
   # (wait_for_navigation/2, where the caller — a click, say — triggered the navigation
   # out of band and no loaderId is available; it keeps the pre-existing name-only match).
   defp subscribe_then_await(page, name, deadline, trigger) do
-    case subscribe_each(page.conn, [@lifecycle_method], remaining(deadline), page.session_id) do
+    case subscribe_each(page.conn, @navigation_events, remaining(deadline), page.session_id) do
       {:error, reason} ->
         {:error, reason}
 
       :ok ->
-        drain_events(page.conn, @lifecycle_method)
+        Enum.each(@navigation_events, &drain_events(page.conn, &1))
         ref = Process.monitor(page.conn)
         watch = watch_target(page, deadline)
         await = &await_lifecycle(page, name, {ref, watch_tag(watch)}, deadline, &1)
@@ -670,8 +709,8 @@ defmodule CDPEx.Page do
         after
           stop_watch(watch)
           Process.demonitor(ref, [:flush])
-          :ok = unsubscribe_each(page.conn, [@lifecycle_method], page.session_id)
-          drain_events(page.conn, @lifecycle_method)
+          :ok = unsubscribe_each(page.conn, @navigation_events, page.session_id)
+          Enum.each(@navigation_events, &drain_events(page.conn, &1))
         end
     end
   end
@@ -805,8 +844,12 @@ defmodule CDPEx.Page do
       {:cdp_event, ^conn, @lifecycle_method, %{"name" => event} = params, ^sid} ->
         case track_lifecycle(params, nav) do
           {:ours, _nav} when event == name -> :reached
+          {:replaced, _nav} -> {:error, {:navigate, @replaced_error}}
           {_, nav} -> await_lifecycle(page, name, mons, deadline, nav)
         end
+
+      {:cdp_event, ^conn, @requested_navigation, params, ^sid} ->
+        await_lifecycle(page, name, mons, deadline, track_request(params, nav))
 
       {^tag, {:session_closed, _sid} = reason} ->
         {:down, reason}
@@ -814,7 +857,7 @@ defmodule CDPEx.Page do
       {^tag, :target_crashed} ->
         {:error, :target_crashed}
 
-      {:cdp_event, ^conn, @lifecycle_method, _params, _session_id} ->
+      {:cdp_event, ^conn, method, _params, _session_id} when method in @navigation_events ->
         await_lifecycle(page, name, mons, deadline, nav)
 
       {:DOWN, ^ref, :process, ^conn, reason} ->
