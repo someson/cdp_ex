@@ -3192,7 +3192,8 @@ defmodule CDPEx.Page do
 
   Interception covers the page's own frames. A cross-site iframe runs as its own
   target in Chrome: its requests are let through (blocked types are still blocked,
-  and a login is still answered there), not sent to you.
+  and a login is still answered there), not sent to you. A popup the page opens is a
+  page of its own, outside the interception.
 
   Works on `:dedicated` and `:session` pages. On a `:session` page the pauses carry
   its session id, so one process can intercept several pages of a browser and tell
@@ -3293,7 +3294,8 @@ defmodule CDPEx.Page do
   the network domain stays enabled on them. A page that relies on its service worker
   (offline caches, synthesized responses) behaves as on a first visit. A
   `SharedWorker` is not covered: Chrome runs it outside the page's targets, so its
-  requests are not blocked.
+  requests are not blocked. Neither is a popup the page opens (`window.open`, a
+  `target="_blank"` link): it is a page of its own.
 
   Unblocking doesn't reload what was already blocked, and navigating the page to the
   same document again may reuse Chrome's in-memory result for it without a request.
