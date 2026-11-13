@@ -1928,6 +1928,27 @@ defmodule CDPEx.IntegrationTest do
       assert {:error, {:navigate, _}} =
                Page.navigate(page, "http://proxied.test/", wait_until: :none)
     end
+
+    test "wrong proxy credentials are given once, then the proxy's 407 is the result" do
+      # The proxy rejects the password and challenges again: the library cancels the
+      # login instead of answering the same request again, so the navigation ends at
+      # once on the proxy's 407. This proxy's 407 has no body, so Chrome fails the
+      # navigation; squid's carries an error page, which then loads as the document
+      # (status 407 with `response: true`). An https:// CONNECT fails either way.
+      {:ok, %{port: proxy_port}} = ProxyAuthServer.start(username: "puser", password: "ppass")
+      {:ok, browser} = CDPEx.launch(proxy: "http://puser:wrong@127.0.0.1:#{proxy_port}")
+      on_exit(fn -> stop_quietly(browser) end)
+
+      {:ok, page} = CDPEx.new_page(browser)
+
+      {elapsed_us, result} =
+        :timer.tc(fn ->
+          Page.navigate(page, "http://proxied.test/", response: true, timeout: 10_000)
+        end)
+
+      assert result == {:error, {:navigate, "net::ERR_HTTP_RESPONSE_CODE_FAILURE"}}
+      assert elapsed_us < 5_000_000, "navigate took #{div(elapsed_us, 1000)}ms"
+    end
   end
 
   describe "a crashed renderer" do
