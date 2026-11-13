@@ -13,3 +13,61 @@ updates:
           - "*"
     commit-message:
       prefix: ci
+
+  # Hex dependencies. A week's cooldown: a release only days old is left to
+  # settle before it is proposed.
+  - package-ecosystem: mix
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      hex:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: chore
+
+  # The benchmark's npm locks (Playwright and the fixture's bundle).
+  - package-ecosystem: npm
+    directories:
+      - /bench
+      - /bench/compare/fixture/js
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      npm:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: chore
+
+  # Base images of the local test and benchmark containers.
+  - package-ecosystem: docker
+    directories:
+      - /test/docker
+      - /bench
+      - /bench/compare
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      docker:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: chore
+
+  # zizmor, the workflow auditor CI installs with pip.
+  - package-ecosystem: pip
+    directory: /.github/requirements
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci

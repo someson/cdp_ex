@@ -12,7 +12,13 @@ defmodule CDPEx.FetchTest do
     "autoAttach" => true,
     "waitForDebuggerOnStart" => true,
     "flatten" => true,
-    "filter" => [%{"type" => "iframe"}, %{"type" => "worker"}]
+    "filter" => [
+      %{"type" => "iframe"},
+      %{"type" => "worker"},
+      %{"type" => "worklet"},
+      %{"type" => "shared_storage_worklet"},
+      %{"type" => "auction_worklet"}
+    ]
   }
   @console ["Runtime.consoleAPICalled", "Runtime.exceptionThrown"]
 
@@ -132,12 +138,8 @@ defmodule CDPEx.FetchTest do
         stylesheet: "Stylesheet",
         script: "Script",
         xhr: "XHR",
-        fetch: "Fetch",
-        text_track: "TextTrack",
-        manifest: "Manifest",
-        prefetch: "Prefetch",
+        prefetch: "Fetch",
         ping: "Ping",
-        event_source: "EventSource",
         other: "Other"
       ]
 
@@ -155,6 +157,15 @@ defmodule CDPEx.FetchTest do
 
     test "documents, websockets, unknown atoms and non-lists are invalid" do
       for bad <- [[:document], [:websocket], [:nope], ["Image"], [:image, "Font"], :image, nil] do
+        assert Fetch.resource_types(bad) == {:error, {:invalid_args, {:block, bad}}}
+      end
+    end
+
+    test "types Chrome rejects or never reports are invalid" do
+      # Fetch.enable rejects TextTrack, Manifest and Prefetch filters; Chrome reports
+      # fetch() and EventSource as XHR, so :fetch and :event_source would block
+      # nothing they name.
+      for bad <- [[:text_track], [:manifest], [:fetch], [:event_source], [:image, :fetch]] do
         assert Fetch.resource_types(bad) == {:error, {:invalid_args, {:block, bad}}}
       end
     end
@@ -284,7 +295,7 @@ defmodule CDPEx.FetchTest do
 
   describe "the owner on FakeCDP" do
     setup do
-      {:ok, server} = FakeCDP.start()
+      {:ok, server} = start_fake()
       {:ok, conn} = Connection.start_link(server.url)
       assert_receive {:fake_cdp_connected, fake}, 2_000
 
@@ -570,6 +581,32 @@ defmodule CDPEx.FetchTest do
       assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
     end
 
+    test "block turns the service worker bypass on, block [] turns it off", %{
+      conn: conn,
+      fake: fake
+    } do
+      pid = start_owner(conn)
+      arm(pid, fake, {:block, ["Image"], 5_000})
+      assert_received {:fake_cdp_auto, "Network.enable", _, nil}
+      assert_received {:fake_cdp_auto, "Network.setBypassServiceWorker", %{"bypass" => true}, nil}
+
+      # A change of the blocked set leaves the bypass as it is.
+      arm(pid, fake, {:block, ["Image", "Font"], 5_000})
+      refute_received {:fake_cdp_auto, "Network.setBypassServiceWorker", _, _}
+
+      tag = make_ref()
+      Fetch.request(pid, tag, {:block, [], 5_000})
+      expect_call(fake, "Fetch.disable")
+      assert_receive {:fetch_reply, ^pid, ^tag, :ok}, 2_000
+      assert_received {:fake_cdp_auto, "Network.setBypassServiceWorker", %{"bypass" => false}, nil}
+    end
+
+    test "interception alone leaves service workers alone", %{conn: conn, fake: fake} do
+      pid = start_owner(conn)
+      arm(pid, fake, {:intercept, self(), [%{"urlPattern" => "*"}], 5_000})
+      refute_received {:fake_cdp_auto, _, _, _}
+    end
+
     test "with block and interception, a blocked type is failed, never forwarded", %{
       conn: conn,
       fake: fake
@@ -681,7 +718,7 @@ defmodule CDPEx.FetchTest do
 
   describe "cross-site iframes on FakeCDP" do
     setup do
-      {:ok, server} = FakeCDP.start()
+      {:ok, server} = start_fake()
       {:ok, conn} = Connection.start_link(server.url)
       assert_receive {:fake_cdp_connected, fake}, 2_000
 
@@ -718,6 +755,7 @@ defmodule CDPEx.FetchTest do
 
       attach(fake, "C1")
       assert expect_iframe_armed(fake, "C1") == Fetch.enable_params(nil, nil, ["Image"])
+      assert_received {:fake_cdp_auto, "Network.setBypassServiceWorker", %{"bypass" => true}, "C1"}
 
       pause_on(fake, "C1", "img", "https://b.test/x.png", "Image")
 
@@ -766,7 +804,7 @@ defmodule CDPEx.FetchTest do
       assert log =~ "iframe"
     end
 
-    test "a dedicated worker, of the page or of an iframe, is only resumed", %{
+    test "a dedicated worker or a worklet, of the page or of an iframe, is only resumed", %{
       conn: conn,
       fake: fake
     } do
@@ -775,8 +813,15 @@ defmodule CDPEx.FetchTest do
       attach(fake, "C1")
       expect_iframe_armed(fake, "C1")
 
-      for {worker, parent} <- [{"W1", nil}, {"W2", "C1"}] do
-        attach(fake, worker, parent, "worker")
+      for {worker, parent, type} <- [
+            {"W1", nil, "worker"},
+            {"W2", "C1", "worker"},
+            {"W3", nil, "worklet"},
+            {"W4", "C1", "worklet"},
+            {"W5", nil, "shared_storage_worklet"},
+            {"W6", nil, "auction_worklet"}
+          ] do
+        attach(fake, worker, parent, type)
 
         assert_receive {:fake_cdp_recv, ^fake, %{"id" => id, "sessionId" => ^worker} = frame},
                        2_000
@@ -895,7 +940,7 @@ defmodule CDPEx.FetchTest do
 
   describe "iframe console on FakeCDP" do
     setup do
-      {:ok, server} = FakeCDP.start()
+      {:ok, server} = start_fake()
       {:ok, conn} = Connection.start_link(server.url)
       assert_receive {:fake_cdp_connected, fake}, 2_000
 
@@ -1064,6 +1109,31 @@ defmodule CDPEx.FetchTest do
       retries == 0 -> false
       true -> Process.sleep(10) && eventually(fun, retries - 1)
     end
+  end
+
+  # The service worker bypass the owner sets alongside block (Network.enable, then
+  # Network.setBypassServiceWorker) is answered here, so the tests that do not look at
+  # it need not; each one still reaches the test as {:fake_cdp_auto, method, params,
+  # session_id}. Every other message is passed through.
+  @auto_answered ["Network.enable", "Network.setBypassServiceWorker"]
+
+  defp start_fake do
+    test = self()
+    FakeCDP.start(spawn_link(fn -> relay(test) end))
+  end
+
+  defp relay(test) do
+    receive do
+      {:fake_cdp_recv, fake, %{"id" => id, "method" => method} = frame}
+      when method in @auto_answered ->
+        answer(fake, id, :ok)
+        send(test, {:fake_cdp_auto, method, frame["params"] || %{}, frame["sessionId"]})
+
+      other ->
+        send(test, other)
+    end
+
+    relay(test)
   end
 
   defp start_owner(conn, session_id \\ nil) do

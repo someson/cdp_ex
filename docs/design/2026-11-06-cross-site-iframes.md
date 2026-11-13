@@ -48,8 +48,10 @@ On both transports (`:dedicated`, and `:session` over the browser socket):
 - Request interception inside iframes: the owner continues an iframe's pauses, and
   the docs say interception covers the page's own frames only (decided 2026-11-06,
   option 1 below; option 2 if someone needs it).
-- Workers and service workers (also targets): the filter attaches iframes only, so
-  workers are never paused.
+- Workers and service workers (also targets). Chrome pauses a new dedicated worker
+  or worklet on start whatever the auto-attach filter says, so the filter lists them
+  too and the owner only resumes them (#51 for workers, later worklets); service and
+  shared workers are not attached.
 - Same-site iframes: they share the page's renderer and are already covered.
 
 ## Design

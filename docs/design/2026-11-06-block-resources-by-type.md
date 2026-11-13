@@ -50,23 +50,26 @@ Two entry points, one mechanism:
   Returns `:ok` once the new `Fetch.enable` is in effect. `:timeout` option as on
   the other Fetch calls.
 
-`types` is a list of atoms mapped to CDP `Network.ResourceType`:
+`types` is a list of atoms mapped to the `Network.ResourceType` the `Fetch`
+domain reports on a pause (checked against Chrome 157):
 
-| Atom | CDP |
-|---|---|
-| `:image` | `Image` |
-| `:font` | `Font` |
-| `:media` | `Media` |
-| `:stylesheet` | `Stylesheet` |
-| `:script` | `Script` |
-| `:xhr` | `XHR` |
-| `:fetch` | `Fetch` |
-| `:text_track` | `TextTrack` |
-| `:manifest` | `Manifest` |
-| `:prefetch` | `Prefetch` |
-| `:ping` | `Ping` |
-| `:event_source` | `EventSource` |
-| `:other` | `Other` |
+| Atom | CDP | What Chrome reports with it |
+|---|---|---|
+| `:image` | `Image` | images |
+| `:font` | `Font` | fonts |
+| `:media` | `Media` | audio/video sources, `<track>` text tracks |
+| `:stylesheet` | `Stylesheet` | stylesheets |
+| `:script` | `Script` | page scripts |
+| `:xhr` | `XHR` | `XMLHttpRequest`, `fetch()`, `EventSource` |
+| `:prefetch` | `Fetch` | `<link rel=prefetch>` |
+| `:ping` | `Ping` | `navigator.sendBeacon()` |
+| `:other` | `Other` | manifests, worker scripts, `preload as=fetch` |
+
+The table holds only types that both pass `Fetch.enable` and appear on a pause.
+`Fetch.enable` rejects `TextTrack`, `Manifest` and `Prefetch` filters
+(`-32602 Unknown resource type in fetch filter`), and Chrome never reports
+`EventSource`, so `:text_track`, `:manifest`, `:event_source` and a `:fetch`
+named after the API (which would block only prefetches) are not accepted.
 
 `:document` is rejected as a `:block` value (documents still load normally):
 blocking it would fail the page's own navigation, and CDP gives iframes the same
@@ -80,6 +83,16 @@ Block mode has no owner process. Unlike interception, nobody has to answer the
 pauses, so there is nothing to brick if the caller dies; blocking lasts until it
 is changed or the page ends. Calling `block_resources/3` from any process is fine,
 and there is no `:already_blocking` error.
+
+Service workers. A worker that answers `fetch` events with `fetch(e.request)`
+makes the page's requests from its own target, which the page's `Fetch` domain
+never sees, so those requests got through. While block is on, the owner sends
+`Network.enable` and `Network.setBypassServiceWorker` (`bypass: true`) to the page
+and to every iframe it arms, and `bypass: false` once block goes off; Chrome
+ignores the bypass while the `Network` domain is off. `Network` stays enabled, as
+`CDPEx.Page` already leaves it after any cookie or header call. A `SharedWorker`
+stays out of reach: a page session's auto-attach does not attach it, only the
+browser's does, and its requests are not blocked.
 
 ### A third mode in `CDPEx.Fetch`
 

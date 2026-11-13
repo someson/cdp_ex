@@ -28,6 +28,7 @@ defmodule CDPExTest do
       {:ws_upgrade, :upgrade_timeout},
       :noproc,
       {:session_closed, "4C1F0E5A2B7D9E3F"},
+      :target_crashed,
       :timeout,
       {:timeout, "Page.navigate"},
       {:timeout, :await_event},
@@ -83,7 +84,8 @@ defmodule CDPExTest do
       {:invalid_screenshot_data, "not-base64"},
       :unknown_page,
       :already_authenticated,
-      :already_intercepting
+      :already_intercepting,
+      {:already_started, self()}
     ]
 
     # Outcome depends on a payload or timing classify_error/1 deliberately does not crack

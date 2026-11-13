@@ -55,13 +55,29 @@ defmodule CDPEx.FixtureServer do
 
     _ =
       case path do
-        "/download-partial" <> rest -> serve_partial_download(socket, rest)
-        "/download?" <> query -> :gen_tcp.send(socket, download_response(query))
-        _ -> :gen_tcp.send(socket, respond(request, json_version))
+        "/download-partial" <> rest ->
+          serve_partial_download(socket, rest)
+
+        "/download?" <> query ->
+          :gen_tcp.send(socket, download_response(query))
+
+        "/hang" ->
+          Process.sleep(15_000)
+
+        "/slow" ->
+          Process.sleep(2_000)
+          :gen_tcp.send(socket, HttpFixture.http_response("200 OK", "slow-data"))
+
+        _ ->
+          :gen_tcp.send(socket, script_response(path) || respond(request, json_version))
       end
 
     :gen_tcp.close(socket)
   end
+
+  defp script_response("/sw.js"), do: service_worker_response()
+  defp script_response("/module.js"), do: js_response("globalThis.loaded = true;")
+  defp script_response(_path), do: nil
 
   defp download_response(query) do
     params = URI.decode_query(query)
@@ -121,6 +137,12 @@ defmodule CDPEx.FixtureServer do
   #     (default report.csv); /download-page links to it (#download) and builds a blob
   #     download (#blob-download). /download-partial never completes (see
   #     serve_partial_download/2).
+  #   /sw.js      — a service worker that claims its clients at once and answers
+  #     every request with fetch(e.request), so the page's requests go through it;
+  #   /slow       — answers "slow-data" after 2 s.
+  #   /hang       — never answered (the socket closes after 15 s); /slow-load is a page
+  #     whose load event waits on it.
+  #     /sw-page registers it. /module.js is a JavaScript module (for worklets).
   #   anything else serves the page.
   defp respond(request, json_version) do
     path = request_path(request)
@@ -210,7 +232,37 @@ defmodule CDPEx.FixtureServer do
       ~s(<body><h1 id="greeting">Assets</h1><img src="/pixel.png"></body></html>)
   end
 
+  # An image that is never answered holds off the load event.
+  defp page_body("/slow-load", _request),
+    do: ~s(<!doctype html><html><body><h1 id="greeting">Slow</h1><img src="/hang"></body></html>)
+
+  defp page_body("/sw-page", _request) do
+    ~s[<!doctype html><html><body><h1 id="greeting">SW</h1><script>] <>
+      ~s[navigator.serviceWorker.register("/sw.js");] <>
+      ~s[</script></body></html>]
+  end
+
   defp page_body(_path, request), do: render(request)
+
+  defp service_worker_response do
+    js_response("""
+    self.addEventListener("install", () => self.skipWaiting());
+    self.addEventListener("activate", e => e.waitUntil(self.clients.claim()));
+    self.addEventListener("fetch", e => e.respondWith(fetch(e.request)));
+    """)
+  end
+
+  defp js_response(body) do
+    Enum.join(
+      [
+        "HTTP/1.1 200 OK",
+        "Content-Type: text/javascript",
+        "Content-Length: #{byte_size(body)}",
+        "Connection: close"
+      ],
+      "\r\n"
+    ) <> "\r\n\r\n" <> body
+  end
 
   @doc false
   # The bytes /download?size=N serves, so a test can compare a saved file against them.

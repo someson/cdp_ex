@@ -4,9 +4,8 @@ CDPEx emits [`:telemetry`](https://hexdocs.pm/telemetry) events and attaches no
 handlers; attach your own to record them (emitting with nothing attached is a no-op).
 Events: `[:cdp_ex, :launch, …]`, `[:cdp_ex, :connect, …]`, and
 `[:cdp_ex, :navigate, …]` spans, `[:cdp_ex, :page, :start | :stop]`, and
-`[:cdp_ex, :error]`. See `CDPEx.Telemetry`
-([`lib/cdp_ex/telemetry.ex`](../../lib/cdp_ex/telemetry.ex)) for the full taxonomy
-(measurements + metadata). The `[:cdp_ex, :page, …]` metadata carries `:transport`
+`[:cdp_ex, :error]`. See `CDPEx.Telemetry` for the full taxonomy (measurements +
+metadata). The `[:cdp_ex, :page, …]` metadata carries `:transport`
 and `:isolated`.
 
 ```elixir

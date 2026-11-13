@@ -12,6 +12,12 @@ defmodule CDPEx.Proxy do
   (e.g. `p@ss` → `p%40ss`); they are decoded back on parse. The keyword form takes
   credentials verbatim, so prefer it when a password contains reserved characters.
 
+  Parsing is strict, so a malformed value fails instead of becoming another proxy: a
+  URL with a path, query or fragment (an unencoded `/` in a password produces one) or
+  a non-numeric port, a `:server` carrying `user:pass@`, and a non-string
+  `:username`/`:password` all return `{:error, {:invalid_proxy, reason}}`. No error
+  term carries the credentials.
+
   See the `:proxy` option on `CDPEx.launch/1`.
   """
 
@@ -26,7 +32,14 @@ defmodule CDPEx.Proxy do
   """
   @spec parse(term()) :: {:ok, t()} | {:error, {:invalid_proxy, term()}}
   def parse(url) when is_binary(url), do: parse_url(url)
-  def parse(opts) when is_list(opts), do: parse_opts(Map.new(opts))
+
+  # Any other list may hold a URL with credentials, so it is not echoed.
+  def parse(opts) when is_list(opts) do
+    if Keyword.keyword?(opts),
+      do: parse_opts(Map.new(opts)),
+      else: {:error, {:invalid_proxy, {:unsupported, :list}}}
+  end
+
   def parse(%{} = opts), do: parse_opts(opts)
   def parse(other), do: {:error, {:invalid_proxy, {:unsupported, other}}}
 
@@ -46,10 +59,15 @@ defmodule CDPEx.Proxy do
 
   def credentials(_), do: nil
 
+  # Strict: a proxy URL is `scheme://[userinfo@]host[:port]` and nothing else. A path,
+  # query or fragment means the string was not what it looked like (an unencoded `/` in
+  # a password makes "http://user:pa/ss@host:8080" a URL for host "user"), and a lax
+  # parse would hand Chrome a different proxy without an error.
   defp parse_url(url) do
-    case URI.parse(url) do
-      %URI{scheme: scheme, host: host, port: port} = uri
-      when is_binary(scheme) and is_binary(host) and host != "" and is_integer(port) ->
+    case URI.new(url) do
+      {:ok, %URI{scheme: scheme, host: host, port: port, path: path} = uri}
+      when is_binary(scheme) and is_binary(host) and host != "" and is_integer(port) and
+             path in [nil, "", "/"] and is_nil(uri.query) and is_nil(uri.fragment) ->
         {user, pass} = split_userinfo(uri.userinfo)
 
         {:ok,
@@ -62,13 +80,24 @@ defmodule CDPEx.Proxy do
 
   defp parse_opts(%{server: server} = opts) when is_binary(server) and server != "" do
     server = if String.contains?(server, "://"), do: server, else: "#{scheme(opts)}://#{server}"
+    bad = for key <- [:username, :password], not credential?(opts[key]), do: key
 
-    {:ok,
-     %{
-       server: server,
-       username: blank_to_nil(opts[:username]),
-       password: blank_to_nil(opts[:password])
-     }}
+    cond do
+      # Chrome would get them on its command line, and no login would be armed.
+      String.contains?(server, "@") ->
+        {:error, {:invalid_proxy, :credentials_in_server}}
+
+      bad != [] ->
+        {:error, {:invalid_proxy, {:invalid_credentials, bad}}}
+
+      true ->
+        {:ok,
+         %{
+           server: server,
+           username: blank_to_nil(opts[:username]),
+           password: blank_to_nil(opts[:password])
+         }}
+    end
   end
 
   # Echo only the keys, never the values — opts may carry :password.
@@ -76,29 +105,47 @@ defmodule CDPEx.Proxy do
 
   defp scheme(opts), do: Map.get(opts, :scheme, "http")
 
-  # Strip any "user:pass@" userinfo so a credentialed proxy URL never lands in an error
-  # term (these surface from launch/1 and callers routinely log them).
-  defp redact(url) when is_binary(url), do: String.replace(url, ~r{//[^/@]*@}, "//***@")
+  defp credential?(value), do: is_nil(value) or is_binary(value)
+
+  # Mask everything up to the last "@" (keeping a leading scheme) so a credentialed
+  # proxy string never lands in an error term or a status (these surface from launch/1,
+  # and callers routinely log them), however malformed it is: with no scheme, or with an
+  # unencoded "@" in the password.
+  defp redact(url) when is_binary(url) do
+    case String.split(url, "@") do
+      [_no_userinfo] ->
+        url
+
+      parts ->
+        scheme =
+          case Regex.run(~r{\A[A-Za-z][A-Za-z0-9+.-]*://}, url) do
+            [scheme] -> scheme
+            nil -> ""
+          end
+
+        scheme <> "***@" <> List.last(parts)
+    end
+  end
 
   @doc false
   # A `:proxy` option value with its credentials masked, for crash reports and
-  # process status: the URL loses its userinfo, the keyword form its username and
-  # password. Anything else comes back unchanged.
+  # process status: the URL loses its userinfo, the keyword and map forms their username
+  # and password (and any userinfo in :server). Anything else comes back unchanged.
   @spec redact_option(term()) :: term()
   def redact_option(url) when is_binary(url), do: redact(url)
 
   def redact_option(opts) when is_list(opts) do
-    if Keyword.keyword?(opts) do
-      Enum.map(opts, fn
-        {key, value} when key in [:username, :password] and value != nil -> {key, "***"}
-        pair -> pair
-      end)
-    else
-      opts
-    end
+    if Keyword.keyword?(opts), do: Enum.map(opts, &redact_pair/1), else: opts
   end
 
+  def redact_option(%{} = opts), do: Map.new(opts, &redact_pair/1)
   def redact_option(other), do: other
+
+  defp redact_pair({key, value}) when key in [:username, :password] and value != nil,
+    do: {key, "***"}
+
+  defp redact_pair({:server, server}) when is_binary(server), do: {:server, redact(server)}
+  defp redact_pair(pair), do: pair
 
   # URI strips the brackets from an IPv6 literal (host: "::1"); re-wrap so the rebuilt
   # `host:port` stays unambiguous for Chrome (`[::1]:8080`, not `::1:8080`).

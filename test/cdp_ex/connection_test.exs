@@ -1,6 +1,8 @@
 defmodule CDPEx.ConnectionTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias CDPEx.Connection
   alias CDPEx.FakeCDP
 
@@ -84,6 +86,77 @@ defmodule CDPEx.ConnectionTest do
     assert_receive {:fake_cdp_recv, ^fake, %{"method" => "Hang.forever"}}, 2_000
     Connection.close(conn)
     assert {:error, {:ws_closed, _}} = Task.await(task)
+  end
+
+  test "a timeout that is not an integer or :infinity is {:invalid_args, _} and harms nothing",
+       %{conn: conn} do
+    for bad <- [30.0, 0.5, :never] do
+      assert {:error, {:invalid_args, {:timeout, ^bad}}} = Connection.call(conn, "X", %{}, bad)
+
+      assert {:error, {:invalid_args, {:timeout, ^bad}}} =
+               Connection.await_event(conn, fn _ -> true end, bad)
+
+      assert {:error, {:invalid_args, {:timeout, ^bad}}} =
+               Connection.await_event_async(conn, fn _ -> true end, bad)
+    end
+
+    # Straight to the server, past the client-side check: it must not crash on it.
+    assert {:error, {:timeout, "X"}} = GenServer.call(conn, {:cdp_call, "X", %{}, 30.0, nil})
+    assert Process.alive?(conn)
+  end
+
+  test "connects to an IPv6 literal endpoint" do
+    {:ok, server} = FakeCDP.start(self(), inet6: true)
+    assert server.url =~ "ws://[::1]:"
+    assert {:ok, conn} = Connection.start_link(server.url)
+    assert_receive {:fake_cdp_connected, _fake}, 2_000
+    Connection.close(conn)
+  end
+
+  test "an :infinity call's pending entry goes when its caller dies", %{conn: conn, fake: fake} do
+    caller = spawn(fn -> Connection.call(conn, "Never.answered", %{}, :infinity) end)
+    assert_receive {:fake_cdp_recv, ^fake, %{"method" => "Never.answered"}}, 2_000
+    assert map_size(:sys.get_state(conn).pending) == 1
+
+    Process.exit(caller, :kill)
+    eventually(fn -> :sys.get_state(conn).pending == %{} end)
+  end
+
+  test "a subscribe/4 that timed out does not land later", %{conn: conn} do
+    :ok = Connection.subscribe(conn, "Kept.event", 1_000, session_id: "S")
+    :ok = :sys.suspend(conn)
+
+    assert {:error, {:timeout, :subscribe}} =
+             Connection.subscribe(conn, "Late.event", 50, session_id: "S")
+
+    :ok = :sys.resume(conn)
+    state = :sys.get_state(conn)
+    assert Map.get(state.subscribers, "Late.event", %{}) == %{}
+    assert state.subscribers["Kept.event"] == %{self() => MapSet.new(["S"])}
+  end
+
+  test "a URL init can't parse is {:ws_connect, exception}, not a raw raise" do
+    Process.flag(:trap_exit, true)
+
+    assert {:error, {:ws_connect, %ArgumentError{}}} =
+             Connection.start_link("http://not-a-ws-url/")
+  end
+
+  test "close/2 kills a connection that does not stop within its timeout" do
+    # Stands in for a connection wedged in a socket write to a peer that stopped
+    # reading: a GenServer busy in a callback that never returns.
+    {:ok, wedged} = Agent.start(fn -> nil end)
+    Agent.cast(wedged, fn _ -> Process.sleep(:infinity) end)
+    ref = Process.monitor(wedged)
+
+    log =
+      capture_log(fn ->
+        {elapsed_us, :ok} = :timer.tc(fn -> Connection.close(wedged, 200) end)
+        assert elapsed_us < 2_000_000
+      end)
+
+    assert_receive {:DOWN, ^ref, :process, ^wedged, :killed}, 1_000
+    assert log =~ "did not stop"
   end
 
   test "demultiplexes concurrent callers, even when replies arrive out of order", %{
@@ -347,6 +420,97 @@ defmodule CDPEx.ConnectionTest do
 
     assert {:ok, %{"who" => "A"}} = Task.await(a)
     assert {:ok, %{"who" => "B"}} = Task.await(b)
+  end
+
+  describe "a crashed target" do
+    test "Inspector.targetCrashed fails that session's in-flight calls and waiters only", %{
+      conn: conn,
+      fake: fake
+    } do
+      gone =
+        Task.async(fn ->
+          Connection.call(conn, "Runtime.evaluate", %{}, 5_000, session_id: "S1")
+        end)
+
+      kept =
+        Task.async(fn ->
+          Connection.call(conn, "Runtime.evaluate", %{}, 5_000, session_id: "S2")
+        end)
+
+      ids =
+        for _ <- 1..2, into: %{} do
+          assert_receive {:fake_cdp_recv, ^fake, %{"id" => id, "sessionId" => sid}}, 2_000
+          {sid, id}
+        end
+
+      registered = waiter_count(conn)
+
+      waiter =
+        Task.async(fn ->
+          Connection.await_event(conn, fn _ -> false end, 5_000, session_id: "S1")
+        end)
+
+      await_waiter(conn, registered)
+      FakeCDP.send_text(fake, ~s({"method":"Inspector.targetCrashed","sessionId":"S1","params":{}}))
+
+      assert {:error, :target_crashed} = Task.await(gone, 1_000)
+      assert {:error, :target_crashed} = Task.await(waiter, 1_000)
+
+      FakeCDP.send_text(fake, ~s({"id":#{ids["S2"]},"sessionId":"S2","result":{"who":"S2"}}))
+      assert {:ok, %{"who" => "S2"}} = Task.await(kept, 1_000)
+    end
+
+    test "a later call fails at once until a navigation, which goes through", %{
+      conn: conn,
+      fake: fake
+    } do
+      FakeCDP.send_text(fake, ~s({"method":"Inspector.targetCrashed","sessionId":"S1","params":{}}))
+      await_crashed(conn, "S1")
+
+      assert {:error, :target_crashed} =
+               Connection.call(conn, "Runtime.evaluate", %{}, 5_000, session_id: "S1")
+
+      refute_received {:fake_cdp_recv, ^fake, _}
+
+      nav =
+        Task.async(fn -> Connection.call(conn, "Page.navigate", %{}, 5_000, session_id: "S1") end)
+
+      assert_receive {:fake_cdp_recv, ^fake, %{"id" => id, "method" => "Page.navigate"}}, 2_000
+      FakeCDP.send_text(fake, ~s({"id":#{id},"sessionId":"S1","result":{}}))
+      assert {:ok, _} = Task.await(nav, 1_000)
+
+      call =
+        Task.async(fn ->
+          Connection.call(conn, "Runtime.evaluate", %{}, 5_000, session_id: "S1")
+        end)
+
+      assert_receive {:fake_cdp_recv, ^fake, %{"id" => id, "method" => "Runtime.evaluate"}}, 2_000
+      FakeCDP.send_text(fake, ~s({"id":#{id},"sessionId":"S1","result":{}}))
+      assert {:ok, _} = Task.await(call, 1_000)
+    end
+
+    test "on a page's own connection the crash carries no session id", %{conn: conn, fake: fake} do
+      task = Task.async(fn -> Connection.call(conn, "Runtime.evaluate", %{}, 5_000) end)
+      assert_receive {:fake_cdp_recv, ^fake, %{"method" => "Runtime.evaluate"}}, 2_000
+      FakeCDP.send_text(fake, ~s({"method":"Inspector.targetCrashed","params":{}}))
+      assert {:error, :target_crashed} = Task.await(task, 1_000)
+      assert {:error, :target_crashed} = Connection.call(conn, "DOM.getDocument", %{}, 5_000)
+    end
+
+    test "a session that detaches is forgotten as crashed", %{conn: conn, fake: fake} do
+      FakeCDP.send_text(fake, ~s({"method":"Inspector.targetCrashed","sessionId":"S1","params":{}}))
+      await_crashed(conn, "S1")
+
+      FakeCDP.send_text(
+        fake,
+        ~s({"method":"Target.detachedFromTarget","params":{"sessionId":"S1","targetId":"T1"}})
+      )
+
+      assert eventually(fn -> :sys.get_state(conn).crashed == %{} end)
+    end
+
+    defp await_crashed(conn, sid),
+      do: assert(eventually(fn -> is_map_key(:sys.get_state(conn).crashed, sid) end))
   end
 
   describe "a detached session" do

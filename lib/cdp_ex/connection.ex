@@ -31,11 +31,20 @@ defmodule CDPEx.Connection do
   alias Mint.HTTP
   alias Mint.WebSocket
 
+  require Logger
+
   @upgrade_timeout 15_000
   @default_call_timeout 10_000
   # crdtp's SESSION_NOT_FOUND dispatch code. Chrome returns it only for a sessionId it
   # doesn't know, so on a call that carried one it means that session has detached.
   @session_not_found -32_001
+
+  # What the connection's timers take: :infinity or an integer (a negative one fires at
+  # once).
+  defguardp is_timeout(timeout) when timeout == :infinity or is_integer(timeout)
+  @close_timeout 5_000
+  # The calls that bring a crashed renderer back (see handle_call/3).
+  @recovering_methods ["Page.navigate", "Page.reload"]
 
   defstruct [
     :conn,
@@ -66,6 +75,9 @@ defmodule CDPEx.Connection do
     # session_id => %{frame_id => execution context id} of each frame's main world, from
     # Runtime.executionContextCreated (see frame_context/4).
     contexts: %{},
+    # Sessions (nil for a dedicated page) whose renderer crashed and has not been
+    # navigated since (see fail_crashed_session/3).
+    crashed: %{},
     ws_send_error: nil
   ]
 
@@ -101,6 +113,7 @@ defmodule CDPEx.Connection do
           | {:ws_closed, term()}
           | :noproc
           | {:session_closed, String.t()}
+          | :target_crashed
           | {:invalid_args, term()}
 
   @doc """
@@ -110,7 +123,9 @@ defmodule CDPEx.Connection do
   error, `{:error, {:timeout, method}}`, or `{:error, {:ws_closed, reason}}` /
   `{:error, :noproc}` if the connection drops or is already gone. `params` that
   can't be encoded as JSON (e.g. a binary that isn't valid UTF-8) return
-  `{:error, {:invalid_args, reason}}`; the command is not sent. A `method` that isn't a
+  `{:error, {:invalid_args, reason}}`, and a `timeout` that is neither an integer nor
+  `:infinity` returns `{:error, {:invalid_args, {:timeout, timeout}}}`; the command is
+  not sent. A `method` that isn't a
   string or `params` that aren't a map raise `FunctionClauseError` in the caller.
 
   Pass `opts` with `session_id: sid` to address a flattened CDP session. A call on
@@ -119,10 +134,20 @@ defmodule CDPEx.Connection do
   in flight when the connection sees `Target.detachedFromTarget` for it fails
   then, and a later one fails on Chrome's "session not found" reply rather than
   waiting out `timeout`.
+
+  When Chrome reports `Inspector.targetCrashed` for a session (or, on a page's own
+  connection, for the page), its calls in flight and its `await_event/4` waiters
+  return `{:error, :target_crashed}`, and so does every later call on it except
+  `Page.navigate` and `Page.reload`, which bring up a new renderer and end the state.
   """
   @spec call(GenServer.server(), String.t(), map(), timeout(), keyword()) ::
           {:ok, map()} | {:error, call_error()}
   def call(conn, method, params \\ %{}, timeout \\ @default_call_timeout, opts \\ [])
+
+  # A timeout the connection's timers can't take is the caller's mistake: rejected here,
+  # in the caller, so it can't take down a connection other pages share.
+  def call(_conn, _method, _params, timeout, _opts) when not is_timeout(timeout),
+    do: {:error, {:invalid_args, {:timeout, timeout}}}
 
   # Guarded here, in the caller, because Protocol.encode/4 raising FunctionClauseError
   # inside the connection would crash it and surface to the caller as :noproc.
@@ -164,16 +189,27 @@ defmodule CDPEx.Connection do
   element is the parent's, usually `nil`, and `params["sessionId"]` is `sid`).
 
   Returns `{:error, :noproc}` if the connection is gone, or
-  `{:error, {:timeout, :subscribe}}` if it doesn't register within `timeout`.
+  `{:error, {:timeout, :subscribe}}` if it doesn't register within `timeout`; the
+  late registration is then undone (as is the same subscription made before), though
+  a few of its events may still arrive.
   """
   @spec subscribe(GenServer.server(), String.t() | :all, timeout(), keyword()) ::
           :ok | {:error, :noproc | {:timeout, :subscribe} | {:ws_closed, term()}}
   def subscribe(conn, method, timeout \\ @default_call_timeout, opts \\ []) do
     GenServer.call(conn, {:subscribe, method, Keyword.get(opts, :session_id), self()}, timeout)
   catch
-    :exit, {:timeout, {GenServer, :call, _}} -> {:error, {:timeout, :subscribe}}
-    :exit, {{:shutdown, {:ws_closed, reason}}, _} -> {:error, {:ws_closed, reason}}
-    :exit, {reason, {GenServer, :call, _}} when reason != :calling_self -> {:error, :noproc}
+    # The request is still in the connection's mailbox and would subscribe the caller
+    # once handled: a cast queued behind it undoes that, as cancel_await/2 does for a
+    # waiter. A few events can still land in between.
+    :exit, {:timeout, {GenServer, :call, _}} ->
+      GenServer.cast(conn, {:unsubscribe, method, {:only, Keyword.get(opts, :session_id)}, self()})
+      {:error, {:timeout, :subscribe}}
+
+    :exit, {{:shutdown, {:ws_closed, reason}}, _} ->
+      {:error, {:ws_closed, reason}}
+
+    :exit, {reason, {GenServer, :call, _}} when reason != :calling_self ->
+      {:error, :noproc}
   end
 
   @doc """
@@ -277,7 +313,12 @@ defmodule CDPEx.Connection do
              | {:ws_closed, term()}
              | {:session_closed, String.t()}}
   def await_event(conn, matcher, timeout \\ @default_call_timeout, opts \\ [])
-      when is_function(matcher, 1) do
+
+  def await_event(_conn, matcher, timeout, _opts)
+      when is_function(matcher, 1) and not is_timeout(timeout),
+      do: {:error, {:invalid_args, {:timeout, timeout}}}
+
+  def await_event(conn, matcher, timeout, opts) when is_function(matcher, 1) do
     session_id = Keyword.get(opts, :session_id)
     GenServer.call(conn, {:await_event, matcher, timeout, session_id}, call_deadline(timeout))
   catch
@@ -297,7 +338,13 @@ defmodule CDPEx.Connection do
   @doc false
   @spec await_event_async(GenServer.server(), (map() -> boolean()), timeout(), keyword()) ::
           {:ok, reference()} | {:error, :noproc | {:timeout, :await_event} | {:ws_closed, term()}}
-  def await_event_async(conn, matcher, timeout, opts \\ []) when is_function(matcher, 1) do
+  def await_event_async(conn, matcher, timeout, opts \\ [])
+
+  def await_event_async(_conn, matcher, timeout, _opts)
+      when is_function(matcher, 1) and not is_timeout(timeout),
+      do: {:error, {:invalid_args, {:timeout, timeout}}}
+
+  def await_event_async(conn, matcher, timeout, opts) when is_function(matcher, 1) do
     ref = :erlang.alias()
     session_id = Keyword.get(opts, :session_id)
 
@@ -340,11 +387,25 @@ defmodule CDPEx.Connection do
     end
   end
 
-  @doc "Closes the WebSocket and stops the connection. `:ok` if it is already gone."
-  @spec close(GenServer.server()) :: :ok
-  def close(conn) do
-    GenServer.stop(conn, :normal)
+  @doc """
+  Closes the WebSocket and stops the connection. `:ok` if it is already gone.
+
+  A connection that has not stopped within `timeout` ms (default 5_000) is killed:
+  one blocked in a write to a peer that stopped reading would otherwise never return.
+  """
+  @spec close(GenServer.server(), timeout()) :: :ok
+  def close(conn, timeout \\ @close_timeout) do
+    GenServer.stop(conn, :normal, timeout)
   catch
+    :exit, {:timeout, {GenServer, :stop, _}} ->
+      Logger.warning(
+        "[CDPEx.Connection] did not stop within #{timeout} ms (a write to a peer that " <>
+          "stopped reading?); killed"
+      )
+
+      _ = if pid = GenServer.whereis(conn), do: Process.exit(pid, :kill)
+      :ok
+
     :exit, {reason, {GenServer, :stop, _}} when reason != :calling_self ->
       Exits.warn_unclean_stop("CDPEx.Connection", reason)
   end
@@ -354,8 +415,8 @@ defmodule CDPEx.Connection do
   # Mint.WebSocket.new/4's success typing interacts badly with Dialyzer: it infers
   # the {:ok, conn, websocket} branch unreachable (claims new/4 only returns
   # {:error, ...}). That's a false positive — every connection test establishes a
-  # socket through this branch at runtime. Suppress just this one tiny callback.
-  @dialyzer {:nowarn_function, init: 1}
+  # socket through this branch at runtime. Suppress just the function that holds it.
+  @dialyzer {:nowarn_function, connect: 2}
 
   @impl true
   def init({{:pipe, port}, _opts}) when is_port(port) do
@@ -365,7 +426,16 @@ defmodule CDPEx.Connection do
     {:ok, %__MODULE__{port: port}}
   end
 
+  # A raise before the handshake (a URL that doesn't parse, a CA store that can't be
+  # read) would make start_link return `{exception, stacktrace}`: report it as the
+  # failed connect it is.
   def init({ws_url, opts}) do
+    connect(ws_url, opts)
+  rescue
+    exception -> stop_init({:ws_connect, exception})
+  end
+
+  defp connect(ws_url, opts) do
     {scheme, host, port, path} = Protocol.parse_ws_url(ws_url)
 
     # Before the handshake, not after: a connect that blocks in `recv_upgrade` is
@@ -424,10 +494,11 @@ defmodule CDPEx.Connection do
   # `:https`; everything else is plaintext `:http` to a local Chrome.
   defp transport_for("wss", host, opts) do
     tls = [{:server_name_indication, Protocol.sni(host)} | tls_opts(opts)]
-    {:https, :wss, [protocols: [:http1], transport_opts: tls]}
+    {:https, :wss, [protocols: [:http1], transport_opts: Protocol.family_opts(host) ++ tls]}
   end
 
-  defp transport_for(_ws, _host, _opts), do: {:http, :ws, [protocols: [:http1]]}
+  defp transport_for(_ws, host, _opts),
+    do: {:http, :ws, [protocols: [:http1], transport_opts: Protocol.family_opts(host)]}
 
   @doc false
   @spec tls_opts(keyword()) :: keyword()
@@ -463,8 +534,17 @@ defmodule CDPEx.Connection do
   def format_status(status), do: status
 
   @impl true
+  # A crashed renderer queues most calls until a new document replaces it, so a call
+  # on it would only time out: it fails at once, except a navigation, which brings the
+  # page back.
+  def handle_call({:cdp_call, method, _params, _timeout, session_id}, _from, state)
+      when method not in @recovering_methods and is_map_key(state.crashed, session_id) do
+    {:reply, {:error, :target_crashed}, state}
+  end
+
   def handle_call({:cdp_call, method, params, timeout, session_id}, from, state) do
     id = state.next_id
+    state = %{state | crashed: Map.delete(state.crashed, session_id)}
 
     case encode(method, params, id, session_id) do
       {:ok, payload} -> send_call(payload, method, timeout, session_id, from, state)
@@ -525,6 +605,11 @@ defmodule CDPEx.Connection do
   end
 
   @impl true
+  def handle_cast({:unsubscribe, method, scope, pid}, state) do
+    {:reply, :ok, state} = handle_call({:unsubscribe, method, scope, pid}, nil, state)
+    {:noreply, state}
+  end
+
   def handle_cast({:cancel_await, ref}, state) do
     case pop_waiter(state.waiters, {:async, ref}) do
       {nil, _waiters} ->
@@ -581,7 +666,7 @@ defmodule CDPEx.Connection do
   # A dead waiter caller is dropped the same way: with nobody left to receive its
   # outcome, it would otherwise run its matcher on every event until its timeout.
   def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
-    {:noreply, state |> drop_dead_waiter(ref) |> drop_subscriber(pid)}
+    {:noreply, state |> drop_dead_caller(ref) |> drop_dead_waiter(ref) |> drop_subscriber(pid)}
   end
 
   # A linked process — our owner (e.g. CDPEx.Browser) — went down. Stop too, so
@@ -717,6 +802,7 @@ defmodule CDPEx.Connection do
     |> track_context(method, session_id, params)
     |> answer_dialog(method, session_id, params)
     |> fail_detached_session(method, params)
+    |> fail_crashed_session(method, session_id)
     |> notify_waiters(session_id, params)
     |> notify_subscribers(method, session_id, params)
     |> drop_detached_subscriptions(method, params)
@@ -827,7 +913,29 @@ defmodule CDPEx.Connection do
   # leave them to their own timeouts.
   defp fail_detached_session(state, "Target.detachedFromTarget", %{"sessionId" => sid})
        when is_binary(sid) do
-    reason = {:error, {:session_closed, sid}}
+    fail_session(
+      %{state | crashed: Map.delete(state.crashed, sid)},
+      sid,
+      {:error, {:session_closed, sid}}
+    )
+  end
+
+  defp fail_detached_session(state, _method, _params), do: state
+
+  # Chrome answers nothing a crashed renderer was running, and fires no event a waiter
+  # on it is parked for, until a navigation brings up a new one. Fail both now, and the
+  # session's later calls at once (see handle_call/3) until it is navigated.
+  defp fail_crashed_session(state, "Inspector.targetCrashed", sid) do
+    fail_session(
+      %{state | crashed: Map.put(state.crashed, sid, true)},
+      sid,
+      {:error, :target_crashed}
+    )
+  end
+
+  defp fail_crashed_session(state, _method, _sid), do: state
+
+  defp fail_session(state, sid, reason) do
     {gone, pending} = Map.split_with(state.pending, fn {_id, entry} -> elem(entry, 3) == sid end)
     {dead, waiters} = Enum.split_with(state.waiters, fn waiter -> elem(waiter, 1) == sid end)
 
@@ -843,8 +951,6 @@ defmodule CDPEx.Connection do
 
     forget_waiters(%{state | pending: pending, waiters: waiters}, Enum.map(dead, &elem(&1, 2)))
   end
-
-  defp fail_detached_session(state, _method, _params), do: state
 
   defp notify_waiters(state, event_session_id, params) do
     {matched, kept} =
@@ -876,6 +982,12 @@ defmodule CDPEx.Connection do
     {mons, waiter_monitors} = Map.split(state.waiter_monitors, tos)
     Enum.each(mons, fn {_to, mon} -> Process.demonitor(mon, [:flush]) end)
     %{state | waiter_monitors: waiter_monitors}
+  end
+
+  # The caller of an :infinity call died: nobody is left to take its reply.
+  defp drop_dead_caller(state, mon) do
+    pending = Map.reject(state.pending, fn {_id, entry} -> elem(entry, 2) == {:caller, mon} end)
+    %{state | pending: pending}
   end
 
   defp drop_dead_waiter(state, mon) do
@@ -1125,7 +1237,7 @@ defmodule CDPEx.Connection do
 
     case ws_send(state, payload) do
       {:ok, state} ->
-        timer = arm_timeout({:call_timeout, id}, timeout)
+        timer = arm_call_timeout(id, timeout, from)
         pending = Map.put(state.pending, id, {from, method, timer, session_id})
         {:noreply, %{state | next_id: id + 1, pending: pending}}
 
@@ -1177,9 +1289,24 @@ defmodule CDPEx.Connection do
   defp arm_timeout(msg, timeout) when is_integer(timeout) and timeout < 0,
     do: Process.send_after(self(), msg, 0)
 
-  defp arm_timeout(msg, timeout), do: Process.send_after(self(), msg, timeout)
+  defp arm_timeout(msg, timeout) when is_integer(timeout),
+    do: Process.send_after(self(), msg, timeout)
+
+  # Unreachable through the public functions, which reject such a timeout in the caller;
+  # a message sent straight to the connection fires at once rather than crash it.
+  defp arm_timeout(msg, _timeout), do: Process.send_after(self(), msg, 0)
+
+  # A call with no timeout ends only on its reply, which may never come: the caller is
+  # monitored instead, so its entry goes when it dies (see the :DOWN clause).
+  defp arm_call_timeout(_id, :infinity, {caller, _tag}), do: {:caller, Process.monitor(caller)}
+  defp arm_call_timeout(id, timeout, _from), do: arm_timeout({:call_timeout, id}, timeout)
 
   defp cancel_timer(nil), do: :ok
+
+  defp cancel_timer({:caller, mon}) do
+    Process.demonitor(mon, [:flush])
+    :ok
+  end
 
   defp cancel_timer(timer) do
     # Process.cancel_timer returns time-left | false; we only call it for the

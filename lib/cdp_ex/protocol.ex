@@ -128,7 +128,7 @@ defmodule CDPEx.Protocol do
   """
   @spec classify(frame()) :: classification()
   def classify({:text, text}) do
-    case Jason.decode(text) do
+    case decode_json(text) do
       {:ok, %{"id" => id, "result" => result} = msg} ->
         {:reply, id, Map.get(msg, "sessionId"), {:ok, result}}
 
@@ -146,6 +146,32 @@ defmodule CDPEx.Protocol do
   def classify({:ping, data}), do: {:ping, data}
   def classify({:close, code, reason}), do: {:close, code, reason}
   def classify(_other), do: :ignore
+
+  # Chrome serialises a JS string holding a lone UTF-16 surrogate (e.g. a `slice`
+  # through an emoji) as a `\ud83d`-style escape, which is not valid Unicode and
+  # which Jason rejects. Dropping such a frame would leave its caller waiting out
+  # the whole timeout, so on a decode error each lone surrogate escape becomes
+  # U+FFFD (what `TextEncoder` does) and the frame is decoded once more. The
+  # common path pays nothing.
+  @surrogate_escape ~r/\\(?:u(?:d[89ab][0-9a-f]{2}\\ud[c-f][0-9a-f]{2}|(d[89a-f][0-9a-f]{2}))|.)/is
+
+  defp decode_json(text) do
+    case Jason.decode(text) do
+      {:ok, _} = ok ->
+        ok
+
+      {:error, _} = error ->
+        replaced = Regex.replace(@surrogate_escape, text, &replace_lone_surrogate/2)
+        if replaced == text, do: error, else: Jason.decode(replaced)
+    end
+  end
+
+  # The regex consumes every escape left to right (`\\` included), so a `u` after
+  # an escaped backslash is never mistaken for an escape. Only the second
+  # alternative (an unpaired surrogate) captures; a valid pair or any other escape
+  # is kept as is.
+  defp replace_lone_surrogate(escape, ""), do: escape
+  defp replace_lone_surrogate(_escape, _lone), do: "\\ufffd"
 
   @doc """
   Unwraps a `Runtime.evaluate` result.
@@ -285,6 +311,30 @@ defmodule CDPEx.Protocol do
     case :inet.parse_address(String.to_charlist(host)) do
       {:ok, _ip} -> :disable
       {:error, _} -> String.to_charlist(host)
+    end
+  end
+
+  @doc """
+  The socket family option for connecting to `host`: `[inet6: true]` for an IPv6
+  literal (`:gen_tcp` takes it for a name to resolve otherwise, and fails with
+  `:nxdomain`), else none.
+
+  ## Examples
+
+      iex> CDPEx.Protocol.family_opts("::1")
+      [inet6: true]
+
+      iex> CDPEx.Protocol.family_opts("127.0.0.1")
+      []
+
+      iex> CDPEx.Protocol.family_opts("localhost")
+      []
+  """
+  @spec family_opts(String.t()) :: keyword()
+  def family_opts(host) do
+    case :inet.parse_ipv6strict_address(String.to_charlist(host)) do
+      {:ok, _ip} -> [inet6: true]
+      {:error, _} -> []
     end
   end
 end

@@ -125,6 +125,7 @@ defmodule CDPEx do
           | :unknown_page
           | :already_authenticated
           | :already_intercepting
+          | {:already_started, pid()}
           | {:timeout,
              :await_event
              | :new_page
@@ -204,7 +205,8 @@ defmodule CDPEx do
     * `:transient` — environmental or timing failures: the connection dropped or
       couldn't be established (`{:ws_closed, _}`, `{:ws_connect, _}`, `{:ws_upgrade, _}`,
       `:noproc`), a `:session` page's target closed or detached (`{:session_closed, _}`,
-      the session-transport counterpart of a dedicated page's `:noproc`), a wait or call
+      the session-transport counterpart of a dedicated page's `:noproc`), the page's
+      renderer crashed (`:target_crashed`; navigating the page brings it back), a wait or call
       timed out (`:timeout`, `{:timeout, _}`, `:deadline_exceeded`), Chrome died
       or was slow to start (`{:chrome_exited, _, _}`, `{:debug_url_not_found, _}`,
       `{:devtools_file_malformed, _}`), an internal capture/idle/download helper crashed
@@ -248,6 +250,7 @@ defmodule CDPEx do
   def classify_error({:ws_upgrade, _}), do: :transient
   def classify_error(:noproc), do: :transient
   def classify_error({:session_closed, _}), do: :transient
+  def classify_error(:target_crashed), do: :transient
   def classify_error(:timeout), do: :transient
   def classify_error({:timeout, _}), do: :transient
   def classify_error(:deadline_exceeded), do: :transient
@@ -285,6 +288,7 @@ defmodule CDPEx do
   def classify_error(:unknown_page), do: :terminal
   def classify_error(:already_authenticated), do: :terminal
   def classify_error(:already_intercepting), do: :terminal
+  def classify_error({:already_started, _}), do: :terminal
   # A navigation failure carries Chrome's net::ERR_* text: connection/network-layer
   # codes are transient (a fresh attempt may succeed); everything else stays :unknown
   # (see @transient_net_errors). A non-string payload can't be inspected -> :unknown.
@@ -362,7 +366,9 @@ defmodule CDPEx do
   `:chrome_binary`, `:extra_args`, `:window_size`, `:launch_timeout`). On slow
   cold-start hosts (e.g. headless Chrome in a constrained container) raise
   `:launch_timeout` — it is a ceiling, not a fixed wait. For long-lived use, prefer
-  putting `CDPEx.Browser` under your own supervisor with a `:shutdown` timeout.
+  putting `CDPEx.Browser` under your own supervisor with a `:shutdown` timeout. An
+  option no launch reads (a misspelling such as `:extra_arg`) raises `ArgumentError`
+  before anything starts.
 
   ## Proxy
 

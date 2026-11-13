@@ -77,14 +77,16 @@ defmodule CDPEx.Connect do
   defp connect_opts(:https, host, tls_opts, timeout),
     do: [
       mode: :passive,
-      transport_opts: [
-        {:timeout, timeout},
-        {:server_name_indication, Protocol.sni(host)} | Connection.tls_opts(tls_opts)
-      ]
+      transport_opts:
+        Protocol.family_opts(host) ++
+          [
+            {:timeout, timeout},
+            {:server_name_indication, Protocol.sni(host)} | Connection.tls_opts(tls_opts)
+          ]
     ]
 
-  defp connect_opts(_http, _host, _tls_opts, timeout),
-    do: [mode: :passive, transport_opts: [timeout: timeout]]
+  defp connect_opts(_http, host, _tls_opts, timeout),
+    do: [mode: :passive, transport_opts: Protocol.family_opts(host) ++ [timeout: timeout]]
 
   defp deadline(:infinity), do: :infinity
   defp deadline(timeout), do: System.monotonic_time(:millisecond) + timeout

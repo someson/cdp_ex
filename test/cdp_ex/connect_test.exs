@@ -23,6 +23,30 @@ defmodule CDPEx.ConnectTest do
     assert ws == "ws://#{host}:#{port}/devtools/browser/FAKE-GUID"
   end
 
+  test "discovers over an IPv6 literal endpoint" do
+    {:ok, listen} =
+      :gen_tcp.listen(0, [:inet6, :binary, ip: {0, 0, 0, 0, 0, 0, 0, 1}, active: false])
+
+    {:ok, port} = :inet.port(listen)
+
+    spawn_link(fn ->
+      {:ok, socket} = :gen_tcp.accept(listen)
+      {:ok, _request} = :gen_tcp.recv(socket, 0)
+      body = ~s({"webSocketDebuggerUrl":"ws://127.0.0.1:1/devtools/browser/V6"})
+
+      :ok =
+        :gen_tcp.send(
+          socket,
+          "HTTP/1.1 200 OK\r\ncontent-length: #{byte_size(body)}\r\n\r\n" <> body
+        )
+
+      Process.sleep(500)
+    end)
+
+    assert Connect.resolve("http://[::1]:#{port}") ==
+             {:ok, "ws://[::1]:#{port}/devtools/browser/V6"}
+  end
+
   test "discovery preserves the query string from webSocketDebuggerUrl" do
     {:ok, %{url: base}} = FixtureServer.start(json_version: :with_query)
     %URI{host: host, port: port} = URI.parse(base)

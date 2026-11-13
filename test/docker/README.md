@@ -23,7 +23,8 @@ Environment variables:
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `RUNS`   | `20`    | Number of runs |
-| `TEST`   | `test/cdp_ex/integration_test.exs:1712` | Test location to run |
+| `TEST`   | `test/cdp_ex/integration_test.exs` | Test file or location to run |
+| `ONLY`   | `leak_loop` | Tag to run within `TEST` (the launch cut short by `:launch_timeout`); empty runs `TEST` as given |
 | `TRACE`  | `0`     | `1` runs each test under `strace` and prints the process that created a leftover dir |
 | `CPUS`   | `0`     | CPU cap for the container; `0` means no cap |
 

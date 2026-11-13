@@ -14,7 +14,8 @@ offers no way to label a supervisor from outside it.)
 | `{:cdp_connection, "/devtools/page/<targetId>"}` | a `:dedicated` page WebSocket |
 | `{:cdp_connection, :pipe}` | the browser connection of a `pipe: true` browser |
 | `{:cdp_page_helper, :idle_wait \| :capture, target_id}` | the short-lived process behind `wait_for_network_idle/2` and `navigate/3` with `response: true` |
-| `{:cdp_page_helper, :detach_watch, target_id}` | the short-lived process that watches a `:session` page's detach during `navigate/3` and `wait_for_navigation/2` |
+| `{:cdp_page_helper, :target_watch, target_id}` | the short-lived process that watches the page's renderer crash (and a `:session` page's detach) during `navigate/3` and `wait_for_navigation/2` |
+| `{:cdp_download_wait, target_id}` | the short-lived process behind `wait_for_download/2` |
 | `{:cdp_authenticate, target_id}` | the short-lived relay behind `Page.authenticate/4` |
 | `{:cdp_fetch, target_id}` | the page's `Fetch` owner: answers login challenges and forwards intercepted requests |
 | `{:cdp_context_dispose, context_id}` | the throwaway task that disposes an isolated page's context after the page went away on its own |

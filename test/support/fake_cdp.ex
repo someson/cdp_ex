@@ -28,12 +28,21 @@ defmodule CDPEx.FakeCDP do
 
   @ws_magic "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-  @spec start(pid()) :: {:ok, %{port: non_neg_integer(), url: String.t(), listen: port()}}
-  def start(controller \\ self()) do
-    {:ok, listen} = :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
+  # `inet6: true` listens on ::1 instead, and the URL names it as [::1].
+  @spec start(pid(), keyword()) ::
+          {:ok, %{port: non_neg_integer(), url: String.t(), listen: port()}}
+  def start(controller \\ self(), opts \\ []) do
+    {family, ip, host} =
+      if Keyword.get(opts, :inet6, false),
+        do: {:inet6, {0, 0, 0, 0, 0, 0, 0, 1}, "[::1]"},
+        else: {:inet, {127, 0, 0, 1}, "127.0.0.1"}
+
+    {:ok, listen} =
+      :gen_tcp.listen(0, [family, :binary, ip: ip, packet: :raw, active: false, reuseaddr: true])
+
     {:ok, port} = :inet.port(listen)
     spawn_link(fn -> accept_loop(listen, controller) end)
-    {:ok, %{port: port, url: "ws://127.0.0.1:#{port}/devtools/browser/fake", listen: listen}}
+    {:ok, %{port: port, url: "ws://#{host}:#{port}/devtools/browser/fake", listen: listen}}
   end
 
   # Like start/1, but the server accepts the connection and reads the upgrade

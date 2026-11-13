@@ -7,13 +7,19 @@ on:
     branches: [main]
   # Run on demand from the Actions tab (e.g. to re-check main).
   workflow_dispatch:
+  # Weekly, so a new Chrome stable (the integration job floats on it) or a new
+  # advisory shows up here rather than as the next PR's failure.
+  schedule:
+    - cron: "17 5 * * 1"
 
 permissions:
   contents: read
 
+# A newer push to a PR supersedes its running checks; every push to main keeps
+# its own result.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # Lint + type-check + unit tests across a min and a current Elixir/OTP pair.
@@ -35,6 +41,9 @@ jobs:
             otp: "28.5"
           - elixir: "1.20.5"
             otp: "29.1"
+          # The production pair: Ubuntu 26.04 ships OTP 27 (see test/docker/).
+          - elixir: "1.20.5"
+            otp: "27.3"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -136,7 +145,8 @@ jobs:
         with:
           python-version: "3.14"
 
-      - run: pip install zizmor==1.31.1
+      # Pinned in a file Dependabot updates (pip ecosystem).
+      - run: pip install -r .github/requirements/zizmor.txt
 
       - name: Audit workflows
         run: zizmor --offline .github/workflows/

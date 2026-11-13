@@ -33,10 +33,10 @@ succeed), `:terminal` (selector miss, JS exception, usage/validation error, whic
 retry won't fix), or `:unknown` (payload-dependent, e.g. an ambiguous `net::ERR_*`
 navigation error or a CDP error code; you decide). The library tracks the error surface, so the
 transient/terminal decision lives in one place instead of drifting across callers.
-The reason shapes are documented as `t:CDPEx.error_reason/0`
-([`lib/cdp_ex.ex`](../../lib/cdp_ex.ex)).
+The reason shapes are documented as `t:CDPEx.error_reason/0`.
 
 Retries are yours to bound: cap attempts, back off, and on a `:transient` result
 re-establish the resource (open a fresh page/browser) rather than reusing a dead
 handle — a dead page keeps returning `:noproc`, or `{:session_closed, session_id}` for a
-`:session` page (the default on a `connect/2` or `pipe: true` browser).
+`:session` page (the default on a `connect/2` or `pipe: true` browser). A page whose
+renderer crashed returns `:target_crashed` until you navigate it again (or close it).

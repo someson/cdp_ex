@@ -3,13 +3,16 @@
 # cdp_ex-* dir in the temp dir and any Chrome process left behind.
 #
 #   RUNS   number of runs (default 20)
-#   TEST   test location (default: the launch cut short by launch_timeout)
+#   TEST   test file or location (default: the integration suite's file)
+#   ONLY   tag to run within TEST (default: leak_loop, the launch cut short by
+#          launch_timeout); empty runs TEST as given
 #   TRACE  1 = run each test under strace and, for a leftover dir, print the
 #          process that created it (needs --cap-add SYS_PTRACE)
 set -uo pipefail
 
 RUNS="${RUNS:-20}"
-TEST="${TEST:-test/cdp_ex/integration_test.exs:1712}"
+TEST="${TEST:-test/cdp_ex/integration_test.exs}"
+ONLY="${ONLY-leak_loop}"
 TRACE="${TRACE:-0}"
 TMP="${TMPDIR:-/tmp}"
 LOGS="$TMP/leak_loop"
@@ -25,11 +28,14 @@ pass=0 fail=0 leaky=0
 for i in $(seq 1 "$RUNS"); do
   before="$(list_dirs)"
   trace="$LOGS/strace-$i.log"
-  if [ "$TRACE" = 1 ]; then
-    cmd=(strace -f -qq -e trace=execve,mkdir,mkdirat -o "$trace" mix test "$TEST" --include integration)
+  # --only alone: an :integration test with the tag is included despite the
+  # default exclusion, and --include integration would run the whole suite.
+  if [ -n "$ONLY" ]; then
+    cmd=(mix test "$TEST" --only "$ONLY")
   else
     cmd=(mix test "$TEST" --include integration)
   fi
+  [ "$TRACE" = 1 ] && cmd=(strace -f -qq -e trace=execve,mkdir,mkdirat -o "$trace" "${cmd[@]}")
 
   if "${cmd[@]}" >"$LOGS/test-$i.log" 2>&1; then
     pass=$((pass + 1))
