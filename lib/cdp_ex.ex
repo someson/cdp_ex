@@ -383,6 +383,13 @@ defmodule CDPEx do
   the accepted forms (the keyword form avoids percent-encoding special-character
   passwords).
 
+  The credentials are given once per request. If the proxy rejects them, the login is
+  cancelled and the proxy's `407` is the answer: an `https://` navigation fails with
+  `{:error, {:navigate, "net::ERR_HTTP_RESPONSE_CODE_FAILURE"}}`, and so does an
+  `http://` one when the `407` has no body; a `407` with a body (squid's error page)
+  loads as the document, which `CDPEx.Page.navigate/3` with `response: true` reports
+  as `status: 407`.
+
   Pages of both transports are armed, including the `:session` pages of a `pipe: true`
   browser. An auto-armed page still takes `CDPEx.Page.enable_request_interception/2`
   and `block:` / `CDPEx.Page.block_resources/3`: one process per page drives the

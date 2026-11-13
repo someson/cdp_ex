@@ -194,10 +194,50 @@ defmodule CDPEx.IntegrationTest do
       elixir = System.find_executable("elixir")
       {out, 1} = System.cmd(elixir, code_path ++ ["-e", script], stderr_to_stdout: true)
       [_, os_pid, dir] = Regex.run(~r/chrome=(\d+) dir=(\S+)/, out)
-      on_exit(fn -> File.rm_rf(dir) end)
+      on_exit(fn -> remove_orphaned_profile(dir) end)
 
       assert eventually(fn -> not os_alive?(os_pid) end, 250),
              "Chrome (os pid #{os_pid}) outlived the VM that launched it"
+    end
+
+    test "Chrome dies with a VM killed by SIGKILL, and the next launch removes its files" do
+      # The VM runs on until `kill -9`: no code of it runs after that, so only the
+      # watchdog kills Chrome, and only the next launch's sweep can remove the profile
+      # and the singleton socket dir it links to.
+      script = """
+      {:ok, _} = Application.ensure_all_started(:cdp_ex)
+      {:ok, browser} = CDPEx.launch()
+      {:ok, _page} = CDPEx.new_page(browser)
+      %{os_pid: os_pid, user_data_dir: dir} = :sys.get_state(browser).chrome
+      IO.puts("beam=\#{System.pid()} chrome=\#{os_pid} dir=\#{dir}")
+      Process.sleep(:infinity)
+      """
+
+      code_path = Enum.flat_map(:code.get_path(), &["-pa", to_string(&1)])
+
+      port =
+        Port.open({:spawn_executable, System.find_executable("elixir")}, [
+          :binary,
+          :exit_status,
+          :stderr_to_stdout,
+          args: code_path ++ ["-e", script]
+        ])
+
+      [_, beam, os_pid, dir] = await_line(port, ~r/beam=(\d+) chrome=(\d+) dir=(\S+)/, "")
+      on_exit(fn -> remove_orphaned_profile(dir) end)
+      {:ok, socket} = File.read_link(Path.join(dir, "SingletonSocket"))
+
+      {_, 0} = System.cmd("kill", ["-9", beam])
+      assert_receive {^port, {:exit_status, _}}, 10_000
+
+      assert eventually(fn -> not os_alive?(os_pid) end, 250),
+             "Chrome (os pid #{os_pid}) outlived the VM that launched it"
+
+      {:ok, browser} = CDPEx.launch()
+      on_exit(fn -> stop_quietly(browser) end)
+
+      refute File.exists?(dir), "the profile of the killed VM was not swept"
+      refute File.exists?(Path.dirname(socket)), "its singleton socket dir was not swept"
     end
 
     test "launch/1 returns well under the timeout ceiling (readiness is polled)" do
@@ -1887,6 +1927,27 @@ defmodule CDPEx.IntegrationTest do
 
       assert {:error, {:navigate, _}} =
                Page.navigate(page, "http://proxied.test/", wait_until: :none)
+    end
+
+    test "wrong proxy credentials are given once, then the proxy's 407 is the result" do
+      # The proxy rejects the password and challenges again: the library cancels the
+      # login instead of answering the same request again, so the navigation ends at
+      # once on the proxy's 407. This proxy's 407 has no body, so Chrome fails the
+      # navigation; squid's carries an error page, which then loads as the document
+      # (status 407 with `response: true`). An https:// CONNECT fails either way.
+      {:ok, %{port: proxy_port}} = ProxyAuthServer.start(username: "puser", password: "ppass")
+      {:ok, browser} = CDPEx.launch(proxy: "http://puser:wrong@127.0.0.1:#{proxy_port}")
+      on_exit(fn -> stop_quietly(browser) end)
+
+      {:ok, page} = CDPEx.new_page(browser)
+
+      {elapsed_us, result} =
+        :timer.tc(fn ->
+          Page.navigate(page, "http://proxied.test/", response: true, timeout: 10_000)
+        end)
+
+      assert result == {:error, {:navigate, "net::ERR_HTTP_RESPONSE_CODE_FAILURE"}}
+      assert elapsed_us < 5_000_000, "navigate took #{div(elapsed_us, 1000)}ms"
     end
   end
 
@@ -3659,6 +3720,31 @@ defmodule CDPEx.IntegrationTest do
     match?({_, 0}, System.cmd("kill", ["-0", to_string(os_pid)], stderr_to_stdout: true))
   end
 
+  # Reads a port's output until `regex` matches it; returns the match.
+  defp await_line(port, regex, acc) do
+    case Regex.run(regex, acc) do
+      nil ->
+        receive do
+          {^port, {:data, data}} -> await_line(port, regex, acc <> data)
+          {^port, {:exit_status, status}} -> flunk("the VM exited (#{status}): #{acc}")
+        after
+          30_000 -> flunk("no #{inspect(regex)} in: #{acc}")
+        end
+
+      match ->
+        match
+    end
+  end
+
+  # A profile left by a VM that halted: nothing there reaped it or Chrome's singleton
+  # socket dir it links to, and with the profile gone no later sweep finds that dir.
+  defp remove_orphaned_profile(dir) do
+    with {:ok, socket} <- File.read_link(Path.join(dir, "SingletonSocket")),
+         do: File.rm_rf(Path.dirname(socket))
+
+    File.rm_rf(dir)
+  end
+
   # The Browser holds its own detach subscription; count only the wait's.
   defp detach_watched?(page) do
     page.conn
@@ -3897,7 +3983,7 @@ defmodule CDPEx.IntegrationTest do
       elixir = System.find_executable("elixir")
       {out, 1} = System.cmd(elixir, code_path ++ ["-e", script], stderr_to_stdout: true)
       [_, os_pid, dir] = Regex.run(~r/chrome=(\d+) dir=(\S+)/, out)
-      on_exit(fn -> File.rm_rf(dir) end)
+      on_exit(fn -> remove_orphaned_profile(dir) end)
 
       assert eventually(fn -> not os_alive?(os_pid) end, 250),
              "Chrome (os pid #{os_pid}) outlived the VM that launched it"

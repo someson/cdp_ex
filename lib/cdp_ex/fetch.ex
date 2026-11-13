@@ -525,16 +525,18 @@ defmodule CDPEx.Fetch do
   # While blocking, the page's requests (and its iframes') skip service workers and go
   # to the network, where Fetch fails them. Chrome applies the bypass only with the
   # Network domain on; CDPEx.Page enables it lazily too and never disables it.
-  defp sync_bypass(%__MODULE__{block: block, bypass_sw: on} = state, _timeout)
-       when block != nil == on, do: state
-
   defp sync_bypass(state, timeout) do
     bypass = state.block != nil
-    Enum.each(Map.keys(state.children), &set_bypass(state, &1, bypass, timeout))
 
-    case set_bypass(state, state.session_id, bypass, timeout) do
-      :ok -> %{state | bypass_sw: bypass}
-      :error -> state
+    if bypass == state.bypass_sw do
+      state
+    else
+      Enum.each(Map.keys(state.children), &set_bypass(state, &1, bypass, timeout))
+
+      case set_bypass(state, state.session_id, bypass, timeout) do
+        :ok -> %{state | bypass_sw: bypass}
+        :error -> state
+      end
     end
   end
 
